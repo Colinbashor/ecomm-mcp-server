@@ -1,0 +1,27 @@
+# Normalise line endings so the repo is byte-stable regardless of each
+# machine's core.autocrlf. Without this, git warns on nearly every add
+# ("LF will be replaced by CRLF") and diffs can turn into whole-file churn
+# when someone clones with different settings.
+
+# Default: store LF in the repo, check out native on Windows.
+* text=auto
+
+# Windows scripts must keep CRLF in the working tree. .bat in particular can
+# misbehave with bare LF (a label or goto on the last line may not parse).
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Always LF, including on Windows.
+*.py    text eol=lf
+*.sql   text eol=lf
+*.sh    text eol=lf
+
+# Binary — never diff, never touch line endings.
+*.xlsx  binary
+*.xls   binary
+*.db    binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.gz    binary
