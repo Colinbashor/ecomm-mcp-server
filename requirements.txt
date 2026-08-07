@@ -1,0 +1,12 @@
+# MCP SDK - pinned to v1 deliberately. SDK 2.0.0 renames FastMCP to MCPServer,
+# so an unpinned install breaks the import in server.py.
+mcp[cli]>=1.29,<2
+
+python-dotenv
+requests
+uvicorn
+anyio
+
+# Only needed for the Google Ads connector. It is a heavy install - drop this
+# line if you are not syncing Google Ads.
+google-ads

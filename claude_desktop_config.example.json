@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ecomm-warehouse": {
+      "command": "/ABSOLUTE/PATH/TO/ecomm-mcp-server/.venv/bin/python",
+      "args": ["/ABSOLUTE/PATH/TO/ecomm-mcp-server/server.py"],
+      "env": {
+        "WAREHOUSE_DB": "/ABSOLUTE/PATH/TO/ecomm-mcp-server/warehouse.db"
+      }
+    }
+  }
+}
