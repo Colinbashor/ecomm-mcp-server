@@ -10,3 +10,7 @@ anyio
 # Only needed for the Google Ads connector. It is a heavy install - drop this
 # line if you are not syncing Google Ads.
 google-ads
+
+# Only needed to run make_cert.py (self-signed TLS for --http team sharing,
+# see SHARING.md). Not required for stdio use or plain-HTTP setups.
+cryptography

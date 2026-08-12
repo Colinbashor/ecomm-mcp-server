@@ -42,6 +42,24 @@ python run_sync.py --sample
 This loads synthetic rows so you can verify the schema and exercise the MCP tools before
 wiring up a single real API.
 
+## Getting credentials
+
+Every connector reads its own block in `.env.example`, which documents where to get each
+value. Three platforms need a one-time interactive OAuth consent before you have a refresh
+token to put in `.env` — a helper script drives that flow and saves the result for you:
+
+```bash
+python google_auth.py                          # Google Ads: opens a browser, saves the refresh token
+python amazon_auth.py --url                     # Amazon Ads: prints a consent URL
+python amazon_auth.py PASTE_THE_CODE_HERE       # then exchanges the code it redirects you to
+python tiktok_auth.py PASTE_THE_CODE_HERE       # TikTok Shop: same pattern, code from Partner Center
+```
+
+Amazon retail orders (SP-API) and Shopify don't need one of these: SP-API gives you a refresh
+token directly in Seller Central when you authorize your own private app, and Shopify uses a
+non-interactive client-credentials grant that the connector performs itself. See the comments
+above each block in `.env.example` for the exact steps.
+
 ## Syncing real data
 
 ```bash
@@ -72,6 +90,11 @@ Host/Origin validation is on by default; `--allow-host` is repeatable, and the s
 can live in `WAREHOUSE_MCP_ALLOWED_HOSTS` (re-read without a restart). Use
 `--check-host <value>` to print the accept/reject verdict for a Host and exit.
 
+See [SHARING.md](SHARING.md) for the full walkthrough: generating a self-signed
+cert with `make_cert.py` so Claude's connector UI accepts the URL, keeping the
+server running across reboots with `serve_mcp.bat` (Windows), and the
+`mcp-remote` config snippet each teammate adds to their own Claude Desktop.
+
 ## Claude Desktop
 
 Copy `claude_desktop_config.example.json` into your Claude Desktop config and replace
@@ -82,6 +105,17 @@ The interpreter path differs by platform:
 
 - macOS / Linux — `.venv/bin/python`
 - Windows — `.venv\Scripts\python.exe`
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+Hermetic — no network access, no `warehouse.db` required — and runs in a couple of seconds.
+Covers the two things a well-meaning edit is most likely to break: the Host/Origin validation
+rules in `server.py` and the remote SQL column authorizer.
 
 ## Configuration
 
