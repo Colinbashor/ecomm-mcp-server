@@ -1,0 +1,11 @@
+# Development dependencies. Deliberately SEPARATE from requirements.txt so that
+# installing the test tooling can never perturb the runtime pins — in
+# particular mcp[cli]>=1.29,<2, whose upper bound keeps the MCP server
+# importable (2.0.0 renames FastMCP -> MCPServer).
+#
+#     pip install -r requirements-dev.txt
+#     pytest -q
+#
+# The suite is fast (~2s, no network, no warehouse.db) — hermetic by design.
+
+pytest>=8.0
