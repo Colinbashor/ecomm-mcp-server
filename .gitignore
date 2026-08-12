@@ -3,7 +3,7 @@
 *.pem
 *.key
 credentials.json
-service-account*.json
+*service-account*.json
 certs/
 
 # local data - a warehouse DB is not source code
