@@ -30,10 +30,11 @@ put a real TLS terminator in front of it (a reverse proxy, a Cloudflare
 Tunnel, etc.) rather than relying on the steps below, which are meant for a
 small team on the same LAN.
 
-For a LAN-only setup, generate a self-signed certificate once:
+For a LAN-only setup, generate a self-signed certificate once (`cryptography`
+is already in `requirements.txt`, so no separate install is needed if you
+followed the README's Setup step):
 
 ```bash
-pip install cryptography
 python make_cert.py
 ```
 
@@ -41,7 +42,11 @@ This writes `certs/warehouse-mcp.crt` (safe to share with teammates — no
 secret material) and `certs/warehouse-mcp.key` (never share this one).
 `server.py --http` automatically serves HTTPS once both files exist. Re-run
 `make_cert.py` if the machine's LAN IP changes, or when adding extra names
-(`python make_cert.py extra.hostname 10.1.2.3`).
+(`python make_cert.py extra.hostname 10.1.2.3`). The certificate's
+Organization field is cosmetic (clients trust it by SAN + Trusted Root
+install, not by this string) but defaults to "ecommerce-warehouse MCP" —
+set `CERT_ORG_NAME` in `.env` before running it to put your own team or
+company name there instead.
 
 On Windows, `serve_mcp.bat` keeps the server running across reboots and
 restarts it if it crashes — point a Task Scheduler "At startup" trigger at it.
@@ -67,6 +72,11 @@ and removing a name revokes it just as fast.
 
 Use `python server.py --check-host <value>` to test what a given Host header
 would resolve to before a teammate hits it live.
+
+`--allow-any-host` skips this check entirely — useful for a quick local debug
+session, not for anything reachable by a teammate. It logs a warning on
+startup and re-warns every 6 hours for as long as it's set, specifically so an
+`--allow-any-host` left on in `serve_mcp.bat` doesn't go unnoticed.
 
 ## 3. Give each teammate a config snippet
 
