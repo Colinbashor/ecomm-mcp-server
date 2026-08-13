@@ -88,7 +88,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import openpyxl
 import requests
 from dotenv import load_dotenv
 
@@ -323,6 +322,12 @@ def _rows_from_file(path: Path) -> list[list]:
     if path.suffix.lower() == ".csv":
         with path.open(newline="", encoding="utf-8-sig") as f:
             return [row for row in csv.reader(f)]
+    # Imported lazily so the `api` subcommand (and anything that merely
+    # imports this module) works without installing openpyxl — only the
+    # `import` subcommand's xlsx path needs it. Same convention as
+    # warehouse/connectors/google_ads.py's lazy google-ads import.
+    import openpyxl
+
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
     return [list(row) for row in ws.iter_rows(values_only=True)]
