@@ -8,7 +8,7 @@ read-only tools over your local SQLite warehouse so you can ask things like
 Two ways to run it:
   python server.py           # stdio — Claude Desktop launches this locally
   python server.py --http    # HTTP on 0.0.0.0:8787 for coworkers on the
-                             # network (see COWORKER_SETUP.md). Requires
+                             # network (see SHARING.md). Requires
                              # WAREHOUSE_MCP_TOKEN in .env and sends it in
                              # the Authorization Bearer header.
 
@@ -610,6 +610,25 @@ class BearerTokenMiddleware:
                 self.legacy_path,
             )
         )
+        # Scrub the token out of the path BEFORE any response is sent, so a
+        # server's access-log middleware (Uvicorn's included) never persists it
+        # verbatim. This matters most for the legacy `/<token>/mcp` path style:
+        # once a token is rotated, every request against the OLD path 401s below
+        # (the compare_digest checks above are already computed, so mutating the
+        # scope here cannot affect them) and would otherwise write the retired
+        # secret straight into a log file on every stale client's retry.
+        #
+        # Deliberately matched by SHAPE (first path segment of a two-segment
+        # `/<x>/mcp` path), not by comparing against self.legacy_path — a
+        # rotated-out token no longer equals the current one, but it still sits
+        # in exactly this position and is exactly as sensitive.
+        if self.legacy_path is not None:
+            path_str = str(scope.get("path", ""))
+            segments = path_str.split("/")
+            if len(segments) == 3 and segments[0] == "" and segments[1] and segments[2] == "mcp":
+                safe_path = "/<redacted-token>/mcp"
+                scope["path"] = safe_path
+                scope["raw_path"] = safe_path.encode("ascii", "replace")
         if not bearer_ok and not legacy_ok:
             body = b'{"error":"authentication required"}'
             await send(
@@ -736,6 +755,15 @@ def list_tables(table_pattern: str | None = None,
     return json.dumps(out, indent=2)
 
 
+# Wall-clock ceiling on a single ad-hoc run_sql() call. On a large warehouse an
+# unindexed scan or an accidental cross join can run for minutes, and this
+# server is often shared (--http mode) or running alongside a sync job, so one
+# slow query souring the whole process for everyone else is a worse failure
+# mode than cutting it off with a clear error. Tune to your database size and
+# how many concurrent callers you expect.
+RUN_SQL_TIMEOUT_SEC = 45.0
+
+
 def run_sql(query: str) -> str:
     """
     Run a READ-ONLY SQL query against the warehouse and return rows as JSON.
@@ -749,11 +777,24 @@ def run_sql(query: str) -> str:
     # the startswith check above is just a friendlier fast-fail.
     conn = db.connect_readonly()
     _protect_remote_connection(conn)
+    # SQLite polls this callback every N virtual-machine instructions during
+    # query execution; returning truthy aborts the query with an
+    # OperationalError("interrupted"), which is how a wall-clock budget is
+    # enforced without threads or a separate watchdog process.
+    deadline = time.monotonic() + RUN_SQL_TIMEOUT_SEC
+    conn.set_progress_handler(lambda: time.monotonic() > deadline, 100_000)
     try:
         rows = conn.execute(cleaned).fetchmany(1000)  # cap without loading everything
+    except sqlite3.OperationalError as e:  # noqa: BLE001
+        if "interrupted" in str(e).lower():
+            return (f"Error: query exceeded the {RUN_SQL_TIMEOUT_SEC:.0f}s time "
+                    f"budget and was cancelled. Narrow it with a WHERE on an "
+                    f"indexed column, add a LIMIT, or pre-aggregate.")
+        return f"SQL error: {e}"
     except Exception as e:  # noqa: BLE001
         return f"SQL error: {e}"
     finally:
+        conn.set_progress_handler(None, 0)
         conn.close()
     out = _rows_to_json(rows)
     if len(rows) == 1000:
@@ -982,7 +1023,7 @@ if __name__ == "__main__":
         )
         # If make_cert.py has been run, serve https — Claude's connector UI
         # refuses plain http URLs. Teammates trust the .crt once (see
-        # COWORKER_SETUP.md). Without certs, falls back to plain http.
+        # SHARING.md). Without certs, falls back to plain http.
         here = os.path.dirname(os.path.abspath(__file__))
         cert = os.path.join(here, "certs", "warehouse-mcp.crt")
         key = os.path.join(here, "certs", "warehouse-mcp.key")

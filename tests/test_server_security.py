@@ -5,6 +5,7 @@ import os
 import socket
 import sqlite3
 import unittest
+from unittest import mock
 
 import server
 
@@ -703,6 +704,49 @@ class ServerSecurityTests(unittest.TestCase):
         self.assertEqual(no_host[0]["status"], 421)
         self.assertEqual(seen, [True])
 
+    def test_stale_legacy_token_path_is_redacted_before_the_401(self) -> None:
+        """A rotated-out token must never reach an access log verbatim.
+
+        The stored `legacy_path` reflects the CURRENT token, so a request built
+        against the OLD one fails `legacy_ok` — but the secret-shaped segment is
+        still sitting in `scope['path']`, and that scope is what a real ASGI
+        server's access-log middleware reads when the response completes. The
+        redaction has to fire on this failure path, not just the success path
+        the existing rewrite already covered.
+        """
+        async def app(scope, receive, send):
+            del scope, receive, send
+            raise AssertionError("a 401 must never reach the inner app")
+
+        async def request():
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": b""}
+
+            async def send(message):
+                sent.append(message)
+
+            middleware = server.BearerTokenMiddleware(
+                app, "current-secret", _guard(), allow_legacy_path=True,
+            )
+            scope = {
+                "type": "http",
+                "path": "/rotated-out-old-secret/mcp",
+                "raw_path": b"/rotated-out-old-secret/mcp",
+                "headers": [(b"host", b"warehouse-host:8787")],
+                "server": ["10.0.0.42", 8787],
+            }
+            await middleware(scope, receive, send)
+            return sent, scope
+
+        sent, scope = asyncio.run(request())
+
+        self.assertEqual(sent[0]["status"], 401)
+        self.assertNotIn("rotated-out-old-secret", scope["path"])
+        self.assertNotIn(b"rotated-out-old-secret", scope["raw_path"])
+        self.assertEqual(scope["path"], "/<redacted-token>/mcp")
+
     def test_legacy_path_bridge_authenticates_and_rewrites_path(self) -> None:
         seen = []
 
@@ -753,6 +797,43 @@ class ServerSecurityTests(unittest.TestCase):
         self.assertEqual(seen, [("/mcp", True)])
         self.assertEqual(scope["path"], "/mcp")
         self.assertEqual(scope["raw_path"], b"/mcp")
+
+
+class RunSqlTimeoutTests(unittest.TestCase):
+    """run_sql()'s wall-clock budget, enforced via sqlite3's progress handler."""
+
+    @staticmethod
+    def _slow_connection() -> sqlite3.Connection:
+        """A connection whose queries can generate plenty of VM instructions
+        without needing a real database file or actually running long — a
+        recursive CTE counting to a few million is enough to guarantee at
+        least one progress-handler poll fires. row_factory matches
+        db.connect_readonly() so _rows_to_json's dict(row) conversion works."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def test_query_past_the_deadline_is_cancelled_with_a_clear_message(self) -> None:
+        conn = self._slow_connection()
+        with (
+            mock.patch.object(server.db, "connect_readonly", return_value=conn),
+            mock.patch.object(server, "RUN_SQL_TIMEOUT_SEC", -1.0),
+        ):
+            result = server.run_sql(
+                "WITH RECURSIVE cnt(x) AS "
+                "(SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5000000) "
+                "SELECT COUNT(*) FROM cnt"
+            )
+        self.assertIn("time budget", result)
+        self.assertIn("-1s", result)
+
+    def test_ordinary_query_is_unaffected_by_a_generous_budget(self) -> None:
+        conn = self._slow_connection()
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)")
+        with mock.patch.object(server.db, "connect_readonly", return_value=conn):
+            result = server.run_sql("SELECT SUM(x) FROM t")
+        self.assertIn("6", result)
 
 
 if __name__ == "__main__":

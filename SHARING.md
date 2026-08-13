@@ -124,6 +124,15 @@ should then see the warehouse tools under the hammer icon: `spend_summary`,
 - The server is **read-only** — `run_sql` only permits `SELECT`/`WITH`, and
   the underlying connection is opened `mode=ro`, so nothing a client sends can
   write to the warehouse.
+- `run_sql` also carries a wall-clock budget (`RUN_SQL_TIMEOUT_SEC` in
+  `server.py`, 45s by default) — one unindexed scan or accidental cross join
+  can't tie up a server that several people share. A query that hits the
+  budget gets cancelled with a clear error instead of stalling everyone else.
+- If you rotate `WAREHOUSE_MCP_TOKEN` while running with
+  `--allow-legacy-token-path`, a stale client retrying against the old
+  `/<old-token>/mcp` URL gets a normal 401 — and the server scrubs that path
+  before logging it, so the retired token never ends up sitting in plain text
+  in an access log.
 - Ask Claude to run `last_sync_status` to check data freshness for each
   platform.
 - The bearer token is a secret. Don't post it in a public channel or embed it
