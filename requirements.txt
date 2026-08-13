@@ -14,3 +14,23 @@ google-ads
 # Only needed to run make_cert.py (self-signed TLS for --http team sharing,
 # see SHARING.md). Not required for stdio use or plain-HTTP setups.
 cryptography
+
+# Only needed for ga4_sync.py (Google Analytics 4).
+google-analytics-data
+
+# Only needed for ga4_sync.py and merchant_center_sync.py — both use a Google
+# service-account credential (server-to-server auth, no browser consent step).
+google-auth
+
+# Only needed for tiktok_creators_sync.py's `import` subcommand (loading a
+# manually-exported .xlsx creator roster). The `api` subcommand and every
+# other script here work without it.
+openpyxl
+
+# Needed by klaviyo_sync.py and tiktok_live_sync.py, which use the stdlib
+# `zoneinfo` module to convert timestamps into a shop's local calendar day.
+# Windows does not ship the IANA time zone database the way Linux/macOS
+# usually do, so `zoneinfo` raises ZoneInfoNotFoundError (even for "UTC")
+# without this — install it everywhere for portability, it's a no-op where
+# the OS already provides the data.
+tzdata
