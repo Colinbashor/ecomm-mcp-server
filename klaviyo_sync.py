@@ -39,11 +39,13 @@ CREDENTIALS
 
   Klaviyo also supports an OAuth (authorization-code) grant, useful if you're
   building a multi-tenant integration rather than a single store's private
-  key. This script deliberately only implements the private-key path — it's
-  the simplest option for a single warehouse pulling its own account's data,
-  and OAuth's refresh-token dance adds a browser-consent step this scaffold
-  doesn't need. Swap in an OAuth-minted bearer token in `_session()` if you
-  need it later; the rest of the script is unaffected.
+  key. `klaviyo_auth.py` runs that one-time PKCE consent flow and saves
+  KLAVIYO_CLIENT_ID / KLAVIYO_CLIENT_SECRET / KLAVIYO_REFRESH_TOKEN to .env.
+  `_auth_mode()` resolves which credential set is configured — OAuth if all
+  three of those are present, else the private key — and `_session()` mints a
+  fresh Bearer access token from the refresh token whenever OAuth is active.
+  Both paths hit the same read-only scopes; pick whichever suits your setup,
+  or leave OAuth unconfigured and the private key keeps working unchanged.
 
   KLAVIYO_CONVERSION_METRIC   the Klaviyo metric id used as "the" conversion
                      event for value reporting (usually whatever you treat as
@@ -120,11 +122,12 @@ except ImportError:  # pragma: no cover - py<3.9
     ZoneInfo = None  # type: ignore
 
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 from warehouse import db
 
 load_dotenv()
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 
 API_BASE = "https://a.klaviyo.com/api"
 # Dated JSON:API revision. Bump via .env if Klaviyo deprecates this one -
@@ -213,10 +216,59 @@ _COMMON_HEADERS = {
 }
 
 
-def _session() -> requests.Session:
+def _auth_mode() -> str | None:
+    """Which credential set is configured: 'oauth' if KLAVIYO_CLIENT_ID/
+    _SECRET + KLAVIYO_REFRESH_TOKEN (see klaviyo_auth.py) are all present,
+    else 'private_key' if KLAVIYO_API_KEY is set, else None (unconfigured -
+    callers should skip cleanly, same convention as _require_conversion_metric).
+    OAuth takes precedence when both happen to be configured."""
+    if (os.environ.get("KLAVIYO_CLIENT_ID") and os.environ.get("KLAVIYO_CLIENT_SECRET")
+            and os.environ.get("KLAVIYO_REFRESH_TOKEN")):
+        return "oauth"
+    if os.environ.get("KLAVIYO_API_KEY"):
+        return "private_key"
+    return None
+
+
+def _oauth_access_token() -> str:
+    """Mint a fresh Bearer access token from KLAVIYO_REFRESH_TOKEN. A minimal
+    inline refresh call rather than importing klaviyo_auth.py as a module -
+    same convention this scaffold already uses elsewhere (e.g. the TikTok
+    Shop connector re-implements its own small token-refresh request instead
+    of importing tiktok_auth.py). klaviyo_auth.py is what puts the refresh
+    token in .env in the first place; this just spends it."""
+    resp = requests.post(
+        "https://a.klaviyo.com/oauth/token",
+        data={"grant_type": "refresh_token",
+              "refresh_token": os.environ["KLAVIYO_REFRESH_TOKEN"]},
+        auth=(os.environ["KLAVIYO_CLIENT_ID"], os.environ["KLAVIYO_CLIENT_SECRET"]),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=60,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Klaviyo OAuth token refresh failed ({resp.status_code}): {resp.text[:500]}")
+    data = resp.json()
+    if "access_token" not in data:
+        raise RuntimeError(f"Klaviyo OAuth refresh returned no access_token: {data}")
+    new_rt = data.get("refresh_token")
+    if new_rt and new_rt != os.environ.get("KLAVIYO_REFRESH_TOKEN"):
+        os.environ["KLAVIYO_REFRESH_TOKEN"] = new_rt
+        set_key(ENV_PATH, "KLAVIYO_REFRESH_TOKEN", new_rt)
+    return data["access_token"]
+
+
+def _session(mode: str | None = None) -> requests.Session:
+    """Build an authenticated session. `mode` defaults to whatever
+    `_auth_mode()` resolves - OAuth if configured (see klaviyo_auth.py), else
+    the private API key. Callers should gate on `_auth_mode()` first (see
+    `run()`); with neither configured this raises a KeyError."""
+    mode = mode or _auth_mode()
     s = requests.Session()
     s.headers.update(_COMMON_HEADERS)
-    s.headers["Authorization"] = f"Klaviyo-API-Key {os.environ['KLAVIYO_API_KEY']}"
+    if mode == "oauth":
+        s.headers["Authorization"] = f"Bearer {_oauth_access_token()}"
+    else:
+        s.headers["Authorization"] = f"Klaviyo-API-Key {os.environ['KLAVIYO_API_KEY']}"
     return s
 
 
@@ -646,8 +698,9 @@ def run(only: set[str] | None = None, campaign_timeframe: str | None = None,
     `only` is a set drawn from {"campaigns", "flows", "audience", "attributed"};
     None means run everything. Each section logs to sync_log under its own
     platform name and a failure there does not stop the others."""
-    if not os.environ.get("KLAVIYO_API_KEY"):
-        print("  - klaviyo  SKIPPED (KLAVIYO_API_KEY not set in .env)")
+    if _auth_mode() is None:
+        print("  - klaviyo  SKIPPED (no Klaviyo credentials in .env - set "
+              "KLAVIYO_API_KEY, or configure OAuth via klaviyo_auth.py)")
         return 0
     if not _require_conversion_metric():
         return 0

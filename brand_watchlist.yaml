@@ -1,0 +1,29 @@
+# Optional config for amazon_ba_sync.py's Top Search Terms grain.
+#
+# The Brand Analytics Top Search Terms report is MARKET-WIDE (every seller,
+# every search term) and can be enormous, so amazon_ba_sync.py never stores it
+# wholesale. It always keeps a row when one of YOUR OWN ASINs shows up in that
+# term's top-3 clicked results, and it always keeps terms at or above a rank
+# cutoff (see rank_flag_max below). This file adds one more, OPTIONAL reason to
+# keep a term: matching a brand name you care about, even when neither of the
+# other two conditions is true.
+#
+# This file is entirely optional. If it's missing, amazon_ba_sync.py just
+# skips the brand-name matching feature — it still filters/stores search-term
+# data using the other two rules.
+#
+# Edit the lists below for YOUR OWN house brand name(s) and any competitor
+# brand(s) you want flagged. The example values ("Acme", "Widgetco") are
+# placeholders — replace them.
+
+house_brands:
+  - "Acme"
+
+competitor_brands:
+  - "Widgetco"
+
+# A search term is also kept if its searchFrequencyRank (1 = most-searched)
+# is at or below this number, regardless of brand match. Lower = more
+# selective (fewer terms kept just for being popular). Tune this to the scale
+# of your own catalog/marketplace.
+rank_flag_max: 2500

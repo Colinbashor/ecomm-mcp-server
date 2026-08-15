@@ -117,7 +117,9 @@ project depends on them.
   shipments.
 - **Klaviyo** (`klaviyo_sync.py`) — email/SMS campaign performance, flow
   (automation) performance, monthly audience/segment growth, and daily
-  attributed revenue by channel and flow.
+  attributed revenue by channel and flow. Supports either a private API key
+  or OAuth (`klaviyo_auth.py`, a PKCE helper matching the other `*_auth.py`
+  scripts' shape) — useful if you'd rather not hand out a long-lived key.
 - **Purple Dot** (`purple_dot_sync.py`) — pre-order/waitlist bookings and
   their eventual export into real storefront orders, plus daily waitlist
   inventory-allocation snapshots. Kept in its own tables rather than the
@@ -130,19 +132,47 @@ project depends on them.
   `read_customers` scope. Deliberately never stores email, name, phone, or
   address — see the module docstring for why.
 - **TikTok Shop extras** (`tiktok_videos_sync.py`, `tiktok_live_sync.py`,
-  `tiktok_creators_sync.py`) — video performance, LIVE-shopping broadcast +
-  product funnel, and a handle ↔ display-name ↔ user-id creator/affiliate
-  identity bridge (TikTok's video API and order API expose different halves
-  of a creator's identity with no shared join key — the bridge closes that
-  gap via the API plus an optional manual CSV import).
+  `tiktok_creators_sync.py`, `tiktok_analytics_sync.py`) — video performance,
+  LIVE-shopping broadcast + product funnel, a handle ↔ display-name ↔ user-id
+  creator/affiliate identity bridge (TikTok's video API and order API expose
+  different halves of a creator's identity with no shared join key — the
+  bridge closes that gap via the API plus an optional manual CSV import), and
+  a true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split (a
+  cleaner alternative to estimating "unattributed" sales by subtraction).
 - **Amazon Seller extras** (`amazon_inventory_sync.py`,
   `amazon_returns_sync.py`, `amazon_rank_sync.py`, `amazon_fees_sync.py`,
-  `amazon_economics_sync.py`) — FBA inventory snapshots, customer returns,
-  Best-Seller-Rank tracking, SP-API fee reports (previews, storage,
-  reimbursements, promotions, fulfilled shipments/MCF), and Data Kiosk SKU
-  economics (actual fees + net proceeds, as opposed to the fee-preview
-  estimate). All five reuse the SP-API credentials already set up for Amazon
-  retail orders.
+  `amazon_economics_sync.py`, `amazon_traffic_sync.py`) — FBA inventory
+  snapshots, customer returns, Best-Seller-Rank tracking, SP-API fee reports
+  (previews, storage, reimbursements, promotions, fulfilled shipments/MCF),
+  Data Kiosk SKU economics (actual fees + net proceeds, as opposed to the
+  fee-preview estimate), and per-ASIN Sales & Traffic (sessions, page views,
+  Buy Box %, units/sales, both weekly and monthly grain). All six reuse the
+  SP-API credentials already set up for Amazon retail orders.
+- **Amazon Ads detail** (`amazon_ads_detail_sync.py`) — the grains the
+  campaign-level connector (`run_sync.py --only amazon_ads`) can't reach:
+  per-ASIN advertised-product performance, keyword/target-level performance,
+  and customer search-term performance (Sponsored Products). Reuses the same
+  Ads API credentials — no new setup.
+- **Amazon Brand Analytics** (`amazon_sqp_sync.py`, `amazon_ba_sync.py`,
+  `warehouse/brand_analytics.py`) — for brand-registered sellers: Search
+  Query Performance (query-level volume + your share of impressions/clicks/
+  cart-adds/purchases vs. the whole market), Search Catalog Performance,
+  Top Search Terms (filterable — see the module docstring, since the raw
+  report is market-wide and can be huge), Market Basket Analysis (frequently
+  co-purchased products), and Repeat Purchase Behavior. These reports queue
+  for 15-25+ minutes on Amazon's side; `warehouse/brand_analytics.py` is the
+  shared create/poll/download runner both scripts build on. An optional
+  `brand_watchlist.yaml` (see that file) flags search terms containing your
+  own or a competitor's brand name. Reuses the SP-API credentials above —
+  requires brand registry, no new setup otherwise.
+- **Amazon Voice of the Customer** (`voc_import.py`) — there's no API for
+  this report, so it's a manual-drop CSV importer: download the export from
+  Seller Central (Performance > Voice of the Customer), drop it in a local
+  folder, and this loads per-ASIN/SKU customer-experience health and
+  negative-experience rate. A useful template if you need to import any
+  other Seller-Central-only report that has no API — header-driven column
+  matching (spellings drift between export versions) and `--dry-run` to
+  preview before writing.
 
 ## Notifications (optional)
 
@@ -164,6 +194,25 @@ nothing configured is silently skipped — `send()` never raises, so a
 notification failure can't take down whatever pipeline called it. See the
 module docstring for full setup (webhook creation, SMTP/app-password setup
 for email).
+
+## Backups (optional)
+
+`backup_db.py` makes a same-disk rotating copy of `warehouse.db` using
+SQLite's online backup API, which is safe to run against a live WAL database
+— a concurrent sync can keep writing while the backup runs. Useful once your
+warehouse holds history that's aged out of your source platforms' own API
+retention and so can't simply be re-pulled.
+
+```
+python backup_db.py
+```
+
+Defaults to a `warehouse-backups/` folder next to (not inside) the project
+directory, keeping the newest 3 copies; override with `WAREHOUSE_BACKUP_DIR`
+/ `WAREHOUSE_BACKUP_KEEP` in `.env`. A backup that fails to verify (can't
+open, no tables) is discarded rather than kept, so a corrupt copy never
+silently replaces a good one. Wire it into your OS's scheduler (Task
+Scheduler, cron, launchd) to run before your main sync job.
 
 ## Running the server
 
