@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import klaviyo_sync as ks
@@ -137,6 +138,153 @@ class LoadCampaignsAggregationTests(unittest.TestCase):
         count = self.conn.execute(
             "SELECT COUNT(*) FROM klaviyo_campaigns WHERE campaign_id='C1'").fetchone()[0]
         self.assertEqual(count, 1)
+
+
+class AttributedRevenueTests(unittest.TestCase):
+    """Coverage for the daily attributed-revenue-by-channel/flow section
+    (klaviyo_attributed_daily via metric-aggregates) - distinct from the
+    campaign/flow VALUE report tests above, which never touch this path."""
+
+    def setUp(self) -> None:
+        self.conn = sqlite3.connect(":memory:")
+        ks.ensure_schema(self.conn)
+        self._metric = ks.CONVERSION_METRIC
+        ks.CONVERSION_METRIC = "TEST_METRIC"
+
+    def tearDown(self) -> None:
+        ks.CONVERSION_METRIC = self._metric
+        self.conn.close()
+
+    @patch.object(ks, "_request")
+    def test_load_dimension_skips_all_zero_cells(self, mock_request) -> None:
+        mock_request.return_value = {"data": {"attributes": {
+            "dates": ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"],
+            "data": [{"dimensions": ["$email_channel"],
+                      "measurements": {"count": [0, 3], "unique": [0, 2],
+                                       "sum_value": [0.0, 45.5]}}],
+        }}}
+        n = ks._load_dimension(
+            MagicMock(), self.conn, "channel", "$attributed_channel",
+            "2026-01-01T00:00:00+00:00", "2026-01-03T00:00:00+00:00", ks._channel_name)
+        self.assertEqual(n, 1)
+        rows = self.conn.execute(
+            "SELECT date, dimension_name, conversions, revenue FROM klaviyo_attributed_daily"
+        ).fetchall()
+        self.assertEqual(rows, [("2026-01-02", "email", 3, 45.5)])
+
+    @patch.object(ks, "_request")
+    def test_load_dimension_resolves_names_incl_unattributed(self, mock_request) -> None:
+        mock_request.return_value = {"data": {"attributes": {
+            "dates": ["2026-01-01T00:00:00Z"],
+            "data": [
+                {"dimensions": ["$sms_channel"],
+                 "measurements": {"count": [1], "unique": [1], "sum_value": [10.0]}},
+                {"dimensions": [""],
+                 "measurements": {"count": [2], "unique": [1], "sum_value": [5.0]}},
+            ],
+        }}}
+        ks._load_dimension(
+            MagicMock(), self.conn, "channel", "$attributed_channel",
+            "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00", ks._channel_name)
+        names = {r[0]: r[1] for r in self.conn.execute(
+            "SELECT dimension_id, dimension_name FROM klaviyo_attributed_daily")}
+        self.assertEqual(names.get("$sms_channel"), "sms")
+        self.assertEqual(names.get(""), "unattributed")
+
+    @patch.object(ks, "_request")
+    def test_sync_attributed_channel_requests_expected_shape(self, mock_request) -> None:
+        mock_request.return_value = {"data": {"attributes": {"dates": [], "data": []}}}
+        ks.sync_attributed_channel(MagicMock(), self.conn, 10)
+        body = mock_request.call_args.kwargs["json"]
+        attrs = body["data"]["attributes"]
+        self.assertEqual(attrs["metric_id"], "TEST_METRIC")
+        self.assertEqual(attrs["by"], ["$attributed_channel"])
+        self.assertEqual(attrs["interval"], "day")
+
+    @patch.object(ks, "_request")
+    def test_sync_attributed_flow_resolves_name_via_flow_meta(self, mock_request) -> None:
+        mock_request.return_value = {"data": {"attributes": {
+            "dates": ["2026-01-01T00:00:00Z"],
+            "data": [{"dimensions": ["F1"],
+                      "measurements": {"count": [4], "unique": [3], "sum_value": [99.0]}}],
+        }}}
+        ks.sync_attributed_flow(MagicMock(), self.conn, 10,
+                                flow_meta={"F1": {"name": "Welcome Series"}})
+        row = self.conn.execute(
+            "SELECT dimension_name, conversions, revenue FROM klaviyo_attributed_daily "
+            "WHERE dimension_id='F1'").fetchone()
+        self.assertEqual(row, ("Welcome Series", 4, 99.0))
+
+    @patch.object(ks, "_request")
+    def test_sync_attributed_flow_unattributed_bucket_when_no_flow_id(self, mock_request) -> None:
+        mock_request.return_value = {"data": {"attributes": {
+            "dates": ["2026-01-01T00:00:00Z"],
+            "data": [{"dimensions": [""],
+                      "measurements": {"count": [1], "unique": [1], "sum_value": [7.0]}}],
+        }}}
+        ks.sync_attributed_flow(MagicMock(), self.conn, 10, flow_meta={})
+        row = self.conn.execute(
+            "SELECT dimension_name FROM klaviyo_attributed_daily WHERE dimension_id=''"
+        ).fetchone()
+        self.assertEqual(row, ("campaign/unattributed",))
+
+    def test_attributed_window_caps_at_max_days(self) -> None:
+        start_iso, end_iso = ks._attributed_window(10_000)
+        start = datetime.fromisoformat(start_iso)
+        end = datetime.fromisoformat(end_iso)
+        self.assertLessEqual((end - start).days, ks.ATTRIBUTED_MAX_DAYS + 1)
+        self.assertGreaterEqual((end - start).days, ks.ATTRIBUTED_MAX_DAYS)
+
+
+class AuthModeTests(unittest.TestCase):
+    """`_auth_mode()` / `_session()` resolve OAuth-vs-private-key credentials -
+    OAuth (klaviyo_auth.py's refresh token) takes precedence when both are
+    configured, and either path leaves the other connector behavior alone."""
+
+    def setUp(self) -> None:
+        self._env_keys = ("KLAVIYO_API_KEY", "KLAVIYO_CLIENT_ID",
+                          "KLAVIYO_CLIENT_SECRET", "KLAVIYO_REFRESH_TOKEN")
+        self._saved = {k: ks.os.environ.get(k) for k in self._env_keys}
+        for k in self._env_keys:
+            ks.os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            if v is None:
+                ks.os.environ.pop(k, None)
+            else:
+                ks.os.environ[k] = v
+
+    def test_no_credentials_resolves_to_none(self) -> None:
+        self.assertIsNone(ks._auth_mode())
+
+    def test_private_key_alone_resolves_to_private_key(self) -> None:
+        ks.os.environ["KLAVIYO_API_KEY"] = "pk_test"
+        self.assertEqual(ks._auth_mode(), "private_key")
+
+    def test_partial_oauth_config_falls_back_to_none(self) -> None:
+        # missing KLAVIYO_REFRESH_TOKEN - not a complete OAuth grant yet
+        ks.os.environ["KLAVIYO_CLIENT_ID"] = "id"
+        ks.os.environ["KLAVIYO_CLIENT_SECRET"] = "secret"
+        self.assertIsNone(ks._auth_mode())
+
+    def test_full_oauth_config_takes_precedence_over_private_key(self) -> None:
+        ks.os.environ["KLAVIYO_API_KEY"] = "pk_test"
+        ks.os.environ["KLAVIYO_CLIENT_ID"] = "id"
+        ks.os.environ["KLAVIYO_CLIENT_SECRET"] = "secret"
+        ks.os.environ["KLAVIYO_REFRESH_TOKEN"] = "rt"
+        self.assertEqual(ks._auth_mode(), "oauth")
+
+    def test_session_private_key_sets_expected_header(self) -> None:
+        ks.os.environ["KLAVIYO_API_KEY"] = "pk_test123"
+        session = ks._session()
+        self.assertEqual(session.headers["Authorization"], "Klaviyo-API-Key pk_test123")
+
+    @patch.object(ks, "_oauth_access_token", return_value="minted-token")
+    def test_session_oauth_mints_bearer_header(self, mock_mint) -> None:
+        session = ks._session(mode="oauth")
+        self.assertEqual(session.headers["Authorization"], "Bearer minted-token")
+        mock_mint.assert_called_once()
 
 
 class _TimeShim:

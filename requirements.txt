@@ -27,6 +27,12 @@ google-auth
 # other script here work without it.
 openpyxl
 
+# Only needed for amazon_ba_sync.py's OPTIONAL brand_watchlist.yaml feature
+# (flagging search terms that contain your own/competitor brand names). The
+# import is wrapped in a try/except, so amazon_ba_sync.py still runs its core
+# reports without this installed — it just skips that one feature.
+PyYAML
+
 # Needed by klaviyo_sync.py and tiktok_live_sync.py, which use the stdlib
 # `zoneinfo` module to convert timestamps into a shop's local calendar day.
 # Windows does not ship the IANA time zone database the way Linux/macOS
