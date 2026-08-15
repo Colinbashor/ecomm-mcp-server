@@ -193,8 +193,9 @@ class RowShapeTests(unittest.TestCase):
         tables = {r[0] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({
-            "gmc_product_performance", "gmc_product_status", "gmc_product_issues",
-            "gmc_price_competitiveness", "gmc_best_sellers", "gmc_competitive_visibility",
+            "gmc_product_performance", "gmc_account_performance", "gmc_product_status",
+            "gmc_product_issues", "gmc_price_competitiveness", "gmc_best_sellers",
+            "gmc_best_seller_brands", "gmc_competitive_visibility",
         } <= tables)
 
     def test_sync_performance_writes_expected_row_shape(self) -> None:
@@ -295,6 +296,82 @@ class RowShapeTests(unittest.TestCase):
         self.assertEqual(n, 1)
         reason = self.conn.execute("SELECT pull_reason FROM gmc_best_sellers").fetchone()[0]
         self.assertEqual(reason, "stocked")
+
+    def test_sync_account_performance_writes_expected_row_shape(self) -> None:
+        client = _FakeSearchClient([{
+            "date": {"year": 2026, "month": 8, "day": 1},
+            "week": {"year": 2026, "month": 7, "day": 27},
+            "clicks": "40", "impressions": "900", "clickThroughRate": "0.044",
+        }])
+        import datetime as dt
+        n = gmc.sync_account_performance(self.conn, client, dt.date(2026, 8, 1), dt.date(2026, 8, 1))
+        self.assertEqual(n, 1)
+        row = self.conn.execute(
+            "SELECT date, week_start, clicks, impressions, click_through_rate "
+            "FROM gmc_account_performance"
+        ).fetchone()
+        self.assertEqual(row, ("2026-08-01", "2026-07-27", 40, 900, 0.044))
+
+    def test_sync_best_sellers_includes_risers(self) -> None:
+        riser_row = {
+            "reportDate": {"year": 2026, "month": 7, "day": 13},
+            "reportGranularity": "WEEKLY", "reportCountryCode": "US",
+            "reportCategoryId": "166", "rank": "9000", "previousRank": "9500",
+            "title": "Example Product", "brand": "Example Brand",
+            "relativeDemand": "LOW", "relativeDemandChange": "RISER",
+            "inventoryStatus": "NOT_IN_INVENTORY",
+        }
+
+        class _RiserClient:
+            def search(self, query, **kw):
+                if "relative_demand_change = 'RISER'" in query:
+                    return iter([riser_row])
+                return iter([])
+
+        n = gmc.sync_best_sellers(self.conn, _RiserClient(),
+                                   [{"id": 166, "name": "Apparel"}], ["US"],
+                                   top_n=10, granularities=("WEEKLY",))
+        self.assertEqual(n, 1)
+        reason = self.conn.execute("SELECT pull_reason FROM gmc_best_sellers").fetchone()[0]
+        self.assertEqual(reason, "riser")
+
+    def test_sync_best_seller_brands_marks_tracked_brand(self) -> None:
+        row = {
+            "reportGranularity": "WEEKLY",
+            "reportDate": {"year": 2026, "month": 7, "day": 13},
+            "reportCountryCode": "US", "reportCategoryId": "166",
+            "rank": "5243", "previousRank": "5300", "brand": "Example Brand",
+            "relativeDemand": "VERY_LOW", "previousRelativeDemand": "VERY_LOW",
+            "relativeDemandChange": "FLAT",
+        }
+
+        class _BrandClient:
+            def search(self, query, **kw):
+                if "brand IN" in query:
+                    return iter([row])
+                return iter([])
+
+        n = gmc.sync_best_seller_brands(self.conn, _BrandClient(),
+                                         [{"id": 166, "name": "Apparel"}], ["US"],
+                                         brands=["Example Brand"], top_n=10,
+                                         granularities=("WEEKLY",))
+        self.assertEqual(n, 1)
+        brand, is_tracked, reason = self.conn.execute(
+            "SELECT brand, is_tracked_brand, pull_reason FROM gmc_best_seller_brands"
+        ).fetchone()
+        self.assertEqual((brand, is_tracked, reason), ("Example Brand", 1, "tracked_brand"))
+
+    def test_sync_best_seller_brands_skips_the_tracked_query_with_no_brands(self) -> None:
+        class _NoBrandQueryClient:
+            def search(self, query, **kw):
+                self_calls.append(query)
+                return iter([])
+
+        self_calls: list[str] = []
+        gmc.sync_best_seller_brands(self.conn, _NoBrandQueryClient(),
+                                     [{"id": 166, "name": "Apparel"}], ["US"],
+                                     brands=[], top_n=10, granularities=("WEEKLY",))
+        self.assertTrue(all("brand IN" not in q for q in self_calls))
 
     def test_sync_visibility_writes_competitor_row(self) -> None:
         # sync_visibility() queries once PER traffic_source (ALL/ADS/ORGANIC);

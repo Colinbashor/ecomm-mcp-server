@@ -5,13 +5,21 @@ Standalone script: creates its own tables in warehouse.db via ensure_schema(),
 so nothing else in the repo needs to change to query them (the MCP server's
 generic run_sql / list_tables tools work against any table automatically).
 
-Three reports per run:
+Four reports per run:
   ga_metrics       — daily full-funnel totals by default channel group
-                     (sessions, users, conversions, revenue, ...).
+                     (sessions, users, conversions, revenue, ...), plus a
+                     cookie-scoped first_time_purchasers count per channel
+                     (see "FIRST-TIME PURCHASERS ARE COOKIE-SCOPED" below).
   ga_products      — daily item-level views/add-to-cart/purchases/revenue.
                      Pulled in DAILY chunks (see "THE 100K-ROW CAP" below).
   ga_landing_pages — daily landing-page sessions/conversions/revenue, limited
                      to pages with meaningful traffic that day.
+  ga_campaign_ntb  — daily new-vs-returning split PER GOOGLE ADS CAMPAIGN (see
+                     "NEW-TO-BRAND BY CAMPAIGN" below). Answers "is this
+                     campaign acquiring new customers or just re-selling to
+                     existing ones?" — a question the channel-level metrics
+                     report can't reach, since it only has channel, not
+                     campaign, granularity.
 
 SETUP (once):
   1. Install the client library into your venv:
@@ -93,6 +101,42 @@ accounts commonly have more than one property (e.g. a web property and a
 separate mobile-app property under the same account), and pointing at the
 wrong one is a very easy, very quiet mistake: it doesn't error, it just
 returns tiny real numbers for a different property entirely.
+
+NEW-TO-BRAND BY CAMPAIGN. GA4's `sessionGoogleAdsCampaignName` dimension
+returns the campaign name byte-for-byte identical to whatever your Google Ads
+connector calls it (verify this once for your own account — it's a documented
+GA4 behavior, not something that needs reverse-engineering), so if you already
+have a naming convention that encodes campaign intent (a "Brand" vs
+"Non-Brand" prefix, a "-Prospecting" / "-Retargeting" suffix, anything
+parseable), that convention carries straight over to this table with no extra
+mapping step. `ga_campaign_ntb` splits sessions/users/transactions/revenue by
+`newVsReturning` (new / returning / "(not set)" — the last is real volume GA4
+simply can't classify, typically a few percent of sessions; never assume
+new + returning sums to the total) per campaign per day, so you can compare
+new-customer acquisition efficiency across campaigns directly. GA4 reports all
+non-Google-Ads traffic under a single "(not set)" pseudo-campaign that can
+dwarf real campaign volume (organic + direct + email + everything else that
+isn't a Google Ads click); this connector filters it out of
+`ga_campaign_ntb` specifically so a naive SUM over the table can't
+double-count it — the channel-level baseline (including that traffic) still
+lives in `ga_metrics`, which is why `ga_metrics` carries its own
+`first_time_purchasers` column for that comparison.
+
+FIRST-TIME PURCHASERS ARE COOKIE-SCOPED, NOT CUSTOMER-IDENTITY-SCOPED. GA4's
+`firstTimePurchasers` metric is scoped to the browser/device, not to a real
+customer identity: a returning customer on a new device, or one who cleared
+cookies, counts as "first-time." For a brand with meaningful repeat business
+this metric commonly reads far higher (sometimes 70-90%+ of sessions) than any
+real new-customer rate, on every channel — so don't hand an absolute count of
+it to anyone making a business decision on true new-customer acquisition.
+It IS trustworthy as a RELATIVE index for comparing channels or campaigns
+against each other, since the same cookie-scoping bias applies everywhere, and
+it still discriminates in the expected direction (channels built around
+repeat engagement, like email/SMS, read meaningfully lower than pure
+prospecting channels). A true new-to-brand count needs a real customer
+identity join, which this connector — being GA4-only — cannot provide; if your
+warehouse has an order-level customer id (e.g. from a commerce platform
+connector), that's the more defensible source for an absolute NTB number.
 """
 from __future__ import annotations
 
@@ -123,6 +167,11 @@ ITEM_MIN_VIEWS = 0
 # day, so the report doesn't fill up with one-visit noise.
 LANDING_PAGE_MIN_SESSIONS = 4
 
+# GA4's own pseudo-campaign for every session that didn't arrive via a Google
+# Ads click (organic, direct, email, everything else). Excluded from
+# ga_campaign_ntb — see "NEW-TO-BRAND BY CAMPAIGN" in the module docstring.
+NOT_SET_CAMPAIGN = "(not set)"
+
 DDL = """
 CREATE TABLE IF NOT EXISTS ga_metrics (
     property_id      TEXT NOT NULL,
@@ -135,6 +184,9 @@ CREATE TABLE IF NOT EXISTS ga_metrics (
     new_users        INTEGER DEFAULT 0,
     engaged_sessions INTEGER DEFAULT 0,
     purchases        INTEGER DEFAULT 0,   -- transactions
+    -- cookie/device-scoped, NOT customer-identity-scoped — see
+    -- "FIRST-TIME PURCHASERS ARE COOKIE-SCOPED" in the module docstring.
+    first_time_purchasers INTEGER DEFAULT 0,
     synced_at        TEXT NOT NULL,
     PRIMARY KEY (property_id, date, channel)
 );
@@ -167,11 +219,37 @@ CREATE TABLE IF NOT EXISTS ga_landing_pages (
     PRIMARY KEY (property_id, date, landing_page)
 );
 CREATE INDEX IF NOT EXISTS idx_ga_landing_date ON ga_landing_pages(date);
+
+-- New-vs-returning split per Google Ads campaign — see "NEW-TO-BRAND BY
+-- CAMPAIGN" in the module docstring. visitor_type is GA4's newVsReturning:
+-- 'new' | 'returning' | '(not set)' (real, unclassifiable volume — keep it).
+CREATE TABLE IF NOT EXISTS ga_campaign_ntb (
+    property_id           TEXT NOT NULL,
+    date                  TEXT NOT NULL,
+    campaign_name         TEXT NOT NULL,
+    visitor_type          TEXT NOT NULL,
+    sessions              INTEGER DEFAULT 0,
+    users                 INTEGER DEFAULT 0,
+    new_users             INTEGER DEFAULT 0,
+    transactions          INTEGER DEFAULT 0,
+    purchase_revenue      REAL    DEFAULT 0,
+    first_time_purchasers INTEGER DEFAULT 0,
+    synced_at             TEXT NOT NULL,
+    PRIMARY KEY (property_id, date, campaign_name, visitor_type)
+);
+CREATE INDEX IF NOT EXISTS idx_ga_ntb_date ON ga_campaign_ntb(date);
+CREATE INDEX IF NOT EXISTS idx_ga_ntb_campaign ON ga_campaign_ntb(campaign_name);
 """
 
+# Columns added after a table may already exist from an older version of this
+# script — applied on the fly so an existing warehouse.db doesn't need to be
+# dropped to pick up a new column.
+MIGRATE_COLUMNS = ("first_time_purchasers INTEGER DEFAULT 0",)
+
 # Grain names accepted by --only. "products" is the expensive one (daily
-# chunks); the other two are one request per month of range.
-GRAINS = ("metrics", "products", "landing_pages")
+# chunks); "metrics" and "landing_pages" are one request per month of range;
+# "campaign_ntb" is cheap (low cardinality: campaigns x 3 visitor types x days).
+GRAINS = ("metrics", "products", "landing_pages", "campaign_ntb")
 
 # GA4 caps a single report response at 100k rows; _run() pages past it with
 # offset/limit rather than trusting one request.
@@ -193,10 +271,14 @@ RETRY_BASE_SECONDS = 5  # 5, 10, 20, 40, 80, 160 seconds of backoff
 
 
 def ensure_schema(conn) -> None:
-    """Create this connector's tables if they don't exist yet. Safe to call
-    every run — matches the CREATE TABLE IF NOT EXISTS pattern used across
-    the rest of the warehouse."""
+    """Create this connector's tables if they don't exist yet, and add any
+    columns introduced after a table may already have been created (see
+    MIGRATE_COLUMNS) — safe to call every run."""
     conn.executescript(DDL)
+    existing = {c[1] for c in conn.execute("PRAGMA table_info(ga_metrics)")}
+    for col_def in MIGRATE_COLUMNS:
+        if col_def.split()[0] not in existing:
+            conn.execute(f"ALTER TABLE ga_metrics ADD COLUMN {col_def}")
 
 
 def _client() -> BetaAnalyticsDataClient:
@@ -220,6 +302,16 @@ def _gt_filter(metric: str, threshold: int) -> FilterExpression:
     ))
 
 
+def _not_dimension(dimension: str, value: str) -> FilterExpression:
+    """dimension != value — used to drop GA4's "(not set)" pseudo-campaign
+    from ga_campaign_ntb (see NOT_SET_CAMPAIGN)."""
+    return FilterExpression(not_expression=FilterExpression(filter=Filter(
+        field_name=dimension,
+        string_filter=Filter.StringFilter(
+            value=value, match_type=Filter.StringFilter.MatchType.EXACT),
+    )))
+
+
 def _with_retry(fn, what: str):
     """Call fn(), retrying TRANSIENT_ERRORS with exponential backoff."""
     for attempt in range(RETRY_TRIES):
@@ -235,7 +327,8 @@ def _with_retry(fn, what: str):
 
 
 def _run(client, prop: str, start: str, end: str, dimensions: list[str],
-         metrics: list[str], metric_filter: FilterExpression | None = None):
+         metrics: list[str], metric_filter: FilterExpression | None = None,
+         dimension_filter: FilterExpression | None = None):
     """Run one report, following GA4's offset pagination to completion.
 
     A naive version of this would issue one request capped at 100k rows and
@@ -254,6 +347,7 @@ def _run(client, prop: str, start: str, end: str, dimensions: list[str],
             dimensions=[Dimension(name=d) for d in dimensions],
             metrics=[Metric(name=m) for m in metrics],
             metric_filter=metric_filter,
+            dimension_filter=dimension_filter,
             limit=PAGE_LIMIT,
             offset=off,
         )), f"{dimensions} {start}..{end}")
@@ -324,20 +418,54 @@ def sync_metrics(client, conn, prop: str, start: str, end: str,
     for r in _run(client, prop, start, end,
                   ["date", "sessionDefaultChannelGroup"],
                   ["sessions", "totalUsers", conversion_metric, "totalRevenue",
-                   "newUsers", "engagedSessions", "transactions"]):
+                   "newUsers", "engagedSessions", "transactions",
+                   "firstTimePurchasers"]):
         m = [v.value for v in r.metric_values]
         rows.append((
             prop, _iso(r.dimension_values[0].value), r.dimension_values[1].value,
             int(float(m[0] or 0)), int(float(m[1] or 0)),
             float(m[2] or 0), float(m[3] or 0),
             int(float(m[4] or 0)), int(float(m[5] or 0)), int(float(m[6] or 0)),
+            int(float(m[7] or 0)),
             stamp,
         ))
     _purge_dates(conn, "ga_metrics", prop, rows)
     conn.executemany(
         """INSERT OR REPLACE INTO ga_metrics
            (property_id, date, channel, sessions, users, conversions, revenue,
-            new_users, engaged_sessions, purchases, synced_at)
+            new_users, engaged_sessions, purchases, first_time_purchasers, synced_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    return len(rows)
+
+
+def sync_campaign_ntb(client, conn, prop: str, start: str, end: str, stamp: str) -> int:
+    """New-vs-returning split per Google Ads campaign — see "NEW-TO-BRAND BY
+    CAMPAIGN" in the module docstring. Filters out GA4's "(not set)"
+    pseudo-campaign so a plain SUM over this table can't double-count the
+    non-Google-Ads traffic that lives in ga_metrics instead."""
+    rows = []
+    for r in _run(client, prop, start, end,
+                  ["date", "sessionGoogleAdsCampaignName", "newVsReturning"],
+                  ["sessions", "totalUsers", "newUsers", "transactions",
+                   "purchaseRevenue", "firstTimePurchasers"],
+                  dimension_filter=_not_dimension(
+                      "sessionGoogleAdsCampaignName", NOT_SET_CAMPAIGN)):
+        m = [v.value for v in r.metric_values]
+        rows.append((
+            prop, _iso(r.dimension_values[0].value),
+            r.dimension_values[1].value, r.dimension_values[2].value,
+            int(float(m[0] or 0)), int(float(m[1] or 0)), int(float(m[2] or 0)),
+            int(float(m[3] or 0)), float(m[4] or 0), int(float(m[5] or 0)),
+            stamp,
+        ))
+    _purge_dates(conn, "ga_campaign_ntb", prop, rows)
+    conn.executemany(
+        """INSERT OR REPLACE INTO ga_campaign_ntb
+           (property_id, date, campaign_name, visitor_type, sessions, users,
+            new_users, transactions, purchase_revenue, first_time_purchasers,
+            synced_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
@@ -423,6 +551,10 @@ def run(start: str, end: str, only: frozenset[str] | None = None) -> int:
             for lo, hi in _month_chunks(start, end):
                 with conn:
                     total += sync_landing_pages(client, conn, prop, lo, hi, stamp)
+        if "campaign_ntb" in grains:
+            for lo, hi in _month_chunks(start, end):
+                with conn:
+                    total += sync_campaign_ntb(client, conn, prop, lo, hi, stamp)
     finally:
         conn.close()
     return total

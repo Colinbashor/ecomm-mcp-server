@@ -85,13 +85,31 @@ manages its own tables via its own `ensure_schema(conn)` — nothing else in the
 project depends on them.
 
 - **Google Analytics 4** (`ga4_sync.py`) — daily channel-level funnel metrics,
-  item-level product views/sales, and landing-page performance. Handles GA4's
-  100k-row response cap with daily chunking and pagination.
+  item-level product views/sales, landing-page performance, and a new-vs-
+  returning split per Google Ads campaign (useful for a rough "is this
+  campaign acquiring new customers?" read — see the module docstring for the
+  cookie-scoping caveat on that last one). Handles GA4's 100k-row response
+  cap with daily chunking and pagination.
+- **Google Ads detail + structure** (`google_ads_detail_sync.py`,
+  `google_ads_structure_sync.py`) — everything the campaign-level connector
+  (`run_sync.py --only google`) doesn't reach: customer search terms,
+  keyword-level performance + Quality Score, per-product Shopping/Performance
+  Max demand, paid-vs-organic query overlap, which conversion actions feed
+  the reported Conversions number, device split, Performance Max search
+  themes, and CURRENT-STATE snapshots of campaign/asset-group/listing-group
+  configuration and conversion-action setup. The structure connector in
+  particular is aimed at "this campaign looks funded but isn't serving" —
+  a question spend/impression metrics alone usually can't answer. Reuses the
+  same GOOGLE_ADS_* credentials — no new setup.
 - **Google Merchant Center** (`merchant_center_sync.py`) — product feed
-  performance (organic vs. paid), feed eligibility/issues, price
-  competitiveness, category best-sellers, and competitive visibility. Requires
-  a one-time `registerGcp` API call before anything works — see the module
-  docstring; there's no Merchant Center UI for that step.
+  performance (organic vs. paid, plus account-wide non-product-specific
+  performance), feed eligibility/issues, price competitiveness, category
+  best-sellers (including a "riser" signal for products gaining demand
+  outside the usual top-N cut, and `--brand` for tracking specific brands —
+  yours or a competitor's — regardless of rank), and competitive visibility.
+  Requires a one-time `registerGcp` API call before anything works — see the
+  module docstring; there's no Merchant Center UI for that step. Also see the
+  module docstring for a lag-in-publishing gotcha on the visibility grain.
 - **Flexport** (`flexport_sync.py`, `flexport_orders_sync.py`,
   `flexport_returns_sync.py`, `flexport_inbounds_sync.py`) — 3PL fulfillment:
   catalog + daily inventory snapshots, per-order shipping cost (via a
@@ -125,6 +143,27 @@ project depends on them.
   economics (actual fees + net proceeds, as opposed to the fee-preview
   estimate). All five reuse the SP-API credentials already set up for Amazon
   retail orders.
+
+## Notifications (optional)
+
+`warehouse/notify.py` is a small standalone utility — not a connector, no
+tables of its own — for pushing a plain-text or lightly-formatted message to
+Slack, Google Chat, and/or email from any script in this repo (or your own).
+Useful for a "sync finished, here's a summary" ping, or turning any of the
+sync scripts above into an alert when something needs attention.
+
+```python
+from warehouse import notify
+notify.send("*Sync complete*\n- 1,204 rows written\nFull report: https://...", dest="daily_sync")
+```
+
+Targets are configured per named `dest` in `.env` (`<DEST>_SLACK_WEBHOOK`,
+`<DEST>_GCHAT_WEBHOOK`, `<DEST>_EMAIL_TO`), so different callers can point at
+different channels/spaces/inboxes with no code change, and a `dest` with
+nothing configured is silently skipped — `send()` never raises, so a
+notification failure can't take down whatever pipeline called it. See the
+module docstring for full setup (webhook creation, SMTP/app-password setup
+for email).
 
 ## Running the server
 
@@ -177,6 +216,7 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, and legacy-token-path log scrubbing |
 | `tests/test_run_sync.py` | One connector failing doesn't abort the rest of a sync run |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
+| `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, and that a missing/unconfigured/failing target is skipped rather than raised |
 
 Every standalone script under "Additional connectors" above has its own
 `tests/test_<script>.py` — schema creation, row-shaping, and its own API's
