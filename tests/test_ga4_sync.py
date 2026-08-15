@@ -191,13 +191,23 @@ class SchemaAndRowShapeTests(unittest.TestCase):
         ga4_sync.ensure_schema(self.conn)  # must not raise on a second call
         tables = {r[0] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"ga_metrics", "ga_products", "ga_landing_pages"} <= tables)
+        self.assertTrue({"ga_metrics", "ga_products", "ga_landing_pages",
+                         "ga_campaign_ntb"} <= tables)
+
+    def test_ensure_schema_migrates_first_time_purchasers_onto_an_older_table(self) -> None:
+        # Simulate a warehouse.db created before first_time_purchasers existed.
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE ga_metrics (property_id TEXT, date TEXT, "
+                     "channel TEXT, synced_at TEXT, PRIMARY KEY (property_id, date, channel))")
+        ga4_sync.ensure_schema(conn)  # must add the column, not raise
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(ga_metrics)")}
+        self.assertIn("first_time_purchasers", cols)
 
     def test_sync_metrics_writes_expected_row_shape(self) -> None:
         # sessions, totalUsers, conversions, totalRevenue, newUsers,
-        # engagedSessions, transactions
+        # engagedSessions, transactions, firstTimePurchasers
         page = _Resp([_Row(["20260101", "Organic Search"],
-                            ["120", "100", "5", "250.5", "30", "80", "10"])])
+                            ["120", "100", "5", "250.5", "30", "80", "10", "4"])])
         client = _FakeClient([page])
 
         n = ga4_sync.sync_metrics(client, self.conn, "999", "2026-01-01", "2026-01-01",
@@ -206,9 +216,40 @@ class SchemaAndRowShapeTests(unittest.TestCase):
 
         row = self.conn.execute(
             "SELECT property_id, date, channel, sessions, users, conversions, "
-            "revenue, new_users, engaged_sessions, purchases FROM ga_metrics"
+            "revenue, new_users, engaged_sessions, purchases, first_time_purchasers "
+            "FROM ga_metrics"
         ).fetchone()
-        self.assertEqual(row, ("999", "2026-01-01", "Organic Search", 120, 100, 5.0, 250.5, 30, 80, 10))
+        self.assertEqual(row, ("999", "2026-01-01", "Organic Search", 120, 100, 5.0, 250.5, 30, 80, 10, 4))
+
+    def test_sync_campaign_ntb_writes_expected_row_shape(self) -> None:
+        # sessions, totalUsers, newUsers, transactions, purchaseRevenue, firstTimePurchasers
+        page = _Resp([_Row(["20260101", "Brand | Search | US", "new"],
+                            ["500", "480", "480", "20", "999.5", "18"])])
+        client = _FakeClient([page])
+
+        n = ga4_sync.sync_campaign_ntb(client, self.conn, "999", "2026-01-01", "2026-01-01",
+                                        "2026-01-01T00:00:00+00:00")
+        self.assertEqual(n, 1)
+
+        row = self.conn.execute(
+            "SELECT campaign_name, visitor_type, sessions, users, new_users, "
+            "transactions, purchase_revenue, first_time_purchasers FROM ga_campaign_ntb"
+        ).fetchone()
+        self.assertEqual(row, ("Brand | Search | US", "new", 500, 480, 480, 20, 999.5, 18))
+
+    def test_sync_campaign_ntb_excludes_the_not_set_pseudo_campaign(self) -> None:
+        # The dimension_filter is applied server-side by GA4; here we assert
+        # the request actually carries the exclusion filter rather than
+        # trusting the fake client to enforce it.
+        page = _Resp([])
+        client = _FakeClient([page])
+        ga4_sync.sync_campaign_ntb(client, self.conn, "999", "2026-01-01", "2026-01-01",
+                                    "2026-01-01T00:00:00+00:00")
+        request = client.calls[0]
+        self.assertEqual(
+            request.dimension_filter.not_expression.filter.string_filter.value,
+            ga4_sync.NOT_SET_CAMPAIGN,
+        )
 
     def test_sync_products_writes_expected_row_shape(self) -> None:
         # itemsViewed, itemsAddedToCart, itemsPurchased, itemRevenue

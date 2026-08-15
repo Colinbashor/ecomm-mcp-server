@@ -4,10 +4,13 @@ Google Merchant Center (Merchant API v1) -> warehouse sync.
 Standalone script: creates its own tables in warehouse.db via ensure_schema().
 Pulls five report families, each independently selectable via --only:
   performance  — product_performance_view: ORGANIC vs ADS clicks/impressions/
-                 conversions per product per day. Most ad-platform connectors
-                 in this repo (e.g. google_ads.py) only ever see the PAID side
-                 of Shopping; this is the only place free/organic listing
-                 clicks show up at all.
+                 conversions per product per day, PLUS non_product_performance_view
+                 (account-wide, non-Shopping surfaces — e.g. Discovery/Demand
+                 Gen style placements that don't map to one product) as a
+                 second table under the same family. Most ad-platform
+                 connectors in this repo (e.g. google_ads.py) only ever see
+                 the PAID side of Shopping; this is the only place free/
+                 organic listing clicks show up at all.
   status       — product_view: current feed-eligibility state per product
                  (ELIGIBLE / ELIGIBLE_LIMITED / NOT_ELIGIBLE_OR_DISAPPROVED /
                  PENDING) plus the disapproval/warning issues attached to it.
@@ -15,9 +18,13 @@ Pulls five report families, each independently selectable via --only:
                  crowd-sourced benchmark price for the same product.
   bestsellers  — best_sellers_product_cluster_view: market-wide demand
                  ranking for a category (NOT your own sales — see "BEST
-                 SELLERS IS A MARKET RANKING" below).
+                 SELLERS IS A MARKET RANKING" below), plus
+                 best_sellers_brand_view for tracking specific brands
+                 (yours and/or competitors') across the rank curve via
+                 --brand.
   visibility   — competitive_visibility_competitor_view: your rank vs named
                  competitor domains for a category, plus a benchmark trend.
+                 See "VISIBILITY PUBLISHES A FEW DAYS LATE" below.
 
 SETUP (once):
   1. Reuse or create a Google Cloud service account and download its JSON
@@ -48,6 +55,7 @@ USAGE:
   python merchant_center_sync.py --start 2025-01-01 --end 2025-12-31 --only performance
   python merchant_center_sync.py --only performance|status|pricing|bestsellers|visibility
   python merchant_center_sync.py --category 166:"Apparel & Accessories" --country US --country GB
+  python merchant_center_sync.py --brand "Your Brand" --brand "Competitor Brand"
   python merchant_center_sync.py --backfill                          # walk performance back until it runs dry
 
 GOTCHAS WORTH KNOWING BEFORE YOU MODIFY THIS FILE
@@ -125,6 +133,26 @@ COMPETITIVE VISIBILITY VARIES BY traffic_source. The `ALL` / `ADS` / `ORGANIC`
 values return genuinely different competitor rank orderings for the same
 category and date — store and compare within one traffic_source, never mix
 them into a single ranking.
+
+VISIBILITY PUBLISHES A FEW DAYS LATE. `competitive_visibility_*` data tends to
+lag by several days relative to when it's queried — verify the actual lag for
+your own account once (query a wide recent range and see where real rows stop
+appearing), then set VISIBILITY_LAG_DAYS accordingly. The default `--days`
+window (today minus a few days, through today) will otherwise sit entirely
+inside the unpublished gap and silently return zero rows every single run —
+not an error, just an empty result that looks like "nothing changed" instead
+of "asked for a date that doesn't exist yet."
+
+TRACKING SPECIFIC BRANDS ACROSS THE RANK CURVE (`--brand`). The plain top-N
+best-sellers cut (see above) only shows the highest-ranked products in a
+category — fine for market context, useless for checking where one specific
+brand (yours, or a competitor's) sits if it's not near the top. `--brand`
+issues an explicit `brand IN (...)` query against `best_sellers_brand_view`
+so a brand ranked in the thousands is still retrievable directly, stored in
+`gmc_best_seller_brands` with `is_tracked_brand` marking which rows matched
+your list. Brand matching is exact (case-insensitive) — a substring match
+would risk one brand name accidentally matching an unrelated brand that
+happens to contain the same word.
 """
 from __future__ import annotations
 
@@ -217,6 +245,16 @@ CREATE TABLE IF NOT EXISTS gmc_product_issues (
     PRIMARY KEY (gmc_id, issue_code)
 );
 
+CREATE TABLE IF NOT EXISTS gmc_account_performance (
+    date               TEXT NOT NULL,
+    week_start         TEXT,
+    clicks             INTEGER,
+    impressions        INTEGER,
+    click_through_rate REAL,
+    synced_at          TEXT NOT NULL,
+    PRIMARY KEY (date)
+);
+
 CREATE TABLE IF NOT EXISTS gmc_price_competitiveness (
     snapshot_date        TEXT NOT NULL,
     gmc_id               TEXT NOT NULL,
@@ -246,7 +284,24 @@ CREATE TABLE IF NOT EXISTS gmc_best_sellers (
     relative_demand      TEXT,
     relative_demand_change TEXT,
     inventory_status     TEXT,
-    pull_reason          TEXT,  -- 'top_n' | 'stocked'
+    pull_reason          TEXT,  -- 'top_n' | 'stocked' | 'riser'
+    synced_at            TEXT NOT NULL,
+    PRIMARY KEY (report_date, report_granularity, report_country_code, report_category_id, rank)
+);
+
+CREATE TABLE IF NOT EXISTS gmc_best_seller_brands (
+    report_date          TEXT NOT NULL,
+    report_granularity   TEXT NOT NULL,
+    report_country_code  TEXT NOT NULL,
+    report_category_id   TEXT NOT NULL,
+    rank                 INTEGER NOT NULL,
+    previous_rank        INTEGER,
+    brand                TEXT,
+    is_tracked_brand     INTEGER DEFAULT 0,  -- 1 if `brand` matched --brand
+    relative_demand      TEXT,
+    previous_relative_demand TEXT,
+    relative_demand_change   TEXT,
+    pull_reason          TEXT,  -- 'top_n' | 'tracked_brand'
     synced_at            TEXT NOT NULL,
     PRIMARY KEY (report_date, report_granularity, report_country_code, report_category_id, rank)
 );
@@ -465,6 +520,33 @@ def sync_performance(conn, client: Client, start: dt.date, end: dt.date) -> int:
     return total
 
 
+def sync_account_performance(conn, client: Client, start: dt.date, end: dt.date) -> int:
+    """Account-wide clicks/impressions on non-product-specific surfaces
+    (non_product_performance_view) — Shopping surfaces that don't map to one
+    product, so they can't appear in sync_performance's per-product rows.
+    Same account, same date range, different scope."""
+    now = db.now()
+    rows = []
+    for v in client.search(
+            "SELECT date, week, clicks, impressions, click_through_rate "
+            "FROM non_product_performance_view "
+            f"WHERE date BETWEEN '{start:%Y-%m-%d}' AND '{end:%Y-%m-%d}'"):
+        rows.append({
+            "date": as_date(v.get("date")), "week_start": as_date(v.get("week")),
+            "clicks": as_int(v.get("clicks")),
+            "impressions": as_int(v.get("impressions")),
+            "click_through_rate": as_float(v.get("clickThroughRate")),
+            "synced_at": now,
+        })
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO gmc_account_performance "
+            "(date, week_start, clicks, impressions, click_through_rate, synced_at) "
+            "VALUES (:date, :week_start, :clicks, :impressions, "
+            ":click_through_rate, :synced_at)", rows)
+    return len(rows)
+
+
 # --------------------------------------------------------------------------- #
 #  feed health / status
 # --------------------------------------------------------------------------- #
@@ -615,7 +697,7 @@ _BS_SELECT = ("report_granularity, report_date, report_country_code, "
               "report_category_id, rank, previous_rank, title, brand, "
               "relative_demand, relative_demand_change, inventory_status")
 
-_REASON_RANK = {"stocked": 2, "top_n": 1}
+_REASON_RANK = {"stocked": 3, "riser": 2, "top_n": 1, "tracked_brand": 3}
 
 _BS_INSERT = """
 INSERT OR REPLACE INTO gmc_best_sellers
@@ -632,8 +714,11 @@ VALUES (:report_date, :report_granularity, :report_country_code,
 def sync_best_sellers(conn, client: Client, categories, countries,
                        top_n: int = DEFAULT_TOP_N,
                        granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY")) -> int:
-    """Market best sellers, as the UNION of two targeted queries per category —
-    see "A PLAIN TOP-N CUT CAN MISS EVERYTHING YOU ACTUALLY STOCK" above."""
+    """Market best sellers, as the UNION of three targeted queries per
+    category — see "A PLAIN TOP-N CUT CAN MISS EVERYTHING YOU ACTUALLY STOCK"
+    above. The third variant (rows with rising relative demand) surfaces
+    products gaining momentum even if they're not yet ranked near the top or
+    in your own inventory — an early signal worth watching."""
     now = db.now()
     total = 0
     for country in countries:
@@ -650,6 +735,9 @@ def sync_best_sellers(conn, client: Client, categories, countries,
                     ("stocked", f"SELECT {_BS_SELECT} FROM "
                                 f"best_sellers_product_cluster_view WHERE {base} "
                                 f"AND inventory_status != 'NOT_IN_INVENTORY'"),
+                    ("riser", f"SELECT {_BS_SELECT} FROM "
+                              f"best_sellers_product_cluster_view WHERE {base} "
+                              f"AND relative_demand_change = 'RISER'"),
                 )
                 merged: dict[tuple, dict] = {}
                 for reason, query in variants:
@@ -686,6 +774,94 @@ def sync_best_sellers(conn, client: Client, categories, countries,
     return total
 
 
+def _quoted_list(values: list[str]) -> str:
+    """['A', "O'Brien"] -> "'A','O''Brien'" for a SQL IN (...) clause."""
+    return ",".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+_BSB_INSERT = """
+INSERT OR REPLACE INTO gmc_best_seller_brands
+ (report_date, report_granularity, report_country_code, report_category_id,
+  rank, previous_rank, brand, is_tracked_brand, relative_demand,
+  previous_relative_demand, relative_demand_change, pull_reason, synced_at)
+VALUES (:report_date, :report_granularity, :report_country_code,
+        :report_category_id, :rank, :previous_rank, :brand, :is_tracked_brand,
+        :relative_demand, :previous_relative_demand, :relative_demand_change,
+        :pull_reason, :synced_at)
+"""
+
+
+def sync_best_seller_brands(conn, client: Client, categories, countries, brands,
+                             top_n: int = DEFAULT_TOP_N,
+                             granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY")) -> int:
+    """Brand-level market demand. `brands` (from --brand, case-insensitive) is
+    fetched with an EXPLICIT `brand IN (...)` query, because a specific brand
+    you care about can sit far outside any reasonable top-N cutoff (a small
+    or niche brand can rank in the thousands within a broad category)."""
+    now = db.now()
+    tracked = brands or []
+    tracked_lower = {b.lower() for b in tracked}
+    sel = ("report_granularity, report_date, report_country_code, "
+           "report_category_id, rank, previous_rank, brand, relative_demand, "
+           "previous_relative_demand, relative_demand_change")
+    total = 0
+    for country in countries:
+        for gran in granularities:
+            for cat in categories:
+                cid = cat["id"]
+                base = (f"report_country_code = '{country}' "
+                        f"AND report_granularity = '{gran}' "
+                        f"AND report_category_id = {cid}")
+                variants = [
+                    ("top_n", f"SELECT {sel} FROM best_sellers_brand_view "
+                              f"WHERE {base} ORDER BY rank ASC LIMIT {top_n}"),
+                ]
+                if tracked:
+                    variants.append(
+                        ("tracked_brand",
+                         f"SELECT {sel} FROM best_sellers_brand_view "
+                         f"WHERE {base} AND brand IN ({_quoted_list(tracked)})"))
+                merged: dict[tuple, dict] = {}
+                for reason, query in variants:
+                    try:
+                        for v in client.search(query):
+                            key = (as_date(v.get("reportDate")),
+                                   v.get("reportGranularity"),
+                                   v.get("reportCountryCode"),
+                                   str(v.get("reportCategoryId")),
+                                   as_int(v.get("rank")))
+                            prev = merged.get(key)
+                            if prev and _REASON_RANK[prev["pull_reason"]] >= \
+                                    _REASON_RANK[reason]:
+                                continue
+                            brand = v.get("brand") or None
+                            merged[key] = {
+                                "report_date": key[0],
+                                "report_granularity": key[1],
+                                "report_country_code": key[2],
+                                "report_category_id": key[3], "rank": key[4],
+                                "previous_rank": as_int(v.get("previousRank")),
+                                "brand": brand,
+                                "is_tracked_brand": int(
+                                    (brand or "").lower() in tracked_lower),
+                                "relative_demand": v.get("relativeDemand"),
+                                "previous_relative_demand":
+                                    v.get("previousRelativeDemand"),
+                                "relative_demand_change":
+                                    v.get("relativeDemandChange"),
+                                "pull_reason": reason, "synced_at": now,
+                            }
+                    except GmcQueryError as exc:
+                        print(f"    [brands {gran} cat {cid} {reason}] "
+                              f"skipped: {exc}".replace("\n", " ")[:200])
+                rows = [r for r in merged.values() if r["rank"] is not None]
+                if rows:
+                    with conn:
+                        conn.executemany(_BSB_INSERT, rows)
+                    total += len(rows)
+    return total
+
+
 def _backfill_months(client: Client, conn, start_from: dt.date | None = None
                       ) -> tuple[int, dt.date | None]:
     """Walk performance history backwards a month at a time until it runs
@@ -712,6 +888,12 @@ def _backfill_months(client: Client, conn, start_from: dt.date | None = None
 #  competitive visibility
 # --------------------------------------------------------------------------- #
 TRAFFIC_SOURCES = ("ALL", "ADS", "ORGANIC")
+
+# competitive_visibility_*_view publishes several days late (see "VISIBILITY
+# PUBLISHES A FEW DAYS LATE" in the module docstring — verify the actual lag
+# for your own account and adjust). The default --days window otherwise sits
+# entirely inside the unpublished gap and silently returns zero rows forever.
+VISIBILITY_LAG_DAYS = 4
 
 
 def sync_visibility(conn, client: Client, categories, countries,
@@ -791,6 +973,9 @@ def main() -> None:
                     help="'id' or 'id:Name' (repeatable; default: %s)" % (DEFAULT_CATEGORIES[0]["id"]))
     p.add_argument("--country", action="append",
                     help="ISO country code (repeatable; default: %s)" % (DEFAULT_COUNTRIES[0]))
+    p.add_argument("--brand", action="append",
+                    help="brand name to track explicitly in bestsellers, even "
+                         "outside the top-n cutoff (repeatable)")
     p.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
     args = p.parse_args()
 
@@ -810,6 +995,7 @@ def main() -> None:
     families = tuple(args.only) if args.only else FAMILIES
     categories = [_parse_category(c) for c in args.category] if args.category else list(DEFAULT_CATEGORIES)
     countries = args.country or list(DEFAULT_COUNTRIES)
+    brands = args.brand or []
 
     db.init_db()
     conn = db.connect()
@@ -827,6 +1013,7 @@ def main() -> None:
                     client, conn, dt.date.fromisoformat(args.start) if args.start else None)
             else:
                 n = sync_performance(conn, client, start, end)
+                n += sync_account_performance(conn, client, start, end)
             if resume:
                 paused = True
                 db.log_sync("gmc_performance", started, n, "degraded",
@@ -865,6 +1052,7 @@ def main() -> None:
         started = db.now()
         try:
             n = sync_best_sellers(conn, client, categories, countries, args.top_n)
+            n += sync_best_seller_brands(conn, client, categories, countries, brands, args.top_n)
             db.log_sync("gmc_bestsellers", started, n, "ok")
             print(f"  bestsellers: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
@@ -875,7 +1063,14 @@ def main() -> None:
     if "visibility" in families:
         started = db.now()
         try:
-            n = sync_visibility(conn, client, categories, countries, start, end)
+            if args.start or args.end:
+                vis_start, vis_end = start, end
+            else:
+                vis_end = today - dt.timedelta(days=VISIBILITY_LAG_DAYS)
+                vis_start = vis_end - dt.timedelta(days=max(args.days, 1) - 1)
+                print(f"  visibility window {vis_start} .. {vis_end} "
+                      f"(lag-shifted {VISIBILITY_LAG_DAYS}d — see VISIBILITY_LAG_DAYS)")
+            n = sync_visibility(conn, client, categories, countries, vis_start, vis_end)
             db.log_sync("gmc_visibility", started, n, "ok")
             print(f"  visibility: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
