@@ -719,7 +719,7 @@ def _rows_to_json(rows) -> str:
 def list_tables(table_pattern: str | None = None,
                 include_columns: bool = True) -> str:
     """
-    List the warehouse's tables and their column names.
+    List the warehouse's tables and views, with their column names.
 
     On a mature warehouse the full dump gets large — at ~100 tables it costs
     several thousand tokens per call — so prefer narrowing it:
@@ -728,9 +728,17 @@ def list_tables(table_pattern: str | None = None,
                        makes it a raw SQL LIKE pattern instead.
       include_columns  set false for a cheap name-only catalogue when you just
                        need to know what exists.
+
+    VIEWS are included on purpose, not just tables. If your schema defines a
+    SQL VIEW — for example a dedup view over a source table that can carry
+    several disagreeing rows per key, exposed as the safe join target instead
+    of the raw table — it needs to be just as discoverable here as a table,
+    or a caller exploring the schema over MCP will never learn it exists and
+    will join the raw (unsafe) table instead. `PRAGMA table_info(...)` works
+    the same way for a view as for a table, so no other change was needed.
     """
     conn = db.connect_readonly()
-    sql = "SELECT name FROM sqlite_master WHERE type='table'"
+    sql = "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
     params: tuple[Any, ...] = ()
     if table_pattern:
         # Only '%' signals a hand-written pattern. Underscores must NOT: LIKE
