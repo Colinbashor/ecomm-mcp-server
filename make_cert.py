@@ -15,9 +15,8 @@ connect via mcp-remote; see SHARING.md.
     .venv\Scripts\python.exe make_cert.py            # auto-detect names
     .venv\Scripts\python.exe make_cert.py extra.name 10.1.2.3   # add SANs
 
-Requires the `cryptography` package (pip install cryptography) — not in
-requirements.txt by default since most setups only need stdio, not the
-team-shared HTTP mode.
+Requires the `cryptography` package, already pinned in requirements.txt (see
+the README's Setup step) — no separate install needed.
 """
 from __future__ import annotations
 
