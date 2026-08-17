@@ -130,6 +130,37 @@ should then see the warehouse tools under the hammer icon: `spend_summary`,
 `last_sync_status`. See the README's [MCP tools](README.md#mcp-tools)
 section for what each one does and its parameters.
 
+## Migrating off the legacy token-in-URL scheme
+
+An earlier version of this setup put the bearer token directly in the URL path
+(`https://host:8787/<token>/mcp`) instead of the `Authorization: Bearer` header
+shown in step 3 above. That style is deprecated — a token embedded in a URL
+tends to end up in browser history, proxy access logs, and shell history, none
+of which happens with a header — but a fleet of already-configured teammates
+can't all switch their local `claude_desktop_config.json` in the same instant.
+
+`--allow-legacy-token-path` bridges the gap: while it's set, the server accepts
+**both** the new header style and the old `/<token>/mcp` path, so you can roll
+the header-based config out to one teammate at a time without breaking
+everyone else's connection mid-migration.
+
+```bash
+python server.py --http --port 8787 --allow-legacy-token-path
+```
+
+Once every teammate's config has moved to the header style, remove the flag
+(and update `serve_mcp.bat` if you run it as a Windows service) — leaving it on
+indefinitely keeps the weaker scheme available with no offsetting benefit.
+
+While the flag is set:
+- Both URL styles authenticate identically; either one being valid is enough.
+- The server scrubs the token out of the path before anything logs it (Uvicorn's
+  access log included), so even the legacy style doesn't leave the secret sitting
+  in plain text in a log file.
+- If you rotate `WAREHOUSE_MCP_TOKEN`, a client still hitting the old
+  `/<old-token>/mcp` URL gets a normal 401, exactly like a wrong header would —
+  rotation isn't blocked by having the flag on.
+
 ## Notes
 
 - The server is **read-only** — `run_sql` only permits `SELECT`/`WITH`, and
@@ -139,11 +170,6 @@ section for what each one does and its parameters.
   `server.py`, 45s by default) — one unindexed scan or accidental cross join
   can't tie up a server that several people share. A query that hits the
   budget gets cancelled with a clear error instead of stalling everyone else.
-- If you rotate `WAREHOUSE_MCP_TOKEN` while running with
-  `--allow-legacy-token-path`, a stale client retrying against the old
-  `/<old-token>/mcp` URL gets a normal 401 — and the server scrubs that path
-  before logging it, so the retired token never ends up sitting in plain text
-  in an access log.
 - Ask Claude to run `last_sync_status` to check data freshness for each
   platform.
 - The bearer token is a secret. Don't post it in a public channel or embed it
