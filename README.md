@@ -234,6 +234,12 @@ can live in `WAREHOUSE_MCP_ALLOWED_HOSTS` (re-read without a restart). Use
 `--check-host <value>` to print the accept/reject verdict for a Host and exit.
 `--allow-any-host` disables Host/Origin validation entirely — a debug escape hatch, not
 something to leave on; the server re-warns in the log every 6 hours while it's set.
+`--allow-legacy-token-path` is a temporary migration switch: it makes the server also
+accept the older `/<token>/mcp` URL-embedded-token style alongside the current
+`Authorization: Bearer` header, so you can roll the header-based config out to coworkers
+one at a time instead of breaking everyone's config in the same instant. Drop the flag
+once every teammate's config has switched — see [SHARING.md](SHARING.md#migrating-off-the-legacy-token-in-url-scheme)
+for the full rotation story.
 
 See [SHARING.md](SHARING.md) for the full walkthrough: generating a self-signed
 cert with `make_cert.py` so Claude's connector UI accepts the URL, keeping the
@@ -310,6 +316,7 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | File | Covers |
 |---|---|
 | `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, and legacy-token-path log scrubbing |
+| `tests/test_list_tables.py` | `list_tables` surfaces SQL views alongside tables, in both column-listing and name-only mode, and `table_pattern` matches views too |
 | `tests/test_run_sync.py` | One connector failing doesn't abort the rest of a sync run |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, and that a missing/unconfigured/failing target is skipped rather than raised |
