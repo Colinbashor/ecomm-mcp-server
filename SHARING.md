@@ -127,7 +127,8 @@ Notes:
 Fully quit Claude Desktop (not just close the window) and reopen it. You
 should then see the warehouse tools under the hammer icon: `spend_summary`,
 `sales_summary`, `top_campaigns`, `run_sql`, `list_tables`,
-`last_sync_status`.
+`last_sync_status`. See the README's [MCP tools](README.md#mcp-tools)
+section for what each one does and its parameters.
 
 ## Notes
 
