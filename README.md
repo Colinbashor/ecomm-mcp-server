@@ -240,6 +240,53 @@ cert with `make_cert.py` so Claude's connector UI accepts the URL, keeping the
 server running across reboots with `serve_mcp.bat` (Windows), and the
 `mcp-remote` config snippet each teammate adds to their own Claude Desktop.
 
+## MCP tools
+
+`server.py` exposes six read-only tools — identical set and behavior whether
+you're connected over stdio or `--http`. All annotate `readOnlyHint=True`, so
+clients don't prompt for write-style approval.
+
+| Tool | Signature | Returns |
+|---|---|---|
+| `list_tables` | `(table_pattern: str = None, include_columns: bool = True)` | table/view names, optionally with column lists |
+| `run_sql` | `(query: str)` | up to 1000 rows as JSON |
+| `spend_summary` | `(start_date, end_date)` | spend/revenue/clicks/impressions/conversions/ROAS per platform |
+| `top_campaigns` | `(start_date, end_date, limit: int = 15)` | top campaigns by spend across platforms |
+| `sales_summary` | `(start_date, end_date)` | order count, units, and sales per platform |
+| `last_sync_status` | `()` | most recent sync run per platform, for checking data freshness |
+
+- **`list_tables`** — the schema explorer. Narrow it with `table_pattern`
+  (substring match, case-insensitive — `"shopify"` finds every `shopify_*`
+  table; include a literal `%` to write a raw SQL `LIKE` pattern instead) and
+  drop `include_columns` to `false` for a cheap name-only catalogue. On a
+  mature warehouse the full dump costs several thousand tokens, so prefer
+  narrowing over calling it bare. It lists **views as well as tables** — if
+  your schema defines a SQL `VIEW` (a dedup view over a source table that can
+  carry several disagreeing rows per key, say, exposed as the safe join
+  target instead of the raw table), it needs to be just as discoverable here
+  or a caller exploring the schema will join the raw table instead of the
+  view built to protect against exactly that.
+- **`run_sql`** — ad-hoc analysis. Only `SELECT`/`WITH` are accepted (checked
+  up front, and enforced again by SQLite itself since the connection is
+  opened `mode=ro`); anything else returns an error string instead of
+  executing. Results are capped at 1000 rows — a truncation notice is
+  appended if you hit it, so add a `LIMIT` or pre-aggregate. Each call also
+  carries a wall-clock budget (`RUN_SQL_TIMEOUT_SEC` in `server.py`, 45s by
+  default): a query that runs past it is cancelled with a clear error rather
+  than tying up a server other people may be sharing. Over `--http`, any
+  column listed in `_REMOTE_DENIED_COLUMNS` is unreadable — even through
+  joins, aliases, subqueries, or quoting — while remaining fully queryable
+  over local stdio; see [SHARING.md](SHARING.md).
+- **`spend_summary`**, **`top_campaigns`**, **`sales_summary`** — the
+  canonical rollups over `ad_metrics` and `orders`, the two tables
+  `run_sync.py`'s connectors share a uniform shape for. Dates are inclusive
+  `YYYY-MM-DD` strings. Anything these three don't answer, reach for
+  `run_sql` — `list_tables` shows what else is available, including every
+  table an "Additional connectors" script above adds.
+- **`last_sync_status`** — one row per platform from `sync_log`: last run
+  time, status, rows written, and any error message. The first thing to
+  check if a summary tool looks stale or empty.
+
 ## Claude Desktop
 
 Copy `claude_desktop_config.example.json` into your Claude Desktop config and replace
