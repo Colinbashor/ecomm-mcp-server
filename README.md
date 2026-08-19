@@ -6,7 +6,7 @@ SQLite warehouse of e-commerce data — plus the connectors that fill it.
 Pull advertising and order data from Google Ads, Meta Ads, Amazon (Ads + SP-API), Shopify,
 and TikTok Shop into one SQLite file, then query it in natural language from any MCP client.
 A further set of optional standalone scripts covers GA4, Google Merchant Center, Flexport,
-Klaviyo, Purple Dot, and more — see "Additional connectors" below.
+Klaviyo, Purple Dot, and more — see [Connectors, by platform](#connectors-by-platform) below.
 
 ## How it fits together
 
@@ -44,11 +44,26 @@ python run_sync.py --sample
 This loads synthetic rows so you can verify the schema and exercise the MCP tools before
 wiring up a single real API.
 
-## Getting credentials
+## Syncing real data
 
-Every connector reads its own block in `.env.example`, which documents where to get each
-value. Three platforms need a one-time interactive OAuth consent before you have a refresh
-token to put in `.env` — a helper script drives that flow and saves the result for you:
+The five **core** platforms below share a uniform ads/orders shape and run through one
+CLI. Everything else — the platforms with their own table shapes — is a standalone script;
+see [Connectors, by platform](#connectors-by-platform).
+
+```bash
+python run_sync.py                          # last 7 days, all configured platforms
+python run_sync.py --days 30                # a wider window
+python run_sync.py --start 2026-01-01 --end 2026-01-31
+python run_sync.py --only google,meta       # just these platforms
+```
+
+Platforms whose environment variables are absent are skipped automatically. Valid `--only`
+names: `google`, `meta`, `amazon` (Ads), `amazon_orders` (SP-API retail orders), `shopify`,
+`tiktok`.
+
+`.env.example` documents where to get every credential. Three platforms need a one-time
+interactive OAuth consent before you have a refresh token — a helper script drives that flow
+and saves the result for you:
 
 ```bash
 python google_auth.py                          # Google Ads: opens a browser, saves the refresh token
@@ -59,160 +74,40 @@ python tiktok_auth.py PASTE_THE_CODE_HERE       # TikTok Shop: same pattern, cod
 
 Amazon retail orders (SP-API) and Shopify don't need one of these: SP-API gives you a refresh
 token directly in Seller Central when you authorize your own private app, and Shopify uses a
-non-interactive client-credentials grant that the connector performs itself. See the comments
-above each block in `.env.example` for the exact steps.
+non-interactive client-credentials grant that the connector performs itself. Full setup steps
+for each core platform, including exact env vars, live on its own page — see the table below.
 
-## Syncing real data
+## Connectors, by platform
 
-```bash
-python run_sync.py                      # last 7 days
-python run_sync.py --days 30            # a wider window
-python run_sync.py --start 2026-01-01 --end 2026-01-31
-python run_sync.py --only google,meta   # just these connectors
-```
+`run_sync.py` only handles the five core platforms above. A number of other
+integrations don't fit its uniform shape — a daily inventory snapshot, a
+campaign report, a product feed — so each lives as its own standalone script,
+runnable directly (`python <script>.py`) and schedule-able independently
+(cron, Task Scheduler, etc.). Every one is optional: skip a page entirely if
+you don't use that platform.
 
-Connectors whose environment variables are absent are skipped automatically.
+Each page below is self-contained: setup/credentials, usage, the tables it
+writes, and its test coverage.
 
-## Additional connectors (standalone scripts)
+| Platform | Doc | Core connector | Standalone extras |
+|---|---|---|---|
+| Google Ads | [docs/google-ads.md](docs/google-ads.md) | campaign spend/clicks/conversions | search terms, keywords, Shopping/PMax demand, campaign structure |
+| Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages, new-vs-returning |
+| Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
+| Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | — |
+| Amazon Advertising | [docs/amazon-ads.md](docs/amazon-ads.md) | campaign spend/clicks/conversions | per-ASIN, keyword/target, search-term performance |
+| Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
+| Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase |
+| Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
+| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split |
+| Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | campaign/flow performance, audience growth, attributed revenue |
+| Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
+| Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
 
-`run_sync.py` only handles platforms that fit its uniform ads/orders shape. A
-number of other integrations don't — they have their own table shapes (a daily
-inventory snapshot, a campaign report, a product feed) — so each lives as its
-own standalone script instead, runnable directly (`python <script>.py`) and
-schedule-able independently (cron, Task Scheduler, etc.). Every one of them is
-optional: skip a script entirely if you don't use that platform, and each
-manages its own tables via its own `ensure_schema(conn)` — nothing else in the
-project depends on them.
-
-- **Google Analytics 4** (`ga4_sync.py`) — daily channel-level funnel metrics,
-  item-level product views/sales, landing-page performance, and a new-vs-
-  returning split per Google Ads campaign (useful for a rough "is this
-  campaign acquiring new customers?" read — see the module docstring for the
-  cookie-scoping caveat on that last one). Handles GA4's 100k-row response
-  cap with daily chunking and pagination.
-- **Google Ads detail + structure** (`google_ads_detail_sync.py`,
-  `google_ads_structure_sync.py`) — everything the campaign-level connector
-  (`run_sync.py --only google`) doesn't reach: customer search terms,
-  keyword-level performance + Quality Score, per-product Shopping/Performance
-  Max demand, paid-vs-organic query overlap, which conversion actions feed
-  the reported Conversions number, device split, Performance Max search
-  themes, and CURRENT-STATE snapshots of campaign/asset-group/listing-group
-  configuration and conversion-action setup. The structure connector in
-  particular is aimed at "this campaign looks funded but isn't serving" —
-  a question spend/impression metrics alone usually can't answer. Reuses the
-  same GOOGLE_ADS_* credentials — no new setup.
-- **Google Merchant Center** (`merchant_center_sync.py`) — product feed
-  performance (organic vs. paid, plus account-wide non-product-specific
-  performance), feed eligibility/issues, price competitiveness, category
-  best-sellers (including a "riser" signal for products gaining demand
-  outside the usual top-N cut, and `--brand` for tracking specific brands —
-  yours or a competitor's — regardless of rank), and competitive visibility.
-  Requires a one-time `registerGcp` API call before anything works — see the
-  module docstring; there's no Merchant Center UI for that step. Also see the
-  module docstring for a lag-in-publishing gotcha on the visibility grain.
-- **Flexport** (`flexport_sync.py`, `flexport_orders_sync.py`,
-  `flexport_returns_sync.py`, `flexport_inbounds_sync.py`) — 3PL fulfillment:
-  catalog + daily inventory snapshots, per-order shipping cost (via a
-  resumable event-cursor crawl), customer returns, and inbound supplier
-  shipments.
-- **Klaviyo** (`klaviyo_sync.py`) — email/SMS campaign performance, flow
-  (automation) performance, monthly audience/segment growth, and daily
-  attributed revenue by channel and flow. Supports either a private API key
-  or OAuth (`klaviyo_auth.py`, a PKCE helper matching the other `*_auth.py`
-  scripts' shape) — useful if you'd rather not hand out a long-lived key.
-- **Purple Dot** (`purple_dot_sync.py`) — pre-order/waitlist bookings and
-  their eventual export into real storefront orders, plus daily waitlist
-  inventory-allocation snapshots. Kept in its own tables rather than the
-  shared `orders` table, since a booking and its export are different
-  measures at different times.
-- **Shopify customer dimension** (`shopify_customers_sync.py`) — current
-  account state, tags, marketing-consent state, and custom metafields for
-  every customer, plus a change-log of tag/state transitions over time.
-  Reuses the Shopify connector's credentials but needs the additional
-  `read_customers` scope. Deliberately never stores email, name, phone, or
-  address — see the module docstring for why.
-- **TikTok Shop extras** (`tiktok_videos_sync.py`, `tiktok_live_sync.py`,
-  `tiktok_creators_sync.py`, `tiktok_analytics_sync.py`) — video performance,
-  LIVE-shopping broadcast + product funnel, a handle ↔ display-name ↔ user-id
-  creator/affiliate identity bridge (TikTok's video API and order API expose
-  different halves of a creator's identity with no shared join key — the
-  bridge closes that gap via the API plus an optional manual CSV import), and
-  a true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split (a
-  cleaner alternative to estimating "unattributed" sales by subtraction).
-- **Amazon Seller extras** (`amazon_inventory_sync.py`,
-  `amazon_returns_sync.py`, `amazon_rank_sync.py`, `amazon_fees_sync.py`,
-  `amazon_economics_sync.py`, `amazon_traffic_sync.py`) — FBA inventory
-  snapshots, customer returns, Best-Seller-Rank tracking, SP-API fee reports
-  (previews, storage, reimbursements, promotions, fulfilled shipments/MCF),
-  Data Kiosk SKU economics (actual fees + net proceeds, as opposed to the
-  fee-preview estimate), and per-ASIN Sales & Traffic (sessions, page views,
-  Buy Box %, units/sales, both weekly and monthly grain). All six reuse the
-  SP-API credentials already set up for Amazon retail orders.
-- **Amazon Ads detail** (`amazon_ads_detail_sync.py`) — the grains the
-  campaign-level connector (`run_sync.py --only amazon_ads`) can't reach:
-  per-ASIN advertised-product performance, keyword/target-level performance,
-  and customer search-term performance (Sponsored Products). Reuses the same
-  Ads API credentials — no new setup.
-- **Amazon Brand Analytics** (`amazon_sqp_sync.py`, `amazon_ba_sync.py`,
-  `warehouse/brand_analytics.py`) — for brand-registered sellers: Search
-  Query Performance (query-level volume + your share of impressions/clicks/
-  cart-adds/purchases vs. the whole market), Search Catalog Performance,
-  Top Search Terms (filterable — see the module docstring, since the raw
-  report is market-wide and can be huge), Market Basket Analysis (frequently
-  co-purchased products), and Repeat Purchase Behavior. These reports queue
-  for 15-25+ minutes on Amazon's side; `warehouse/brand_analytics.py` is the
-  shared create/poll/download runner both scripts build on. An optional
-  `brand_watchlist.yaml` (see that file) flags search terms containing your
-  own or a competitor's brand name. Reuses the SP-API credentials above —
-  requires brand registry, no new setup otherwise.
-- **Amazon Voice of the Customer** (`voc_import.py`) — there's no API for
-  this report, so it's a manual-drop CSV importer: download the export from
-  Seller Central (Performance > Voice of the Customer), drop it in a local
-  folder, and this loads per-ASIN/SKU customer-experience health and
-  negative-experience rate. A useful template if you need to import any
-  other Seller-Central-only report that has no API — header-driven column
-  matching (spellings drift between export versions) and `--dry-run` to
-  preview before writing.
-
-## Notifications (optional)
-
-`warehouse/notify.py` is a small standalone utility — not a connector, no
-tables of its own — for pushing a plain-text or lightly-formatted message to
-Slack, Google Chat, and/or email from any script in this repo (or your own).
-Useful for a "sync finished, here's a summary" ping, or turning any of the
-sync scripts above into an alert when something needs attention.
-
-```python
-from warehouse import notify
-notify.send("*Sync complete*\n- 1,204 rows written\nFull report: https://...", dest="daily_sync")
-```
-
-Targets are configured per named `dest` in `.env` (`<DEST>_SLACK_WEBHOOK`,
-`<DEST>_GCHAT_WEBHOOK`, `<DEST>_EMAIL_TO`), so different callers can point at
-different channels/spaces/inboxes with no code change, and a `dest` with
-nothing configured is silently skipped — `send()` never raises, so a
-notification failure can't take down whatever pipeline called it. See the
-module docstring for full setup (webhook creation, SMTP/app-password setup
-for email).
-
-## Backups (optional)
-
-`backup_db.py` makes a same-disk rotating copy of `warehouse.db` using
-SQLite's online backup API, which is safe to run against a live WAL database
-— a concurrent sync can keep writing while the backup runs. Useful once your
-warehouse holds history that's aged out of your source platforms' own API
-retention and so can't simply be re-pulled.
-
-```
-python backup_db.py
-```
-
-Defaults to a `warehouse-backups/` folder next to (not inside) the project
-directory, keeping the newest 3 copies; override with `WAREHOUSE_BACKUP_DIR`
-/ `WAREHOUSE_BACKUP_KEEP` in `.env`. A backup that fails to verify (can't
-open, no tables) is discarded rather than kept, so a corrupt copy never
-silently replaces a good one. Wire it into your OS's scheduler (Task
-Scheduler, cron, launchd) to run before your main sync job.
+Two more standalone utilities aren't connectors at all — no credentials, no
+data pulled from anywhere: pushing a "sync finished" notification to
+Slack/Chat/email, and rotating local backups of `warehouse.db`. See
+[docs/operations.md](docs/operations.md).
 
 ## Running the server
 
@@ -288,7 +183,7 @@ clients don't prompt for write-style approval.
   `run_sync.py`'s connectors share a uniform shape for. Dates are inclusive
   `YYYY-MM-DD` strings. Anything these three don't answer, reach for
   `run_sql` — `list_tables` shows what else is available, including every
-  table an "Additional connectors" script above adds.
+  table a platform page under [Connectors, by platform](#connectors-by-platform) adds.
 - **`last_sync_status`** — one row per platform from `sync_log`: last run
   time, status, rows written, and any error message. The first thing to
   check if a summary tool looks stale or empty.
@@ -321,24 +216,22 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, and that a missing/unconfigured/failing target is skipped rather than raised |
 
-Every standalone script under "Additional connectors" above has its own
-`tests/test_<script>.py` — schema creation, row-shaping, and its own API's
-particular gotchas, all hermetic (mocked HTTP, no network).
+Every standalone script under [Connectors, by platform](#connectors-by-platform) above has
+its own `tests/test_<script>.py` — schema creation, row-shaping, and its own API's particular
+gotchas, all hermetic (mocked HTTP, no network). Each platform's doc page links its own tests.
 
 ## Configuration
 
-`.env.example` lists every credential. A few non-obvious knobs:
+`.env.example` lists every credential, grouped by platform, with setup notes in the comments
+above each block. Platform-specific variables and their per-page docs are linked in
+[Connectors, by platform](#connectors-by-platform). A few cross-cutting knobs that aren't
+tied to any one platform:
 
 | Variable | Purpose | Default |
 |---|---|---|
 | `WAREHOUSE_DB` | Path to the SQLite file | `warehouse.db` beside the code |
 | `WAREHOUSE_MCP_TOKEN` | Bearer token required in `--http` mode | unset |
 | `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma-separated Host/Origin allowlist for `--http` | unset |
-| `SHOPIFY_CAPTURE_CUSTOMER` | Whether to store Shopify customer ids | auto-probes scope |
-| `AMAZON_ADS_REPORT_TIMEOUT_MIN` | Amazon report poll timeout, minutes | `60` |
-| `DATAKIOSK_TIMEOUT_MIN` | Amazon Data Kiosk query poll timeout, minutes (`amazon_economics_sync.py`) | `150` |
-| `TIKTOK_LIVE_OWN_ACCOUNT_TYPE` | Which `tiktok_shop_lives.account_type` counts as your own broadcasts | `OFFICIAL_ACCOUNTS` |
-| `TIKTOK_SHOP_TIMEZONE` | IANA timezone for bucketing LIVE broadcasts into calendar days | `UTC` |
 | `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates | `ecommerce-warehouse MCP` |
 
 Set `WAREHOUSE_DB` the same way for both `run_sync.py` and `server.py`. If they disagree,
