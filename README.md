@@ -125,7 +125,9 @@ python server.py --http --port 8787 --allow-host <hostname>
 
 In HTTP mode, set `WAREHOUSE_MCP_TOKEN` — clients must then send it as a bearer token.
 Host/Origin validation is on by default; `--allow-host` is repeatable, and the same list
-can live in `WAREHOUSE_MCP_ALLOWED_HOSTS` (re-read without a restart). Use
+can also come from `WAREHOUSE_MCP_ALLOWED_HOSTS` (comma- or semicolon-separated) or from
+an `allowed_hosts.txt` file (one entry per line) beside `server.py` — all three are
+re-read on every policy refresh, so adding a name needs no restart. Use
 `--check-host <value>` to print the accept/reject verdict for a Host and exit.
 `--allow-any-host` disables Host/Origin validation entirely — a debug escape hatch, not
 something to leave on; the server re-warns in the log every 6 hours while it's set.
@@ -143,13 +145,14 @@ server running across reboots with `serve_mcp.bat` (Windows), and the
 
 ## MCP tools
 
-`server.py` exposes six read-only tools — identical set and behavior whether
-you're connected over stdio or `--http`. All annotate `readOnlyHint=True`, so
+`server.py` exposes six read-only tools — the same six over stdio or `--http`,
+though `run_sql`'s column redaction only kicks in over HTTP (see below). All
+annotate `readOnlyHint=True`/`destructiveHint=False`/`idempotentHint=True`, so
 clients don't prompt for write-style approval.
 
 | Tool | Signature | Returns |
 |---|---|---|
-| `list_tables` | `(table_pattern: str = None, include_columns: bool = True)` | table/view names, optionally with column lists |
+| `list_tables` | `(table_pattern: str \| None = None, include_columns: bool = True)` | table/view names, optionally with column lists |
 | `run_sql` | `(query: str)` | up to 1000 rows as JSON |
 | `spend_summary` | `(start_date, end_date)` | spend/revenue/clicks/impressions/conversions/ROAS per platform |
 | `top_campaigns` | `(start_date, end_date, limit: int = 15)` | top campaigns by spend across platforms |
@@ -166,7 +169,9 @@ clients don't prompt for write-style approval.
   carry several disagreeing rows per key, say, exposed as the safe join
   target instead of the raw table), it needs to be just as discoverable here
   or a caller exploring the schema will join the raw table instead of the
-  view built to protect against exactly that.
+  view built to protect against exactly that. A `table_pattern` that matches
+  nothing returns a hint to call `list_tables()` bare rather than an error or
+  an empty list.
 - **`run_sql`** — ad-hoc analysis. Only `SELECT`/`WITH` are accepted (checked
   up front, and enforced again by SQLite itself since the connection is
   opened `mode=ro`); anything else returns an error string instead of
@@ -175,9 +180,12 @@ clients don't prompt for write-style approval.
   carries a wall-clock budget (`RUN_SQL_TIMEOUT_SEC` in `server.py`, 45s by
   default): a query that runs past it is cancelled with a clear error rather
   than tying up a server other people may be sharing. Over `--http`, any
-  column listed in `_REMOTE_DENIED_COLUMNS` is unreadable — even through
-  joins, aliases, subqueries, or quoting — while remaining fully queryable
-  over local stdio; see [SHARING.md](SHARING.md).
+  column listed in `_REMOTE_DENIED_COLUMNS` (in `server.py`) is unreadable —
+  even through joins, aliases, subqueries, or quoting — while remaining fully
+  queryable over local stdio; see [SHARING.md](SHARING.md). That set ships
+  **empty** — no redaction happens until an operator edits `server.py` to
+  list their own PII-bearing columns (email, phone, name, free-text notes,
+  tracking numbers), so don't assume PII is protected out of the box.
 - **`spend_summary`**, **`top_campaigns`**, **`sales_summary`** — the
   canonical rollups over `ad_metrics` and `orders`, the two tables
   `run_sync.py`'s connectors share a uniform shape for. Dates are inclusive
@@ -231,7 +239,7 @@ tied to any one platform:
 |---|---|---|
 | `WAREHOUSE_DB` | Path to the SQLite file | `warehouse.db` beside the code |
 | `WAREHOUSE_MCP_TOKEN` | Bearer token required in `--http` mode | unset |
-| `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma-separated Host/Origin allowlist for `--http` | unset |
+| `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma- or semicolon-separated Host/Origin allowlist for `--http` (see also `allowed_hosts.txt`) | unset |
 | `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates | `ecommerce-warehouse MCP` |
 
 Set `WAREHOUSE_DB` the same way for both `run_sync.py` and `server.py`. If they disagree,

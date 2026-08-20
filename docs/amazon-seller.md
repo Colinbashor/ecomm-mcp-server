@@ -49,7 +49,7 @@ folder, and import it.
 python run_sync.py --only amazon_orders   # core retail orders, last 7 days
 python amazon_inventory_sync.py
 python amazon_returns_sync.py
-python amazon_rank_sync.py
+python amazon_rank_sync.py --asins-file asins.txt   # or --asins B0FOO,B0BAR
 python amazon_fees_sync.py
 python amazon_economics_sync.py
 python amazon_traffic_sync.py
@@ -75,6 +75,14 @@ python voc_import.py path/to/export.csv
 `voc_import.py` uses header-driven column matching (spellings drift between
 Seller Central export versions) — a useful template if you need to import
 any other Seller-Central-only report that has no API.
+
+`amazon_rank_sync.py` needs to know which ASINs to track — pass `--asins`
+(comma-separated) or `--asins-file` (one per line). Omit both and it falls
+back to scanning `amazon_fulfilled_shipments` (written by
+`amazon_fees_sync.py`'s shipments report) as a proxy "recently sold" list —
+a weak fallback, not the intended input, and it produces nothing on a first
+run before fees data exists. Pass an explicit ASIN list for anything beyond
+a smoke test.
 
 ## Tests
 
