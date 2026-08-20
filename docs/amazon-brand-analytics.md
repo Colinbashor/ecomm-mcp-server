@@ -21,11 +21,28 @@ terms containing your own or a competitor's brand name (used by
 
 ## Usage
 
+Both scripts need to know which ASINs are yours (to flag a query/term/pair as
+involving your own catalog). Pass them with `--asins` (comma-separated) or
+`--asins-file` (one ASIN per line); if you omit both, they fall back to
+`amazon_rank_sync.fallback_asins()` — a weak proxy, not a real substitute, so
+pass your ASINs explicitly for anything beyond a first smoke test.
+
 ```bash
-python amazon_sqp_sync.py     # Search Query Performance
-python amazon_ba_sync.py      # Search Catalog Performance, Top Search Terms,
-                               # Market Basket Analysis, Repeat Purchase Behavior
+python amazon_sqp_sync.py --asins-file asins.txt   # Search Query Performance
+python amazon_ba_sync.py --asins-file asins.txt    # Search Catalog Performance, Top Search Terms,
+                                                    # Market Basket Analysis
+python amazon_ba_sync.py --month 2026-06           # Repeat Purchase Behavior (no ASINs needed)
 ```
+
+Useful flags on both: `--week YYYY-MM-DD` (a specific BA week, default: last
+completed Sun–Sat), `--weeks N` (backfill N weeks), `--fallback-weeks N` (if a
+week comes back empty, step back further — guards against the Monday
+availability lag on a weekly cron). `amazon_ba_sync.py` also takes `--only
+search_catalog,search_terms,market_basket` to run a subset of grains, and
+`--last-month`/`--month YYYY-MM` for Repeat Purchase. `amazon_sqp_sync.py`
+also takes `--max-asins N` (cap per week; 0 = all), `--refresh` (re-request
+ASINs already recorded in `amazon_sqp_coverage`), and `--max-minutes N` (wall-
+clock budget so a scheduled run can't be blocked indefinitely).
 
 ## Tables
 

@@ -1,7 +1,8 @@
 # Flexport
 
-3PL fulfillment: catalog + daily inventory snapshots, per-order shipping
-cost, customer returns, and inbound supplier shipments.
+3PL fulfillment: daily inventory snapshots (with an on-demand catalog
+gap-fill, or a full catalog crawl via `--catalog`), per-order shipping cost,
+customer returns, and inbound supplier shipments.
 
 **Scripts:** `flexport_sync.py`, `flexport_orders_sync.py`,
 `flexport_returns_sync.py`, `flexport_inbounds_sync.py` (standalone — not
@@ -20,11 +21,17 @@ wired into `run_sync.py`, since 3PL data doesn't fit its ads/orders shape)
 ## Usage
 
 ```bash
-python flexport_sync.py           # catalog + daily inventory snapshots
+python flexport_sync.py           # daily inventory snapshot + a small catalog gap-fill
+python flexport_sync.py --catalog # + a full catalog crawl (slow; run occasionally, not daily)
 python flexport_orders_sync.py    # per-order shipping cost (resumable event-cursor crawl)
 python flexport_returns_sync.py   # customer returns
 python flexport_inbounds_sync.py  # inbound supplier shipments
 ```
+
+A bare run does **not** do a full catalog crawl — only inventory plus enough
+catalog gap-filling to resolve any new SKUs it sees. Pass `--catalog`
+periodically (it pages through your entire product list, which can take a
+while for a large merchant) to fully refresh `flexport_products`.
 
 ## Tables
 
