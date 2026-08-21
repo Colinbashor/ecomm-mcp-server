@@ -1,7 +1,8 @@
 # TikTok Shop
 
-Order ground truth (core), plus four standalone scripts for video
-performance, LIVE-shopping, creator identity, and sales-source attribution.
+Order ground truth (core), plus five standalone scripts for video
+performance, LIVE-shopping, creator identity, sales-source attribution, and
+settlement/fee data.
 
 ## Scripts
 
@@ -12,6 +13,7 @@ performance, LIVE-shopping, creator identity, and sales-source attribution.
 | `tiktok_live_sync.py` | standalone | LIVE-shopping broadcast + product funnel |
 | `tiktok_creators_sync.py` | standalone | handle ↔ display-name ↔ user-id creator/affiliate identity bridge |
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
+| `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
 
 ## Setup
 
@@ -34,7 +36,7 @@ performance, LIVE-shopping, creator identity, and sales-source attribution.
    | `TIKTOK_LIVE_OWN_ACCOUNT_TYPE` | which `tiktok_shop_lives.account_type` counts as your own broadcasts vs. affiliate/creator or paid-marketing lives (default `OFFICIAL_ACCOUNTS`) |
    | `TIKTOK_SHOP_TIMEZONE` | IANA timezone for bucketing LIVE broadcasts into calendar days (default `UTC`) |
 
-All four extras reuse the core `TIKTOK_*` credentials — nothing new to
+All five extras reuse the core `TIKTOK_*` credentials — nothing new to
 configure.
 
 ## Usage
@@ -45,6 +47,9 @@ python tiktok_videos_sync.py
 python tiktok_live_sync.py
 python tiktok_creators_sync.py
 python tiktok_analytics_sync.py
+python tiktok_finance_sync.py                 # settlements, last 30 days
+python tiktok_finance_sync.py --backfill      # 365-day window
+python tiktok_finance_sync.py --no-components # statements only, fast
 ```
 
 ## Tables
@@ -54,6 +59,7 @@ python tiktok_analytics_sync.py
 - `tiktok_shop_lives`, `tiktok_shop_live_products`
 - `tiktok_creators`
 - `tiktok_shop_performance`
+- `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
 
 ## Notes
 
@@ -64,7 +70,24 @@ bridge closes that gap via the API plus an optional manual CSV import.
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction.
 
+`tiktok_finance_sync.py` exists so a report can read a measured, up-to-date
+fee/take-rate from the database instead of hardcoding a guessed commission
+or calling the Finance API live at render time. The load-bearing detail is
+`tiktok_settlement_components.is_fee`: TikTok's settlement transactions carry
+real pass-through lines (sales tax) and your own markdowns (seller-funded
+discounts) alongside genuine platform fees, and summing all of them together
+overstates the take rate substantially. Only `is_fee=1` rows are fees;
+everything else is stored for reconciliation. `tiktok_settlement_orders`
+keeps the per-order breakdown (not just the aggregated component totals)
+specifically so it can be joined to your own orders table by `order_id` —
+that's what makes a true per-product fee/margin number possible instead of
+only an account-wide rate. Also worth knowing before you debug the same
+thing twice: the statements endpoint 400s with "SortField is a required
+field" if `sort_field` is omitted, which reads exactly like a missing-scope
+error but usually isn't — see the module docstring.
+
 ## Tests
 
 `tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_live_sync.py`,
-`tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`
+`tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
+`tests/test_tiktok_finance_sync.py`

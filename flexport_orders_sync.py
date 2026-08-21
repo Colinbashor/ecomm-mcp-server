@@ -65,6 +65,21 @@ batch of orders is flushed, so a killed run continues near where it left off
 instead of restarting. `--restart` discards the stored cursor and starts the
 walk over from the feed floor.
 
+A CURSOR CAN GO PERMANENTLY BAD — SELF-HEAL BY TRACKING A TIMESTAMP TOO. In
+production this has been observed more than once: a *stored* page_info value
+starts 500ing on every retry while a *freshly issued* cursor 200s within the
+same minute — the cursor value itself died, not the feed. An opaque cursor
+that goes bad that way is unrecoverable on its own, so this connector tracks
+position a second way, as a plain timestamp read off each page's own event
+data (`events_last_time`, alongside the `page_info` cursor). On a
+rejected/exhausted cursor it re-crafts a fresh one from that timestamp via
+`page_info_at()` and keeps walking in the same run (bounded by
+`MAX_RECRAFTS`), rather than surfacing a failure that needs a human to notice
+and clear. This generalizes past Flexport: for any paginated feed whose only
+recoverable position signal is a value embedded in the page contents, track
+that value defensively even while the primary cursor is healthy — you only
+find out you need it once the primary cursor is already dead.
+
 Auth: bearer token in FLEXPORT_API_TOKEN (.env), same token as flexport_sync.py.
 Skips cleanly if unset.
 
@@ -97,6 +112,10 @@ SHIPMENT_EVENT = "Shipment.Created"
 DEFAULT_MAX_PAGES = 100_000   # runaway safety bound only, not a real expectation
 ORDER_FETCH_WORKERS = 8    # per-order detail fetches are independent; run them concurrently
 CURSOR_KEY = "events_page_info"
+# Durable position as an event TIMESTAMP, kept alongside the opaque page_info
+# cursor. See the self-healing note on iter_event_pages() for why this exists.
+LAST_TIME_KEY = "events_last_time"
+MAX_RECRAFTS = 3   # bound on same-run cursor re-crafts; each one pays a full retry budget
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # ULID base32 alphabet
 
 DDL = """
@@ -253,16 +272,50 @@ def page_info_at(dt: datetime) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
-def iter_event_pages(start_page_info: str | None, max_pages: int):
-    """Yield (order_ids_in_page, next_page_info), walking Shipment.Created
-    events forward via the Link cursor. `order_ids_in_page` is de-duplicated
-    within the page. Stops at the feed tip (no next cursor), an empty page, or
-    max_pages (a runaway guard)."""
+def iter_event_pages(start_page_info: str | None, max_pages: int,
+                     last_time: str | None = None):
+    """Yield (order_ids_in_page, next_page_info, last_event_time), walking
+    Shipment.Created events forward via the Link cursor. `order_ids_in_page`
+    is de-duplicated within the page. Stops at the feed tip (no next cursor),
+    an empty page, or max_pages (a runaway guard).
+
+    SELF-HEALS A DEAD CURSOR. A specific page_info value can go permanently
+    bad on the vendor's side even though the feed itself is healthy — this
+    connector has hit it more than once: a *stored* cursor returning 500 on
+    every retry while a *freshly issued* cursor 200'd within the same minute.
+    `_request` already retries transient failures, but retrying the same dead
+    cursor forever can't recover — the value itself is the problem.
+
+    The fix generalizes past Flexport: track position a SECOND way, as a
+    timestamp pulled from the page contents (here, each event's `time`
+    field), not just via the opaque cursor. An opaque cursor that goes bad is
+    unrecoverable on its own, but a timestamp can always be re-minted into a
+    fresh cursor via `page_info_at()`. So on a rejected/exhausted cursor this
+    re-crafts one from the last known timestamp and keeps walking in the same
+    run, instead of surfacing the failure and waiting for the next scheduled
+    run (or a human) to notice and clear it. Bounded by MAX_RECRAFTS, and only
+    attempted when a timestamp is already known — on a cold start with no
+    prior position in either dimension, a bad cursor still raises, because
+    re-crafting from nothing would silently restart the walk at an arbitrary
+    point rather than a genuine resume."""
     params = ({"limit": EVENTS_PAGE, "page_info": start_page_info}
               if start_page_info else
               {"limit": EVENTS_PAGE, "type": SHIPMENT_EVENT})
+    recrafts = 0
     for _ in range(max_pages):
-        resp = _request("/events", params)
+        try:
+            resp = _request("/events", params)
+        except (FlexportBadCursor, FlexportTransient):
+            if not last_time or recrafts >= MAX_RECRAFTS:
+                raise
+            recrafts += 1
+            print(f"  cursor rejected — re-crafting at {last_time} "
+                  f"(recraft {recrafts}/{MAX_RECRAFTS})", flush=True)
+            params = {"limit": EVENTS_PAGE,
+                      "page_info": page_info_at(
+                          datetime.strptime(last_time[:19], "%Y-%m-%dT%H:%M:%S")
+                          .replace(tzinfo=timezone.utc))}
+            continue
         batch = resp.json()
         if not isinstance(batch, list) or not batch:
             return
@@ -271,34 +324,49 @@ def iter_event_pages(start_page_info: str | None, max_pages: int):
         for e in batch:
             if not isinstance(e, dict):
                 continue
+            t = e.get("time") or ""
+            if t:
+                last_time = t[:19]
             oid = (e.get("payload") or {}).get("orderId")
             if isinstance(oid, int) and oid not in seen:
                 seen.add(oid)
                 ids.append(oid)
         nxt = next_page_info(resp)
-        yield ids, nxt
+        yield ids, nxt, last_time
         if not nxt:
             return
         params = {"limit": EVENTS_PAGE, "page_info": nxt}
         time.sleep(0.1)
 
 
-def _load_cursor(conn: sqlite3.Connection) -> str | None:
+def _load_state(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute(
-        "SELECT value FROM flexport_order_sync_state WHERE key = ?", (CURSOR_KEY,)).fetchone()
+        "SELECT value FROM flexport_order_sync_state WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
 
 
-def _save_cursor(conn: sqlite3.Connection, page_info: str) -> None:
+def _save_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO flexport_order_sync_state (key, value, updated_at) VALUES (?,?,?)",
-            (CURSOR_KEY, page_info, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+            (key, value, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+
+def _clear_state(conn: sqlite3.Connection, key: str) -> None:
+    with conn:
+        conn.execute("DELETE FROM flexport_order_sync_state WHERE key = ?", (key,))
+
+
+def _load_cursor(conn: sqlite3.Connection) -> str | None:
+    return _load_state(conn, CURSOR_KEY)
+
+
+def _save_cursor(conn: sqlite3.Connection, page_info: str) -> None:
+    _save_state(conn, CURSOR_KEY, page_info)
 
 
 def _clear_cursor(conn: sqlite3.Connection) -> None:
-    with conn:
-        conn.execute("DELETE FROM flexport_order_sync_state WHERE key = ?", (CURSOR_KEY,))
+    _clear_state(conn, CURSOR_KEY)
 
 
 def existing_order_ids(conn: sqlite3.Connection) -> set[int]:
@@ -406,6 +474,7 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
     order_rows: list[tuple] = []
     pkg_rows: list[tuple] = []
     pending_cursor: str | None = None
+    last_time = _load_state(conn, LAST_TIME_KEY)
     n_orders = pages = 0
 
     def checkpoint() -> None:
@@ -414,10 +483,12 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
         order_rows, pkg_rows = [], []
         if pending_cursor:
             _save_cursor(conn, pending_cursor)
+        if last_time:
+            _save_state(conn, LAST_TIME_KEY, last_time)
 
     pool = ThreadPoolExecutor(max_workers=ORDER_FETCH_WORKERS)
     try:
-        for ids, nxt in iter_event_pages(start_cursor, max_pages):
+        for ids, nxt, last_time in iter_event_pages(start_cursor, max_pages, last_time):
             pages += 1
             new_ids = [oid for oid in ids if oid not in already]
             already.update(new_ids)

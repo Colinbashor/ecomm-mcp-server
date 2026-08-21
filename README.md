@@ -6,7 +6,7 @@ SQLite warehouse of e-commerce data — plus the connectors that fill it.
 Pull advertising and order data from Google Ads, Meta Ads, Amazon (Ads + SP-API), Shopify,
 and TikTok Shop into one SQLite file, then query it in natural language from any MCP client.
 A further set of optional standalone scripts covers GA4, Google Merchant Center, Flexport,
-Klaviyo, Purple Dot, and more — see [Connectors, by platform](#connectors-by-platform) below.
+Klaviyo, Purple Dot, Reacher, and more — see [Connectors, by platform](#connectors-by-platform) below.
 
 ## How it fits together
 
@@ -99,10 +99,11 @@ writes, and its test coverage.
 | Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase |
 | Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
-| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split |
+| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data |
 | Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | campaign/flow performance, audience growth, attributed revenue |
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
+| Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics |
 
 Two more standalone utilities aren't connectors at all — no credentials, no
 data pulled from anywhere: pushing a "sync finished" notification to
