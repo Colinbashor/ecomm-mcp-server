@@ -91,8 +91,8 @@ class IterEventPagesTests(unittest.TestCase):
             pages = list(fo.iter_event_pages(None, max_pages=10))
 
         self.assertEqual(len(pages), 2)
-        self.assertEqual(pages[0], ([1, 2], "CUR2"))
-        self.assertEqual(pages[1], ([3], None))
+        self.assertEqual(pages[0], ([1, 2], "CUR2", None))
+        self.assertEqual(pages[1], ([3], None, None))
 
     def test_stops_on_empty_page(self) -> None:
         with patch.object(fo, "_request", return_value=_resp([])), patch.object(fo.time, "sleep"):
@@ -105,6 +105,57 @@ class IterEventPagesTests(unittest.TestCase):
         with patch.object(fo, "_request", return_value=infinite_page), patch.object(fo.time, "sleep"):
             pages = list(fo.iter_event_pages(None, max_pages=3))
         self.assertEqual(len(pages), 3)
+
+    def test_tracks_last_event_time_across_pages(self) -> None:
+        page1 = [{"payload": {"orderId": 1}, "time": "2024-06-01T00:00:00Z"}]
+        page2 = [{"payload": {"orderId": 2}, "time": "2024-06-02T00:00:00Z"}]
+        responses = [
+            _resp(page1, link='<x?page_info=CUR2>; rel="next"'),
+            _resp(page2),
+        ]
+        with patch.object(fo, "_request", side_effect=responses), patch.object(fo.time, "sleep"):
+            pages = list(fo.iter_event_pages(None, max_pages=10))
+        self.assertEqual(pages[0][2], "2024-06-01T00:00:00")
+        self.assertEqual(pages[1][2], "2024-06-02T00:00:00")
+
+
+class SelfHealingCursorTests(unittest.TestCase):
+    """A page_info cursor can go permanently bad on the vendor's side even
+    while the feed is healthy. iter_event_pages must recover by re-crafting a
+    fresh cursor from the last known event timestamp, but only when it has
+    one — a cold start with no prior position must still raise."""
+
+    def test_recrafts_from_last_time_after_bad_cursor(self) -> None:
+        good_page = [{"payload": {"orderId": 9}, "time": "2024-06-05T12:00:00Z"}]
+        responses = [fo.FlexportBadCursor("500"), _resp(good_page)]
+
+        def fake_request(path, params):
+            r = responses.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        with patch.object(fo, "_request", side_effect=fake_request), \
+             patch.object(fo.time, "sleep"):
+            pages = list(fo.iter_event_pages(
+                "DEAD-CURSOR", max_pages=10, last_time="2024-06-05T11:00:00"))
+
+        self.assertEqual(pages[0][0], [9])  # recovered and yielded the order past the dead cursor
+
+    def test_gives_up_after_max_recrafts(self) -> None:
+        with patch.object(fo, "_request", side_effect=fo.FlexportBadCursor("500")), \
+             patch.object(fo.time, "sleep"):
+            with self.assertRaises(fo.FlexportBadCursor):
+                list(fo.iter_event_pages(
+                    "DEAD-CURSOR", max_pages=10, last_time="2024-06-05T11:00:00"))
+
+    def test_cold_start_with_no_last_time_still_raises(self) -> None:
+        # No prior position in either dimension -> recrafting would restart
+        # the walk at an arbitrary point, so a bad cursor must propagate.
+        with patch.object(fo, "_request", side_effect=fo.FlexportBadCursor("500")), \
+             patch.object(fo.time, "sleep"):
+            with self.assertRaises(fo.FlexportBadCursor):
+                list(fo.iter_event_pages("DEAD-CURSOR", max_pages=10, last_time=None))
 
 
 class RequestRetryTests(unittest.TestCase):
@@ -182,7 +233,7 @@ class ResumableCrawlTests(unittest.TestCase):
                 " total_weight_oz, carriers, shipping_methods, is_international, synced_at) "
                 "VALUES (1,'E1',5.0,'USD',NULL,NULL,NULL,NULL,NULL,0,0,0,0,NULL,NULL,0,'x')")
 
-        pages = [([1, 2], None)]  # order 1 already stored; order 2 is new
+        pages = [([1, 2], None, None)]  # order 1 already stored; order 2 is new
 
         def fake_fetch(oid):
             return oid, {"id": oid, "cost": 9.99, "shipments": []}
@@ -201,14 +252,15 @@ class ResumableCrawlTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         fo.ensure_schema(conn)
 
-        def raising_pages(start, max_pages):
-            yield [1], "CURSOR-A"
+        def raising_pages(start, max_pages, last_time=None):
+            yield [1], "CURSOR-A", None
             raise fo.FlexportTransient("backend degraded")
 
         def fake_fetch(oid):
             return oid, {"id": oid, "cost": 1.0, "shipments": []}
 
-        with patch.object(fo, "iter_event_pages", side_effect=lambda s, m: raising_pages(s, m)), \
+        with patch.object(fo, "iter_event_pages",
+                          side_effect=lambda s, m, t=None: raising_pages(s, m, t)), \
              patch.object(fo, "fetch_order", side_effect=fake_fetch):
             n_orders, pages_walked, paused = fo.run(
                 conn, restart=False, since_days=None, max_pages=10)
