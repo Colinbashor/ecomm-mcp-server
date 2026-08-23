@@ -28,6 +28,9 @@ For Amazon **retail orders / SP-API** (a separate credential set), see
    ```
 
    This fills `AMAZON_ADS_REFRESH_TOKEN` and `AMAZON_ADS_PROFILE_ID` for you.
+   Already have a refresh token but need the profile ID (new marketplace,
+   lost the value)? `python amazon_auth.py --profiles` looks it up without
+   a fresh consent round-trip.
 3. Fill in the rest of `.env`:
 
    | Variable | Notes |
@@ -44,8 +47,15 @@ configure.
 
 ```bash
 python run_sync.py --only amazon          # core campaign metrics, last 7 days
-python amazon_ads_detail_sync.py          # ASIN/keyword/search-term detail
+python amazon_ads_detail_sync.py          # ASIN/keyword/search-term detail, last 3 days
+python amazon_ads_detail_sync.py --days 30
+python amazon_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
+python amazon_ads_detail_sync.py --only search_terms   # just one grain
 ```
+
+`amazon_ads_detail_sync.py` defaults to a 3-day lookback (not the 7 days
+`run_sync.py` uses for core metrics) — override with `--days`, or give an
+explicit `--start`/`--end` window.
 
 ## Tables
 

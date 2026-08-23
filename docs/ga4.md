@@ -24,7 +24,10 @@ Service-account flow — server-to-server, no browser consent step:
 ## Usage
 
 ```bash
-python ga4_sync.py
+python ga4_sync.py                                  # last 30 days, all grains
+python ga4_sync.py --days 7
+python ga4_sync.py --start 2026-01-01 --end 2026-01-31
+python ga4_sync.py --only metrics,landing_pages      # grains: metrics, products, landing_pages, campaign_ntb
 ```
 
 Handles GA4's 100k-row response cap with daily chunking and pagination.
@@ -41,6 +44,23 @@ Handles GA4's 100k-row response cap with daily chunking and pagination.
 The new-vs-returning split (`ga_campaign_ntb`) is a rough "is this campaign
 acquiring new customers?" read, not a precise one — see the module docstring
 for the cookie-scoping caveat before treating it as exact.
+
+A few other behaviors worth knowing about before you rely on this connector
+in production:
+
+- **Retries with backoff** on transient GA4 API errors — a single flaky
+  call doesn't fail the whole run.
+- **`conversions` → `keyEvents` metric rename**: GA4 renamed this metric
+  server-side; the script probes for whichever name the property responds
+  to, so you don't need to track which properties migrated.
+- **Stale dimension values are deleted, not just overwritten**, before each
+  day's re-insert — so a landing page or campaign that stops appearing in
+  GA4 also stops appearing in `ga_landing_pages`/`ga_campaign_ntb`, rather
+  than lingering with stale numbers.
+- **Double check `GA4_PROPERTY_ID`.** A GA4 *account* ID and *property* ID
+  look similar but are different values in the same Admin UI — pulling the
+  account ID by mistake fails cleanly, but it's an easy mix-up worth
+  confirming up front.
 
 ## Tests
 

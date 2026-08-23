@@ -32,8 +32,14 @@ var), release a new version, and reinstall the app.
 
 ```bash
 python run_sync.py --only shopify     # core orders, last 7 days
-python shopify_customers_sync.py       # customer dimension
+python shopify_customers_sync.py --probe     # cheap scope/permission check — run this first
+python shopify_customers_sync.py --dry-run   # preview without writing
+python shopify_customers_sync.py --since 2026-01-01
+python shopify_customers_sync.py             # full crawl, all customers
 ```
+
+Start with `--probe` on a new store: it confirms the `read_customers` scope
+and API access work before you kick off a full crawl.
 
 ## Tables
 
@@ -44,8 +50,27 @@ python shopify_customers_sync.py       # customer dimension
 
 ## Notes
 
+**`orders.total` is not net of discounts.** Shopify's `discountedTotalSet`
+excludes several discount-allocation methods (`code/EACH/ENTITLED`,
+`code/ACROSS/ALL`, `manual/ACROSS/ALL`), so summing `orders.total` alone
+overstates realized revenue whenever any of those discount types are in
+play. To get a true net figure, subtract `shopify_order_discounts.amount`:
+`total - SUM(shopify_order_discounts.amount)`. Promo-code discounts and
+price markdowns are two distinct mechanisms with different visibility here
+— see `warehouse/connectors/shopify.py`'s module docstring for the full
+breakdown before building a revenue report on this table.
+
 `shopify_customers_sync.py` deliberately never stores email, name, phone, or
 address — see the module docstring for why.
+
+`shopify_customers_sync.py` uses Shopify's Bulk Operations API, which only
+allows **one bulk query per app at a time** account-wide — a concurrent
+sync elsewhere on the same app gets auto-drained and resubmitted rather than
+failing outright. The bulk query itself has no pagination (results stream
+back as JSONL, regrouped by `__parentId`, and batches only cut at a root
+line boundary). Before overwriting a customer's tag/state history, the
+script diffs against `shopify_customer_flag_history` rather than blindly
+appending — see the module docstring if you're extending this script.
 
 ## Tests
 

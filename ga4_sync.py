@@ -61,8 +61,9 @@ catalog of any real size multiplied by a week of dates can approach or exceed
 the cap on its own, at which point pagination just means "more, slower"
 requests instead of "one that fits". Chunking day-by-day keeps each request's
 row count bounded by catalog size alone, which is the more predictable knob.
-If your property's catalog is small, monthly chunks may work fine — raise
-GA4_PRODUCT_CHUNK_DAYS or write your own chunker.
+If your property's catalog is small, monthly chunks may work fine — the
+chunk size is hardcoded in `_day_chunks()` below, so widen it there if you
+want that tradeoff.
 
 ITEM_MIN_VIEWS is a cardinality control, not a business rule. The item report
 below keeps an (date, item) row if the item sold OR was viewed more than this

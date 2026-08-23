@@ -34,7 +34,7 @@ Seller **self-authorization** — no OAuth consent screen:
    |---|---|
    | `SPAPI_CLIENT_ID` / `SPAPI_CLIENT_SECRET` | from the private app |
    | `SPAPI_REFRESH_TOKEN` | from the Authorize app step above |
-   | `SPAPI_MARKETPLACE_ID` | default `ATVPDKIKX0DER` (US) |
+   | `SPAPI_MARKETPLACE_ID` | required — only `amazon_economics_sync.py` falls back to `ATVPDKIKX0DER` (US) if unset; every other script raises a `KeyError` without it, so set it explicitly |
    | `SPAPI_REGION` | default `NA` |
    | `DATAKIOSK_TIMEOUT_MIN` | optional, how long `amazon_economics_sync.py` waits for a Data Kiosk query (default `150` — these can run 1–2h for a full week) |
 
@@ -48,11 +48,12 @@ folder, and import it.
 ```bash
 python run_sync.py --only amazon_orders   # core retail orders, last 7 days
 python amazon_inventory_sync.py
-python amazon_returns_sync.py
+python amazon_returns_sync.py --start 2026-01-01 --end 2026-01-31   # or no args for the default window
 python amazon_rank_sync.py --asins-file asins.txt   # or --asins B0FOO,B0BAR
-python amazon_fees_sync.py
-python amazon_economics_sync.py
-python amazon_traffic_sync.py
+python amazon_fees_sync.py                          # or --week YYYY-MM-DD
+python amazon_fees_sync.py --only fee_preview,storage,reimbursements,promotions,shipments
+python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --weeks N to backfill
+python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
 ```
@@ -83,6 +84,24 @@ back to scanning `amazon_fulfilled_shipments` (written by
 a weak fallback, not the intended input, and it produces nothing on a first
 run before fees data exists. Pass an explicit ASIN list for anything beyond
 a smoke test.
+
+`amazon_inventory`: **don't sum rows naively by SKU.** Amazon aliases FBA
+inventory under multiple `fn_sku` values for the same seller SKU (bundle
+components, marketplace-specific aliasing), so a plain `SUM(quantity) GROUP
+BY seller_sku` can double-count. Check the module docstring in
+`amazon_inventory_sync.py` before writing aggregate queries against this
+table.
+
+`amazon_economics_sync.py` pulls Data Kiosk's weekly grain, which is aligned
+Sun–Sat. A query with a Mon–Sun (or any other) week boundary will silently
+return zero rows rather than erroring — if `amazon_economics` looks empty for
+a week you expect data for, check the boundary first.
+
+`amazon_fulfilled_shipments` (written by `amazon_fees_sync.py`) carries
+`sales_channel` and `shopify_order_name` columns, letting you join Amazon's
+Multi-Channel Fulfillment (MCF) shipments back to the Shopify order they
+fulfilled — useful for tracing an order that shipped from FBA inventory but
+sold on your own site.
 
 ## Tests
 

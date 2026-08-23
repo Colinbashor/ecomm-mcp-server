@@ -54,6 +54,17 @@ clock budget so a scheduled run can't be blocked indefinitely).
 - `amazon_ba_market_basket` — frequently co-purchased products
 - `amazon_ba_repeat_purchase` — repeat purchase behavior
 
+## Notes
+
+**Unit trap across these two tables**: `amazon_sqp` stores shares
+(impression/click/cart-add/purchase share) as raw **percent** values, while
+the four `amazon_ba_search_catalog`/`amazon_ba_search_terms`/
+`amazon_ba_market_basket`/`amazon_ba_repeat_purchase` reports source
+**fractions** from Amazon that `amazon_ba_sync.py` normalizes ×100 at ingest
+to match. If you're pulling both tables into the same query or dashboard,
+don't assume a shared scale without checking — an easy 100x mistake if you
+copy a formula from one table to the other.
+
 ## Tests
 
 `tests/test_amazon_sqp_sync.py`, `tests/test_amazon_ba_sync.py`,
