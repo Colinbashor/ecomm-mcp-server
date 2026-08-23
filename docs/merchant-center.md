@@ -23,8 +23,19 @@ competitiveness, category best-sellers, and competitive visibility.
 ## Usage
 
 ```bash
-python merchant_center_sync.py
+python merchant_center_sync.py                        # last 3 days (default), all grains
+python merchant_center_sync.py --days 30
+python merchant_center_sync.py --start 2026-01-01 --end 2026-01-31
+python merchant_center_sync.py --only performance --only pricing
+python merchant_center_sync.py --backfill              # walk performance history back until it runs dry
+python merchant_center_sync.py --only bestsellers --category 1604 --country US --top-n 50
+python merchant_center_sync.py --only bestsellers --brand "Your Brand" --brand "Competitor"
 ```
+
+`--only` accepts `performance`, `status`, `pricing`, `bestsellers`,
+`visibility` — pass it once per family to select more than one. `--category`,
+`--country`, and `--brand` are also repeatable, and scope the best-sellers
+grain.
 
 ## Tables
 
@@ -42,6 +53,24 @@ python merchant_center_sync.py
 
 See the module docstring for a lag-in-publishing gotcha on the visibility
 grain (`gmc_competitive_visibility`) — it doesn't update same-day.
+
+`gmc_best_sellers`/`gmc_best_seller_brands` are a **market ranking snapshot**,
+not your own sales data, and Google only exposes the current snapshot — there
+is no historical backfill for this grain regardless of `--backfill`.
+
+`gmc_product_performance`/`gmc_account_performance`'s `conversion_value`
+splits across currencies with no FX conversion applied — summing it across
+a multi-currency account mixes units. Check the currency column before
+aggregating.
+
+A long `--backfill` run can pause partway (rate-limited or interrupted) and
+resumes where it left off on re-run rather than restarting — it exits with
+code `75` to signal "paused, not failed," which matters if you're wiring
+this into a scheduler that treats a nonzero exit as an alert.
+
+The sync distinguishes throttling (retry the same request) from a permanent
+per-item error (skip and move on) rather than retrying everything uniformly
+— see the module docstring if you're debugging a partial/`"degraded"` run.
 
 ## Tests
 

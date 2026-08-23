@@ -24,8 +24,12 @@ wired into `run_sync.py`, since 3PL data doesn't fit its ads/orders shape)
 python flexport_sync.py           # daily inventory snapshot + a small catalog gap-fill
 python flexport_sync.py --catalog # + a full catalog crawl (slow; run occasionally, not daily)
 python flexport_orders_sync.py    # per-order shipping cost (resumable event-cursor crawl)
+python flexport_orders_sync.py --since-days 30 --pages 5
+python flexport_orders_sync.py --restart   # discard the saved cursor and re-walk from scratch
 python flexport_returns_sync.py   # customer returns
+python flexport_returns_sync.py --pages 5 --restart
 python flexport_inbounds_sync.py  # inbound supplier shipments
+python flexport_inbounds_sync.py --max-pages 5
 ```
 
 A bare run does **not** do a full catalog crawl — only inventory plus enough
@@ -55,6 +59,15 @@ fresh one from that timestamp and keeps walking in the same run — bounded to
 human to notice and clear. On a cold start with no prior timestamp, a bad
 cursor still raises rather than silently restarting the walk from an
 arbitrary point.
+
+`flexport_orders_sync.py` and `flexport_inbounds_sync.py` both exit with
+code `75` and log status `"degraded"` when a transient failure pauses the
+run partway through — this is a resumable pause, not a hard error, and
+matters if you're wiring either script into a scheduler that treats any
+nonzero exit as an alert. `flexport_returns_sync.py` doesn't have this
+pause/resume handling — a transient failure there fails the run outright
+rather than pausing, so don't assume identical resilience across all three
+crawlers.
 
 ## Tests
 

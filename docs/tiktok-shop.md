@@ -45,7 +45,7 @@ configure.
 python run_sync.py --only tiktok      # core orders, last 7 days
 python tiktok_videos_sync.py
 python tiktok_live_sync.py
-python tiktok_creators_sync.py
+python tiktok_creators_sync.py api      # or `import path/to/export.csv` for the manual path
 python tiktok_analytics_sync.py
 python tiktok_finance_sync.py                 # settlements, last 30 days
 python tiktok_finance_sync.py --backfill      # 365-day window
@@ -65,10 +65,26 @@ python tiktok_finance_sync.py --no-components # statements only, fast
 
 `tiktok_creators_sync.py` exists because TikTok's video API and order API
 expose different halves of a creator's identity with no shared join key — the
-bridge closes that gap via the API plus an optional manual CSV import.
+bridge closes that gap via the API plus an optional manual CSV import. The
+`api` subcommand's crawl has a rolling window ceiling, and the write logic
+switches behavior based on how far it got: a partial crawl **merges** into
+existing rows, while a complete crawl **replaces** them outright — see the
+module docstring before assuming every run behaves the same way.
 
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
-alternative to estimating "unattributed" sales by subtraction.
+alternative to estimating "unattributed" sales by subtraction. It chunks
+requests by a fixed window length (`CHUNK_DAYS`) and disambiguates a
+"date range too wide" error from a genuine retention-window error (TikTok
+returns similar-looking codes for both) rather than surfacing a confusing
+raw error. It also drops the most recent day or two of unsettled data via
+`latest_available_date`, so don't expect today's numbers to be final yet.
+
+`tiktok_live_sync.py` has a two-endpoint design gotcha: the list endpoint
+ignores a `live_id` filter, so filtering to one broadcast happens client-side
+after fetching the list. `tiktok_shop_lives` is DATE-grain, not
+session-grain — a broadcast spanning midnight splits across two rows — and
+the script runs a reconciliation sanity-check against the funnel totals to
+catch pagination gaps.
 
 `tiktok_finance_sync.py` exists so a report can read a measured, up-to-date
 fee/take-rate from the database instead of hardcoding a guessed commission
