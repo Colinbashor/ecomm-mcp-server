@@ -80,6 +80,26 @@ recoverable position signal is a value embedded in the page contents, track
 that value defensively even while the primary cursor is healthy — you only
 find out you need it once the primary cursor is already dead.
 
+Three refinements worth calling out because they were each found the hard
+way, and the failure mode in each case is silent (the crawl looks fine, it
+just makes little or no progress):
+  * Re-crafting at the IDENTICAL timestamp on every retry assumes the
+    badness is transient — but whatever makes a position bad is often
+    sticky, so retrying the same spot can fail every attempt and burn the
+    whole recraft budget for nothing. `RECRAFT_NUDGE_MINUTES` steps the
+    re-craft position forward a little more on each attempt instead.
+  * A resume seed sized for an initial historical backfill ("N days back")
+    is usually wrong once that backfill is done and you're just keeping the
+    tip current — it can land the crawl re-walking a long stretch of orders
+    you already have. `frontier_seed()` derives the seed from wherever the
+    stored data actually ends instead of a fixed window.
+  * A checkpoint trigger keyed only on "found something new" can starve
+    during a legitimate no-new-data phase (e.g. re-walking the overlap
+    window above the frontier seed) — a kill mid-run then discards all
+    cursor progress even though many pages were successfully walked.
+    `CHECKPOINT_PAGES` adds a second, page-count-based trigger so position is
+    still saved during a quiet stretch.
+
 Auth: bearer token in FLEXPORT_API_TOKEN (.env), same token as flexport_sync.py.
 Skips cleanly if unset.
 
@@ -116,6 +136,27 @@ CURSOR_KEY = "events_page_info"
 # cursor. See the self-healing note on iter_event_pages() for why this exists.
 LAST_TIME_KEY = "events_last_time"
 MAX_RECRAFTS = 3   # bound on same-run cursor re-crafts; each one pays a full retry budget
+# How far to step forward per re-craft attempt when a cursor position is
+# rejected, instead of re-crafting at the identical timestamp. Whatever makes
+# a position bad tends to be sticky — retrying the same spot can fail every
+# time, burning the whole recraft budget for zero progress. Stepping forward
+# clears the bad region at the cost of a small, bounded gap; small enough to
+# lose little, big enough to actually move past the problem.
+RECRAFT_NUDGE_MINUTES = 15
+# When resuming with no validated cursor, re-seed from wherever the STORED
+# DATA actually ends (see frontier_seed()) rather than a fixed "N days ago"
+# window. Size this in HOURS, not days: on a feed where a single page covers
+# only a couple of minutes, a multi-day overlap can mean thousands of pages
+# re-reading orders you already have before reaching anything new. A couple
+# of hours of overlap is cheap insurance against a boundary gap; re-reads are
+# harmless as long as writes are idempotent (INSERT OR REPLACE).
+FRONTIER_OVERLAP_HOURS = 2
+# Persist the cursor at least this often in PAGES, independent of how many
+# new orders were found. A pure resume walk can spend long stretches
+# re-reading pages with nothing new on them (see FRONTIER_OVERLAP_HOURS); a
+# checkpoint trigger keyed only on "found something new" never fires during
+# exactly that phase, so a kill mid-walk can discard all cursor progress.
+CHECKPOINT_PAGES = 25
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # ULID base32 alphabet
 
 DDL = """
@@ -309,12 +350,17 @@ def iter_event_pages(start_page_info: str | None, max_pages: int,
             if not last_time or recrafts >= MAX_RECRAFTS:
                 raise
             recrafts += 1
-            print(f"  cursor rejected — re-crafting at {last_time} "
+            # NUDGE the position forward each attempt rather than re-crafting
+            # at the identical timestamp. Retrying the exact same spot assumes
+            # the badness is transient when it may not be — a cursor that just
+            # died there will die there again, spending the whole recraft
+            # budget for zero progress before the run gives up and pauses.
+            nudge = RECRAFT_NUDGE_MINUTES * recrafts
+            pos = (datetime.strptime(last_time[:19], "%Y-%m-%dT%H:%M:%S")
+                   .replace(tzinfo=timezone.utc) + timedelta(minutes=nudge))
+            print(f"  cursor rejected — re-crafting at {last_time} +{nudge}min "
                   f"(recraft {recrafts}/{MAX_RECRAFTS})", flush=True)
-            params = {"limit": EVENTS_PAGE,
-                      "page_info": page_info_at(
-                          datetime.strptime(last_time[:19], "%Y-%m-%dT%H:%M:%S")
-                          .replace(tzinfo=timezone.utc))}
+            params = {"limit": EVENTS_PAGE, "page_info": page_info_at(pos)}
             continue
         batch = resp.json()
         if not isinstance(batch, list) or not batch:
@@ -367,6 +413,44 @@ def _save_cursor(conn: sqlite3.Connection, page_info: str) -> None:
 
 def _clear_cursor(conn: sqlite3.Connection) -> None:
     _clear_state(conn, CURSOR_KEY)
+
+
+def frontier_time(conn: sqlite3.Connection,
+                  overlap_hours: int = FRONTIER_OVERLAP_HOURS) -> str | None:
+    """The frontier position as a naive-ISO string, for the last_time bookmark.
+    None if the table is empty (nothing to derive a frontier from yet)."""
+    row = conn.execute("SELECT MAX(created_at) FROM flexport_order_costs").fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        newest = datetime.strptime(row[0][:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (newest - timedelta(hours=overlap_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def frontier_seed(conn: sqlite3.Connection,
+                  overlap_hours: int = FRONTIER_OVERLAP_HOURS) -> str | None:
+    """A crafted cursor positioned just before the newest order already stored.
+
+    Used when there is no validated cursor to resume from (a fresh deployment
+    past its first run, or a cursor the poison guard just discarded). A fixed
+    "N days ago" seed is right for an initial historical backfill but wrong
+    for keeping the tip current once that backfill is done — it can land the
+    crawl walking pages of orders you already have for a long stretch before
+    reaching anything new. Deriving the seed from wherever the DATA actually
+    ends (whatever put it there — a prior crawl, an out-of-band import, a long
+    outage) always resumes in the right place. A small overlap re-reads a
+    little rather than risking a boundary gap; already-stored ids are skipped
+    on resume anyway."""
+    row = conn.execute("SELECT MAX(created_at) FROM flexport_order_costs").fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        newest = datetime.strptime(row[0][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return page_info_at(newest - timedelta(hours=overlap_hours))
 
 
 def existing_order_ids(conn: sqlite3.Connection) -> set[int]:
@@ -467,7 +551,15 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
         mode = "restart from feed floor"
     else:
         start_cursor = _load_cursor(conn)
-        mode = "resume from stored cursor" if start_cursor else "fresh from feed floor"
+        if start_cursor:
+            mode = "resume from stored cursor"
+        elif (frontier := frontier_seed(conn)) is not None:
+            # No validated cursor, but we already hold some orders — resume at
+            # the DATA FRONTIER instead of walking the whole feed from the floor.
+            start_cursor = frontier
+            mode = "no stored cursor — re-seed at the data frontier"
+        else:
+            mode = "fresh from feed floor"
     print(f"Flexport orders crawl — {mode}.")
 
     already = existing_order_ids(conn)
@@ -475,6 +567,11 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
     pkg_rows: list[tuple] = []
     pending_cursor: str | None = None
     last_time = _load_state(conn, LAST_TIME_KEY)
+    if start_cursor and not last_time:
+        # A frontier-seeded cursor needs its OWN last_time anchor: the stored
+        # bookmark (if any) can be far older than the frontier, and re-crafting
+        # off a stale value on the first rejected page would rewind the crawl.
+        last_time = frontier_time(conn)
     n_orders = pages = 0
 
     def checkpoint() -> None:
@@ -500,7 +597,13 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
                 pkg_rows.extend(prows)
                 n_orders += 1
             pending_cursor = nxt
-            if len(order_rows) >= 100:
+            # Checkpoint on EITHER 100 new orders OR every CHECKPOINT_PAGES
+            # pages, whichever comes first. The page trigger matters when
+            # resuming near the frontier: that walk can spend many pages
+            # re-reading orders already stored (see FRONTIER_OVERLAP_HOURS),
+            # and an order-count-only trigger never fires during that phase —
+            # a kill mid-walk would then discard all cursor progress.
+            if len(order_rows) >= 100 or pages % CHECKPOINT_PAGES == 0:
                 checkpoint()
                 print(f"  ...checkpointed: {n_orders} new orders, {pages} pages")
         checkpoint()

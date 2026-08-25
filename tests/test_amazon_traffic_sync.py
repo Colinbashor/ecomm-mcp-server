@@ -55,7 +55,8 @@ class SchemaTests(unittest.TestCase):
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("amazon_traffic_weekly", "amazon_traffic_daily",
-                  "amazon_traffic_monthly", "amazon_traffic_monthly_account"):
+                  "amazon_traffic_monthly", "amazon_traffic_monthly_account",
+                  "amazon_traffic_coverage"):
             self.assertIn(t, tables)
 
 
@@ -129,8 +130,11 @@ class SyncWeekTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         traffic.ensure_schema(conn)
         with patch.object(traffic, "_report", return_value=_sample_report()):
-            n = traffic.sync_week(conn, date(2026, 6, 22), "stamp")
+            n, complete = traffic.sync_week(conn, date(2026, 6, 22), "stamp")
         self.assertEqual(n, 4)  # 2 asins + 2 days
+        # The sample fixture only covers 2 of the week's 7 days, so this
+        # period is (correctly) reported incomplete even though rows wrote.
+        self.assertFalse(complete)
         weekly = conn.execute(
             "SELECT asin, units_ordered FROM amazon_traffic_weekly ORDER BY asin").fetchall()
         self.assertEqual(weekly, [("B0001", 10), ("B0002", 0)])
@@ -156,7 +160,7 @@ class SyncMonthTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         traffic.ensure_schema(conn)
         with patch.object(traffic, "_report", return_value=_sample_report()):
-            n = traffic.sync_month(conn, "2026-06", "stamp")
+            n, _complete = traffic.sync_month(conn, "2026-06", "stamp")
         self.assertEqual(n, 3)  # 2 asins + 1 account row
         monthly = conn.execute(
             "SELECT asin, units_ordered FROM amazon_traffic_monthly ORDER BY asin").fetchall()
@@ -178,6 +182,128 @@ class SyncMonthTests(unittest.TestCase):
         asins = {r[0] for r in conn.execute(
             "SELECT asin FROM amazon_traffic_monthly WHERE month='2026-06'")}
         self.assertEqual(asins, {"B0003"})  # old B0001/B0002 rows gone, not accumulated
+
+
+class CoverageTests(unittest.TestCase):
+    def _full_week_report(self) -> dict:
+        """A report covering all 7 days of the 2026-06-22..28 week, sections
+        agreeing exactly — the baseline complete case."""
+        by_date = []
+        total = 0.0
+        for i in range(7):
+            d = (date(2026, 6, 22) + traffic.timedelta(days=i)).isoformat()
+            by_date.append({"date": d, "trafficByDate": {"sessions": 10, "pageViews": 15},
+                            "salesByDate": {"unitsOrdered": 1,
+                                            "orderedProductSales": {"amount": "10.00"},
+                                            "totalOrderItems": 1}})
+            total += 10.00
+        return {
+            "salesAndTrafficByAsin": [
+                {"childAsin": "B0001", "trafficByAsin": {"sessions": 70, "pageViews": 105},
+                 "salesByAsin": {"unitsOrdered": 7,
+                                 "orderedProductSales": {"amount": f"{total:.2f}"}}},
+            ],
+            "salesAndTrafficByDate": by_date,
+        }
+
+    def test_full_week_is_complete(self) -> None:
+        cov = traffic.coverage(self._full_week_report(), "2026-06-22", "2026-06-28")
+        self.assertTrue(cov["is_complete"])
+        self.assertEqual(cov["missing_days"], [])
+
+    def test_missing_trailing_day_is_incomplete(self) -> None:
+        data = self._full_week_report()
+        data["salesAndTrafficByDate"] = data["salesAndTrafficByDate"][:6]  # drop Sunday
+        cov = traffic.coverage(data, "2026-06-22", "2026-06-28")
+        self.assertFalse(cov["is_complete"])
+        self.assertEqual(cov["missing_days"], ["2026-06-28"])
+
+    def test_all_days_present_but_sections_disagree_is_incomplete(self) -> None:
+        # Every day present in byDate, but byAsin reports much more revenue —
+        # the two-section check must catch this even with a full day count.
+        data = self._full_week_report()
+        data["salesAndTrafficByAsin"][0]["salesByAsin"]["orderedProductSales"]["amount"] = "999.00"
+        cov = traffic.coverage(data, "2026-06-22", "2026-06-28")
+        self.assertEqual(cov["missing_days"], [])
+        self.assertFalse(cov["is_complete"])
+
+    def test_a_short_pull_never_overwrites_a_stored_complete_week(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        traffic.ensure_schema(conn)
+        with patch.object(traffic, "_report", return_value=self._full_week_report()):
+            n1, complete1 = traffic.sync_week(conn, date(2026, 6, 22), "stamp1")
+        self.assertTrue(complete1)
+
+        short = self._full_week_report()
+        short["salesAndTrafficByDate"] = short["salesAndTrafficByDate"][:6]
+        with patch.object(traffic, "_report", return_value=short):
+            n2, complete2 = traffic.sync_week(conn, date(2026, 6, 22), "stamp2")
+        self.assertEqual(n2, 0)          # nothing written on top of the good data
+        self.assertFalse(complete2)
+        weekly = conn.execute(
+            "SELECT synced_at FROM amazon_traffic_weekly WHERE asin='B0001'").fetchone()
+        self.assertEqual(weekly[0], "stamp1")  # untouched by the short re-pull
+
+    def test_repair_finds_incomplete_weeks_and_skips_complete_ones(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        traffic.ensure_schema(conn)
+        good_monday = date(2026, 6, 22)
+        bad_monday = date(2026, 6, 29)
+        with patch.object(traffic, "_report", return_value=self._full_week_report()):
+            traffic.sync_week(conn, good_monday, "stamp")
+        short = self._full_week_report()
+        short["salesAndTrafficByDate"] = short["salesAndTrafficByDate"][:6]
+        with patch.object(traffic, "_report", return_value=short):
+            traffic.sync_week(conn, bad_monday, "stamp")
+
+        wanted = traffic.weeks_needing_repair(conn, [good_monday, bad_monday])
+        self.assertEqual(wanted, [bad_monday])
+
+    def test_repair_gives_up_after_max_attempts(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        traffic.ensure_schema(conn)
+        conn.execute(
+            "INSERT INTO amazon_traffic_coverage VALUES "
+            "('week','2026-06-29','2026-06-29','2026-07-05',7,6,'2026-07-05',10,10,0,?,'x')",
+            (traffic.MAX_REPAIR_ATTEMPTS,))
+        wanted = traffic.weeks_needing_repair(conn, [date(2026, 6, 29)])
+        self.assertEqual(wanted, [])
+
+    def test_missing_coverage_row_falls_back_to_day_count_heuristic(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        traffic.ensure_schema(conn)
+        monday = date(2026, 6, 22)
+        with conn:
+            conn.execute(
+                "INSERT INTO amazon_traffic_weekly VALUES ('2026-06-22','B0001',NULL,0,0,0,0,0,'x')")
+            conn.execute("INSERT INTO amazon_traffic_daily VALUES ('2026-06-22',0,0,0,0,0,'x')")
+        # Only 1 of 7 days stored, and no coverage row at all (pre-dates the
+        # feature) -> still flagged for repair via the day-count fallback.
+        self.assertEqual(traffic.weeks_needing_repair(conn, [monday]), [monday])
+
+
+class RunStatusTests(unittest.TestCase):
+    def test_failed_takes_priority(self) -> None:
+        status, msg = traffic.run_status(5, ["2026-06-22"], ["2026-06-29"], repair=False)
+        self.assertEqual(status, "error")
+        self.assertIn("2026-06-29", msg)
+
+    def test_partial_without_failure_is_degraded(self) -> None:
+        status, msg = traffic.run_status(5, ["2026-06-22"], [], repair=False)
+        self.assertEqual(status, "degraded")
+
+    def test_zero_rows_on_a_plain_run_is_an_error(self) -> None:
+        status, _ = traffic.run_status(0, [], [], repair=False)
+        self.assertEqual(status, "error")
+
+    def test_zero_rows_on_a_repair_run_is_ok(self) -> None:
+        # Nothing needed fixing — that is success, not failure.
+        status, msg = traffic.run_status(0, [], [], repair=True)
+        self.assertEqual(status, "ok")
+
+    def test_all_complete_is_ok(self) -> None:
+        status, msg = traffic.run_status(10, [], [], repair=False)
+        self.assertEqual((status, msg), ("ok", ""))
 
 
 class RequireEnvTests(unittest.TestCase):

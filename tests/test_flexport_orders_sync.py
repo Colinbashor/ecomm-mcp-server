@@ -158,6 +158,102 @@ class SelfHealingCursorTests(unittest.TestCase):
                 list(fo.iter_event_pages("DEAD-CURSOR", max_pages=10, last_time=None))
 
 
+class RecraftNudgeTests(unittest.TestCase):
+    """A rejected cursor must not be re-crafted at the identical timestamp —
+    whatever made that position bad is often sticky, so retrying the same
+    spot can fail every attempt. Each recraft should step forward."""
+
+    def test_recraft_steps_forward_past_the_bad_position(self) -> None:
+        seen_dts: list[datetime] = []
+        real_page_info_at = fo.page_info_at
+
+        def spy_page_info_at(dt):
+            seen_dts.append(dt)
+            return real_page_info_at(dt)
+
+        good_page = [{"payload": {"orderId": 9}, "time": "2024-06-05T12:00:00Z"}]
+        responses = [fo.FlexportBadCursor("500"), fo.FlexportBadCursor("500"), _resp(good_page)]
+
+        def fake_request(path, params):
+            r = responses.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        with patch.object(fo, "_request", side_effect=fake_request), \
+             patch.object(fo, "page_info_at", side_effect=spy_page_info_at), \
+             patch.object(fo.time, "sleep"):
+            list(fo.iter_event_pages(
+                "DEAD-CURSOR", max_pages=10, last_time="2024-06-05T11:00:00"))
+
+        # Two recrafts, each nudged further forward than the last, and both
+        # strictly past the original last_time.
+        self.assertEqual(len(seen_dts), 2)
+        base = datetime(2024, 6, 5, 11, 0, 0, tzinfo=timezone.utc)
+        self.assertGreater(seen_dts[0], base)
+        self.assertGreater(seen_dts[1], seen_dts[0])
+
+
+class FrontierSeedTests(unittest.TestCase):
+    """Resuming with no validated cursor should re-seed from wherever the
+    stored data actually ends, not a fixed lookback window."""
+
+    def test_returns_none_on_empty_table(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        fo.ensure_schema(conn)
+        self.assertIsNone(fo.frontier_seed(conn))
+        self.assertIsNone(fo.frontier_time(conn))
+
+    def test_seeds_before_the_newest_stored_order(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        fo.ensure_schema(conn)
+        with conn:
+            conn.execute(
+                "INSERT INTO flexport_order_costs "
+                "(order_id, external_order_id, cost, currency, internal_status, fulfillment_status, "
+                " created_at, shipped_at, delivered_at, units, n_shipments, n_packages, "
+                " total_weight_oz, carriers, shipping_methods, is_international, synced_at) "
+                "VALUES (1,'E1',5.0,'USD',NULL,NULL,'2024-06-05T12:00:00',NULL,NULL,0,0,0,0,"
+                "NULL,NULL,0,'x')")
+
+        cursor = fo.frontier_seed(conn, overlap_hours=2)
+        self.assertIsNotNone(cursor)
+        import base64
+        import json
+        pad = cursor + "=" * (-len(cursor) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(pad))
+        # A ULID's leading characters are monotonic with time; a 2h-earlier seed
+        # must sort strictly before a ULID crafted at the stored created_at.
+        at_created = fo.ulid_at(datetime(2024, 6, 5, 12, 0, 0, tzinfo=timezone.utc))
+        self.assertLess(decoded["cursor"], at_created)
+
+        bookmark = fo.frontier_time(conn, overlap_hours=2)
+        self.assertEqual(bookmark, "2024-06-05T10:00:00")
+
+
+class CheckpointPagesTests(unittest.TestCase):
+    """A quiet stretch with no new orders must still checkpoint periodically,
+    or a kill mid-walk discards all cursor progress."""
+
+    def test_checkpoints_on_page_count_even_with_zero_new_orders(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        fo.ensure_schema(conn)
+
+        # CHECKPOINT_PAGES pages, each with an order id already "seen" so
+        # nothing new accumulates in order_rows — only the page-count trigger
+        # can cause a checkpoint here.
+        pages = [([], f"CUR-{i}", None) for i in range(1, fo.CHECKPOINT_PAGES + 1)]
+
+        with patch.object(fo, "iter_event_pages", return_value=iter(pages)), \
+             patch.object(fo, "fetch_order"):
+            fo.run(conn, restart=False, since_days=None, max_pages=100)
+
+        cursor = conn.execute(
+            "SELECT value FROM flexport_order_sync_state WHERE key='events_page_info'"
+        ).fetchone()
+        self.assertEqual(cursor[0], f"CUR-{fo.CHECKPOINT_PAGES}")
+
+
 class RequestRetryTests(unittest.TestCase):
     def test_401_is_hard_fatal_no_retry(self) -> None:
         with patch.object(fo.requests, "get", return_value=_resp({}, status=401)), \

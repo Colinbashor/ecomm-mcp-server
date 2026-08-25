@@ -31,6 +31,46 @@ this report type does not appear to have a short retention floor in practice
 report-queue throttling (expect 429s under sustained load; this backs off
 and retries).
 
+COMPLETENESS IS NOT GUARANTEED BY A DONE STATUS. A report requested close to
+the end of a period can come back HTTP 200/DONE with fewer days than
+requested, because the platform has not finished publishing the most recent
+day(s) yet — this is common for any "closes the books on a lag" reporting
+API, not specific to this report type. A fixed-schedule pull run shortly
+after a period ends is especially exposed: it can silently store a short
+period as if it were complete, understating totals for however long it takes
+someone to notice a discrepancy against the platform's own dashboard.
+
+`coverage()` guards against this by checking TWO things, deliberately not
+collapsed into a single day-count check: (1) every expected calendar day is
+present in `salesAndTrafficByDate`, and (2) the `salesAndTrafficByDate` and
+`salesAndTrafficByAsin` sections' summed `orderedProductSales` agree within
+`BYASIN_BYDATE_TOLERANCE`. The two sections can disagree independently of
+the day-count check (one section can be short while the other is complete),
+and `sync_week`/`sync_month` write from byAsin, so a day-count-only check
+can call a byAsin-short-but-byDate-complete period "fine" and vice versa.
+
+`sync_week`/`sync_month` return `(rows_written, is_complete)` and apply three
+rules: (1) a short pull never overwrites a period already stored COMPLETE —
+without this, a routine re-check of a recent period could let one bad day
+silently replace good data with a fresher-but-shorter pull; (2) a short pull
+is recorded but logged as `degraded`, never `ok`, so monitoring keyed on
+sync-log status can't read a short pull as healthy; (3) `--repair` re-pulls
+only periods recorded incomplete, at zero API cost when everything is
+already complete, bounded by `MAX_REPAIR_ATTEMPTS` so a period the platform
+will never finish publishing doesn't get re-requested forever. `amazon_traffic_coverage`
+persists what was actually returned per period, independent of whether the
+main tables show any rows — the guiding rule (used elsewhere in this project
+for other gap-prone external feeds) is that the ABSENCE of a coverage row
+can never be treated as evidence of completeness or incompleteness on its
+own; it just means the check predates this feature and falls back to a
+weaker day-count heuristic.
+
+`--allow-partial` exits 0 on a short pull instead of failing the run, for a
+two-pass schedule: an early pass run soon after a period ends is *expected*
+to be short and shouldn't alarm, while a later `--repair` pass (run after
+enough time has passed for the platform to catch up) is the one that should
+fail loudly if data is still missing.
+
 AUTH: same SPAPI_* LWA credentials as amazon_orders.py — no new creds. This
 script is standalone (not wired into run_sync.py), like its sibling
 amazon_*_sync.py scripts.
@@ -108,6 +148,21 @@ CREATE TABLE IF NOT EXISTS amazon_traffic_monthly_account (
     total_orders   INTEGER DEFAULT 0,
     synced_at      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS amazon_traffic_coverage (
+    period_kind    TEXT NOT NULL,   -- 'week' | 'month'
+    period_key     TEXT NOT NULL,   -- Monday ISO date | 'YYYY-MM'
+    range_start    TEXT NOT NULL,
+    range_end      TEXT NOT NULL,
+    days_expected  INTEGER NOT NULL,
+    days_returned  INTEGER NOT NULL,
+    missing_days   TEXT,            -- comma-joined ISO dates Amazon did not return
+    bydate_sales   REAL,
+    byasin_sales   REAL,
+    is_complete    INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 1,
+    synced_at      TEXT NOT NULL,
+    PRIMARY KEY (period_kind, period_key)
+);
 """
 
 
@@ -123,6 +178,92 @@ def require_env() -> None:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+
+
+# ---- coverage validation (see module docstring for why this exists) -------
+
+BYASIN_BYDATE_TOLERANCE = 0.02   # 2%: complete periods measure well under this;
+                                 # a genuinely missing day produces a much larger gap.
+MAX_REPAIR_ATTEMPTS = 6          # poison guard: a day the platform will never
+                                 # publish must not be re-requested forever.
+
+
+def _expected_days(start: str, end: str) -> list[str]:
+    d, last = date.fromisoformat(start), date.fromisoformat(end)
+    out = []
+    while d <= last:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _section_sales(section: dict, key: str) -> float:
+    return float(((section.get(key) or {}).get("orderedProductSales") or {}).get("amount", 0) or 0)
+
+
+def coverage(data: dict, start: str, end: str) -> dict:
+    """Did the platform actually return the whole requested range?
+
+    Pure — takes the parsed report payload, returns a verdict dict. Kept free
+    of IO so the completeness rule is unit-testable without an API call."""
+    expected = _expected_days(start, end)
+    returned = {d.get("date") for d in data.get("salesAndTrafficByDate", []) if d.get("date")}
+    missing = [d for d in expected if d not in returned]
+
+    bydate = sum(_section_sales(d, "salesByDate") for d in data.get("salesAndTrafficByDate", []))
+    byasin = sum(_section_sales(a, "salesByAsin") for a in data.get("salesAndTrafficByAsin", []))
+
+    # Relative gap against the LARGER side: dividing by whichever section is
+    # short overstates the gap when that same section is the short one.
+    base = max(bydate, byasin)
+    gap = abs(byasin - bydate) / base if base else 0.0
+
+    return {
+        "range_start": start,
+        "range_end": end,
+        "days_expected": len(expected),
+        "days_returned": len(expected) - len(missing),
+        "missing_days": missing,
+        "bydate_sales": round(bydate, 2),
+        "byasin_sales": round(byasin, 2),
+        "sections_gap": round(gap, 4),
+        "is_complete": not missing and gap <= BYASIN_BYDATE_TOLERANCE,
+    }
+
+
+def _stored_coverage(conn: sqlite3.Connection, kind: str, key: str) -> dict | None:
+    r = conn.execute(
+        """SELECT is_complete, attempts FROM amazon_traffic_coverage
+           WHERE period_kind=? AND period_key=?""", (kind, key)).fetchone()
+    return None if r is None else {"is_complete": bool(r[0]), "attempts": int(r[1])}
+
+
+def _record_coverage(conn: sqlite3.Connection, kind: str, key: str,
+                     cov: dict, stamp: str) -> None:
+    prior = _stored_coverage(conn, kind, key)
+    attempts = (prior["attempts"] + 1) if prior else 1
+    conn.execute(
+        """INSERT OR REPLACE INTO amazon_traffic_coverage
+           (period_kind, period_key, range_start, range_end, days_expected,
+            days_returned, missing_days, bydate_sales, byasin_sales,
+            is_complete, attempts, synced_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (kind, key, cov["range_start"], cov["range_end"], cov["days_expected"],
+         cov["days_returned"], ",".join(cov["missing_days"]) or None,
+         cov["bydate_sales"], cov["byasin_sales"], int(cov["is_complete"]),
+         attempts, stamp))
+
+
+def describe(cov: dict) -> str:
+    if cov["is_complete"]:
+        return f"{cov['days_expected']}/{cov['days_expected']} days"
+    bits = [f"{cov['days_returned']}/{cov['days_expected']} days"]
+    if cov["missing_days"]:
+        bits.append("missing " + ",".join(cov["missing_days"]))
+    if cov["sections_gap"] > BYASIN_BYDATE_TOLERANCE:
+        bits.append(f"byAsin/byDate differ {cov['sections_gap']*100:.1f}% "
+                    f"(${cov['byasin_sales']:,.0f} vs ${cov['bydate_sales']:,.0f})")
+    return "; ".join(bits)
 
 
 # ---- small local period helpers (no shared "report_period" module here) ---
@@ -235,29 +376,56 @@ def _monthly_account_row(data: dict, ym: str, stamp: str) -> tuple:
     return (ym, sessions, pageviews, units, round(sales, 2), orders, stamp)
 
 
-def sync_week(conn: sqlite3.Connection, monday: date, stamp: str) -> int:
+def sync_week(conn: sqlite3.Connection, monday: date, stamp: str) -> tuple[int, bool]:
+    """Pull one Mon-Sun week. Returns (rows_written, is_complete).
+
+    A short pull never overwrites a week already stored complete — see the
+    module docstring's COMPLETENESS section for why."""
     host = HOSTS[os.environ.get("SPAPI_REGION", "NA").upper()]
     start, end = _week_bounds(monday)
     data = _report(host, start, end)
+
+    cov = coverage(data, start, end)
+    if not cov["is_complete"]:
+        prior = _stored_coverage(conn, "week", start)
+        if prior and prior["is_complete"]:
+            with conn:
+                _record_coverage(conn, "week", start, cov, stamp)
+            print(f"    traffic week {start}: INCOMPLETE ({describe(cov)}) — "
+                  f"keeping the complete data already stored, not overwriting", flush=True)
+            return 0, False
 
     weekly = _weekly_rows(data, start, stamp)
     daily = _daily_rows(data, stamp)
     with conn:
         conn.executemany("INSERT OR REPLACE INTO amazon_traffic_weekly VALUES (?,?,?,?,?,?,?,?,?)", weekly)
         conn.executemany("INSERT OR REPLACE INTO amazon_traffic_daily VALUES (?,?,?,?,?,?,?)", daily)
-    print(f"    traffic week {start}: {len(weekly)} asins, {len(daily)} days", flush=True)
-    return len(weekly) + len(daily)
+        _record_coverage(conn, "week", start, cov, stamp)
+    flag = "" if cov["is_complete"] else f"  !! INCOMPLETE: {describe(cov)}"
+    print(f"    traffic week {start}: {len(weekly)} asins, {len(daily)} days{flag}", flush=True)
+    return len(weekly) + len(daily), cov["is_complete"]
 
 
-def sync_month(conn: sqlite3.Connection, ym: str, stamp: str) -> int:
+def sync_month(conn: sqlite3.Connection, ym: str, stamp: str) -> tuple[int, bool]:
     """Native calendar-month pull -> amazon_traffic_monthly (+_account). ONE
     report request for the whole month range (byAsin aggregates over the full
     requested range on its own; byDate comes back one row per day and is
     summed here into a single account-level month row) — never day-by-day.
-    Parallel tables, never touches amazon_traffic_weekly/_daily."""
+    Parallel tables, never touches amazon_traffic_weekly/_daily. Returns
+    (rows_written, is_complete); see sync_week for the never-downgrade rule."""
     host = HOSTS[os.environ.get("SPAPI_REGION", "NA").upper()]
     start, end = _month_bounds(ym)
     data = _report(host, start, end)
+
+    cov = coverage(data, start, end)
+    if not cov["is_complete"]:
+        prior = _stored_coverage(conn, "month", ym)
+        if prior and prior["is_complete"]:
+            with conn:
+                _record_coverage(conn, "month", ym, cov, stamp)
+            print(f"    traffic month {ym}: INCOMPLETE ({describe(cov)}) — "
+                  f"keeping the complete data already stored, not overwriting", flush=True)
+            return 0, False
 
     monthly = _weekly_rows(data, ym, stamp)  # same per-ASIN shape, month key instead of week key
     acct_row = _monthly_account_row(data, ym, stamp)
@@ -270,9 +438,62 @@ def sync_month(conn: sqlite3.Connection, ym: str, stamp: str) -> int:
             "INSERT OR REPLACE INTO amazon_traffic_monthly_account VALUES (?,?,?,?,?,?,?)",
             acct_row,
         )
+        _record_coverage(conn, "month", ym, cov, stamp)
+    flag = "" if cov["is_complete"] else f"  !! INCOMPLETE: {describe(cov)}"
     print(f"    traffic month {ym} ({start}..{end}): {len(monthly)} asins, "
-          f"{by_date_count} days rolled up to 1 account row", flush=True)
-    return len(monthly) + 1
+          f"{by_date_count} days rolled up to 1 account row{flag}", flush=True)
+    return len(monthly) + 1, cov["is_complete"]
+
+
+def weeks_needing_repair(conn: sqlite3.Connection, mondays: list[date]) -> list[date]:
+    """Which of these weeks are known-incomplete and still worth re-requesting.
+
+    A MISSING coverage row is NOT treated as incomplete: every week synced
+    before coverage tracking existed has none, and treating absence as
+    failure would re-pull the entire backfilled history on the first repair
+    run. For those weeks this falls back to the day count in
+    amazon_traffic_daily — a weak proxy (it reads byDate, not the byAsin the
+    main tables are written from) but strictly better than nothing, and it
+    only ever costs one extra report per week that turns out fine.
+
+    Weeks already re-requested MAX_REPAIR_ATTEMPTS times are dropped: if the
+    platform is never going to publish that day, repeating the ask forever is
+    just noise."""
+    out = []
+    for monday in mondays:
+        key = monday.isoformat()
+        end = (monday + timedelta(days=6)).isoformat()
+        prior = _stored_coverage(conn, "week", key)
+        if prior is not None:
+            if not prior["is_complete"] and prior["attempts"] < MAX_REPAIR_ATTEMPTS:
+                out.append(monday)
+            continue
+        stored_days = conn.execute(
+            "SELECT COUNT(*) FROM amazon_traffic_daily WHERE date BETWEEN ? AND ?",
+            (key, end)).fetchone()[0]
+        has_week = conn.execute(
+            "SELECT 1 FROM amazon_traffic_weekly WHERE week_start=? LIMIT 1", (key,)).fetchone()
+        if has_week and stored_days < 7:
+            out.append(monday)
+    return out
+
+
+def run_status(total: int, partial: list[str], failed: list[str],
+              repair: bool) -> tuple[str, str]:
+    """Decide the sync_log status for a weekly run.
+
+    THE RULE THIS ENCODES: a run that stored a short period is not "ok",
+    however many rows it wrote — status must reflect completeness, not just
+    "wrote something"."""
+    if failed:
+        return "error", "failed weeks: " + ",".join(failed)
+    if partial:
+        return "degraded", ("incomplete weeks (platform had not published the full "
+                            "range): " + ",".join(partial))
+    if not total:
+        # Nothing to repair is a real success; nothing pulled at all is not.
+        return ("ok", "repair: nothing to fix") if repair else ("error", "no rows written")
+    return "ok", ""
 
 
 def main() -> int:
@@ -283,6 +504,13 @@ def main() -> int:
                         "ignored if --week is given)")
     p.add_argument("--month", help="YYYY-MM calendar month — native month pull into the "
                                     "parallel monthly tables (see module docstring)")
+    p.add_argument("--repair", action="store_true",
+                   help="only re-pull weeks inside the --weeks window that are recorded "
+                        "INCOMPLETE (zero API calls when everything is already complete)")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="exit 0 even if a period comes back short. Use for an early pass run "
+                        "soon after a period ends, where a short pull is expected; a later "
+                        "--repair pass is the one that should fail loudly.")
     args = p.parse_args()
 
     require_env()
@@ -293,17 +521,21 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     if args.month:
+        message = args.month
         try:
-            total = sync_month(conn, args.month, stamp)
+            total, complete = sync_month(conn, args.month, stamp)
             status = "ok" if total else "error"
+            if total and not complete:
+                status = "degraded"
+                message = f"{args.month} INCOMPLETE — platform did not return the full month"
         except Exception as e:  # noqa: BLE001
             print(f"    traffic month {args.month}: FAILED {str(e)[:200]}", flush=True)
             total, status = 0, "error"
         finally:
             conn.close()
-        warehouse_db.log_sync(f"{PLATFORM}_monthly", started, total, status, args.month)
-        print(f"Amazon traffic (month {args.month}): wrote {total} rows")
-        return 0 if status == "ok" else 1
+        warehouse_db.log_sync(f"{PLATFORM}_monthly", started, total, status, message)
+        print(f"Amazon traffic (month {args.month}): wrote {total} rows [{status}]")
+        return 0 if status == "ok" or (status == "degraded" and args.allow_partial) else 1
 
     if args.week:
         monday = date.fromisoformat(args.week)
@@ -313,18 +545,34 @@ def main() -> int:
     else:
         mondays = _recent_mondays(args.weeks)
 
+    partial: list[str] = []
+    failed: list[str] = []
     total = 0
     try:
+        if args.repair:
+            wanted = weeks_needing_repair(conn, mondays)
+            skipped = len(mondays) - len(wanted)
+            print(f"    repair: {len(wanted)} of {len(mondays)} weeks recorded incomplete "
+                  f"({skipped} already complete — no report requested)", flush=True)
+            mondays = wanted
         for monday in mondays:
             try:
-                total += sync_week(conn, monday, stamp)
+                rows, complete = sync_week(conn, monday, stamp)
+                total += rows
+                if not complete:
+                    partial.append(monday.isoformat())
             except Exception as e:  # noqa: BLE001 — one week must not kill the rest
                 print(f"    traffic week {monday}: FAILED {str(e)[:100]}", flush=True)
+                failed.append(monday.isoformat())
     finally:
         conn.close()
-    warehouse_db.log_sync(PLATFORM, started, total, "ok" if total else "error")
-    print(f"Amazon traffic: wrote {total} rows")
-    return 0 if total else 1
+
+    status, message = run_status(total, partial, failed, args.repair)
+    warehouse_db.log_sync(PLATFORM, started, total, status, message)
+    print(f"Amazon traffic: wrote {total} rows [{status}]" + (f" — {message}" if message else ""))
+    if status == "degraded" and args.allow_partial:
+        return 0
+    return 0 if status == "ok" else 1
 
 
 if __name__ == "__main__":
