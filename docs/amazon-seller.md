@@ -54,6 +54,8 @@ python amazon_fees_sync.py                          # or --week YYYY-MM-DD
 python amazon_fees_sync.py --only fee_preview,storage,reimbursements,promotions,shipments
 python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --weeks N to backfill
 python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
+python amazon_traffic_sync.py --repair               # re-pull only weeks recorded incomplete
+python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
 ```
@@ -68,7 +70,7 @@ python voc_import.py path/to/export.csv
   `amazon_fba_promotions`, `amazon_fulfilled_shipments`
 - `amazon_economics`
 - `amazon_traffic_weekly`, `amazon_traffic_monthly`, `amazon_traffic_daily`,
-  `amazon_traffic_monthly_account`
+  `amazon_traffic_monthly_account`, `amazon_traffic_coverage`
 - `amazon_voc`
 
 ## Notes
@@ -96,6 +98,25 @@ table.
 Sun–Sat. A query with a Mon–Sun (or any other) week boundary will silently
 return zero rows rather than erroring — if `amazon_economics` looks empty for
 a week you expect data for, check the boundary first.
+
+`amazon_traffic_sync.py` **validates that a "DONE" report is actually
+complete** before trusting it. A report requested close to the end of a
+period can come back HTTP 200/DONE with fewer days than requested, because
+Amazon hasn't finished publishing the most recent day(s) yet — a fixed
+schedule run right after a period ends is especially exposed to silently
+storing a short period as if it were whole. `coverage()` checks two things:
+every expected calendar day is present in `salesAndTrafficByDate`, and the
+`salesAndTrafficByDate`/`salesAndTrafficByAsin` sections' summed
+`orderedProductSales` agree within 2% (`sync_week`/`sync_month` write from
+byAsin, so a day-count-only check can miss a byAsin-short period). A short
+pull never overwrites a period already stored complete, is recorded in the
+new `amazon_traffic_coverage` table, and logs `degraded` rather than `ok` so
+monitoring keyed on sync-log status doesn't read it as healthy. Run with
+`--repair` on a later pass (after Amazon has had time to catch up) to
+re-pull only the recorded-incomplete periods, bounded to 6 attempts per
+period so a day Amazon will never actually finish publishing doesn't get
+re-requested forever. `--allow-partial` is for the opposite case — an early
+pass expected to be short — and exits 0 instead of failing the run.
 
 `amazon_fulfilled_shipments` (written by `amazon_fees_sync.py`) carries
 `sales_channel` and `shopify_order_name` columns, letting you join Amazon's
