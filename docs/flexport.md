@@ -60,6 +60,31 @@ human to notice and clear. On a cold start with no prior timestamp, a bad
 cursor still raises rather than silently restarting the walk from an
 arbitrary point.
 
+Three further refinements, each found from a failure mode where the crawl
+looked fine but made little or no progress:
+
+- **Re-craft nudges forward instead of retrying the identical spot.**
+  Whatever makes a cursor position bad tends to be sticky, so re-crafting at
+  the exact same timestamp on every attempt can fail every time and burn the
+  whole recraft budget for nothing. Each retry steps the position forward by
+  `RECRAFT_NUDGE_MINUTES * recrafts` (15 min, then 30, then 45).
+- **No stored cursor re-seeds from the data frontier, not a fixed lookback.**
+  On resume with no validated cursor (fresh deployment past its first run, or
+  a cursor the poison guard just discarded), `frontier_seed()` derives the
+  resume position from `MAX(created_at)` in `flexport_order_costs` — the data
+  actually on hand — rather than a fixed "N days back" window sized for an
+  initial backfill. That fixed window is wrong once the backfill is done and
+  the crawl is just keeping the tip current: it can re-walk a long stretch of
+  orders already stored. `FRONTIER_OVERLAP_HOURS` (2h) is re-read as cheap
+  insurance against a boundary gap; re-reads are harmless since writes are
+  idempotent (`INSERT OR REPLACE`).
+- **Checkpointing also triggers on page count, not just new-order count.** A
+  resume walk near the frontier can spend a long stretch re-reading pages
+  with nothing new on them, and a checkpoint trigger keyed only on "found 100
+  new orders" never fires during that stretch — a kill mid-walk would then
+  discard all cursor progress. `CHECKPOINT_PAGES` (25) adds a second trigger
+  so position is saved during a quiet stretch too.
+
 `flexport_orders_sync.py` and `flexport_inbounds_sync.py` both exit with
 code `75` and log status `"degraded"` when a transient failure pauses the
 run partway through — this is a resumable pause, not a hard error, and
