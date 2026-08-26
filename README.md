@@ -94,7 +94,7 @@ writes, and its test coverage.
 | Google Ads | [docs/google-ads.md](docs/google-ads.md) | campaign spend/clicks/conversions | search terms, keywords, Shopping/PMax demand, campaign structure |
 | Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages, new-vs-returning |
 | Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
-| Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | — |
+| Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | ad/creative/video-level detail |
 | Amazon Advertising | [docs/amazon-ads.md](docs/amazon-ads.md) | campaign spend/clicks/conversions | per-ASIN, keyword/target, search-term performance |
 | Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase |
@@ -104,6 +104,7 @@ writes, and its test coverage.
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
 | Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics |
+| Algolia (on-site search/browse) | [docs/algolia.md](docs/algolia.md) | — | collection-grid placement, search/browse engagement |
 
 Two more standalone utilities aren't connectors at all — no credentials, no
 data pulled from anywhere: pushing a "sync finished" notification to
