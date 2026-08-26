@@ -1,0 +1,23 @@
+# Optional config for algolia_sync.py's placement grain.
+#
+# `tracked_collections` lists the collection/category page handles whose
+# on-site grid placement gets snapshotted daily. These are storefront-specific
+# — for a Shopify-backed storefront they're usually the collection handle from
+# the page URL (yourstore.com/collections/new-arrivals -> "new-arrivals"); for
+# another platform, whatever slug your Algolia index's `collections`-style
+# facet attribute uses for that grid. Use `algolia_sync.py --probe` to check
+# that a handle actually resolves to a nonzero product count before trusting it.
+#
+# This file is entirely optional. If it's missing, or the list is empty,
+# algolia_sync.py's placement grain has nothing to track and skips cleanly —
+# search/browse ENGAGEMENT capture (the other half of the connector) is
+# unaffected either way. Pass `--collections a,b,c` on the command line to
+# override this file for a single run without editing it.
+#
+# The example values below are placeholders — replace them with your own
+# storefront's collection handles.
+
+algolia:
+  tracked_collections:
+    - "new-arrivals"
+    - "best-sellers"
