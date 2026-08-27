@@ -91,14 +91,22 @@ collection, without writing anything.
 
 ## Notes
 
-The module docstring documents seven specific traps worth reading before you
+The module docstring documents eight specific traps worth reading before you
 build anything on top of this data — among them: Algolia's "conversion"
 metric is frequently add-to-cart, not purchase; engagement can't be
 attributed to a single collection when a product appears on several;
 analytics retention is short (measured in weeks, not years) and hard-capped
-server-side, with **no historical backfill possible**; and a search-hit's own
+server-side, with **no historical backfill possible**; a search-hit's own
 `objectID` may be a variant id that the search index itself cannot reliably
-resolve back to a product (resolve it via your own catalog data instead).
+resolve back to a product (resolve it via your own catalog data instead); and
+A/B testing can start splitting traffic across index variants at any time.
+
+On that last one: the placement grain calls `active_abtests()` on every run
+(needs `ALGOLIA_ANALYTICS_KEY`) and logs a `degraded` sync — not `ok` — the
+moment a live test is found, since a running test means the snapshot no
+longer describes what every shopper saw. It also logs `degraded` if the check
+itself can't run (no analytics key, or the API call fails), because "unknown"
+must never be recorded the same way as "confirmed clean."
 
 Both placement and the analytics grains are **accrue-forward only** — a
 sync that stops running for an extended stretch loses that window
