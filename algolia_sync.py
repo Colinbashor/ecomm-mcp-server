@@ -120,13 +120,29 @@ about it.
     search volume per index it's told about; check that before assuming a
     plausible-looking index name is the right one.
 
+(8) A/B TESTING SPLITS TRAFFIC ACROSS INDEX VARIANTS, AND IT CAN START AT ANY
+    TIME. If your account has A/B testing enabled but genuinely no test
+    running, the default-sort placement really is what every shopper saw —
+    but that's a fact with a shelf life, not a permanent guarantee. The
+    moment a test starts, half the traffic sees a different index and every
+    placement row silently becomes a half-truth. `active_abtests()`
+    re-checks the account's live A/B tests on every run, and the placement
+    grain logs a `degraded` sync (not `ok`) the moment one is found, rather
+    than leaving that discovery for a confusing downstream chart months
+    later. It returns `None` — deliberately distinct from an empty list —
+    when the check itself can't run (no analytics key, or the call errors),
+    so "could not tell" is never recorded as "clean".
+
 WHAT THIS IS NOT. This connector captures the DECLARED default-sort
-placement. A shopper who applies a filter, picks a different sort, or is
-served a personalized or A/B-tested variant sees a different order than what
-gets recorded here. Whether your storefront runs personalization or A/B
-testing on this grid is something you need to confirm independently — nothing
-observed by this connector proves either way. Treat placement as a baseline,
-not per-session truth.
+placement. A shopper who applies a filter or picks a different sort sees a
+different order than what gets recorded here — that's expected, and this
+connector doesn't try to detect it. A/B testing IS actively checked (trap 8),
+but personalization generally is NOT: a personalization/recommendation
+endpoint often requires its own separate access grant and can 401 for an
+ordinary analytics key even when personalization is off, so about the best
+you can usually do is check whether your index settings show a
+personalization flag enabled — its absence is suggestive, not proof. Treat
+placement as a baseline, not per-session truth.
 
 CREDENTIALS. The Algolia app id and a SEARCH-only API key are commonly public
 by design on Algolia-backed storefronts — the storefront ships them to every
@@ -447,6 +463,37 @@ def fetch_collection(handle: str) -> list[dict]:
         if page >= n_pages or not batch:
             break
     return hits
+
+
+def active_abtests() -> list[str] | None:
+    """Names of A/B tests currently splitting traffic on this account.
+
+    Exists because "no test running" is a fact with a shelf life, not a
+    permanent guarantee (see trap (8) in the module docstring) — the day
+    someone starts a test, half the traffic sees a different index and every
+    placement row silently becomes a half-truth. Cheaper to catch on the next
+    run than to notice months later as an unexplained anomaly in a chart.
+
+    Returns [] when no test is currently live, a list of human-readable
+    labels when one or more are, and None when the check itself couldn't run
+    (no analytics key, or the call failed) — None is deliberately distinct
+    from [] so "unknown" can never be mistaken for "clean".
+    """
+    if not ANALYTICS_KEY:
+        return None
+    try:
+        res = _request(f"https://{ANALYTICS_HOST}/2/abtests?limit=50", ANALYTICS_KEY,
+                       label="analytics /2/abtests")
+    except (AlgoliaError, AlgoliaTransient):
+        return None
+    live = []
+    for test in (res.get("abtests") or []):
+        # Anything not explicitly finished is capable of splitting traffic.
+        if str(test.get("status", "")).lower() in {"stopped", "expired", "failed"}:
+            continue
+        live.append(f"{test.get('name') or '?'} (id {test.get('abTestId')}, "
+                    f"status {test.get('status')})")
+    return live
 
 
 def store_placement(conn: sqlite3.Connection, handles: list[str], stamp: str) -> tuple[int, list[str]]:
@@ -834,13 +881,25 @@ def main() -> None:
                 result = fn()
                 if label == "placement":
                     rows, failed_handles = result
+                    notes = []
                     if failed_handles:
                         # A partial snapshot is NOT ok -- a run that quietly
                         # drops a collection reads as "that grid was empty".
-                        warehouse_db.log_sync(
-                            platform, started, rows, "degraded",
-                            f"{len(failed_handles)} collection(s) failed: "
-                            f"{','.join(failed_handles)}")
+                        notes.append(f"{len(failed_handles)} collection(s) failed: "
+                                     f"{','.join(failed_handles)}")
+                    live_tests = active_abtests()
+                    if live_tests:
+                        # Traffic is split across index variants, so this
+                        # snapshot no longer describes what every shopper saw.
+                        notes.append("A/B TEST RUNNING, placement is only one "
+                                     f"variant: {'; '.join(live_tests)}")
+                        print(f"    !! {notes[-1]}", flush=True)
+                    elif live_tests is None:
+                        notes.append("A/B test state UNKNOWN (could not query "
+                                     "/2/abtests)")
+                    if notes:
+                        warehouse_db.log_sync(platform, started, rows,
+                                              "degraded", " | ".join(notes))
                         failures += 1
                         continue
                 else:

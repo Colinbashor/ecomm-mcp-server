@@ -299,6 +299,45 @@ class SearchesPagingTests(unittest.TestCase):
         self.assertEqual(got[0], 1400170)
 
 
+class ABTestGuardTests(unittest.TestCase):
+    """A/B testing can split traffic across index variants at any time (trap
+    (8)) -- the day one starts, the placement snapshot silently stops
+    describing what every shopper saw. `active_abtests()` is the check that
+    catches it."""
+
+    def test_no_tests_reads_as_clean(self):
+        with mock.patch.object(alg, "ANALYTICS_KEY", "test-key"), \
+             mock.patch.object(alg, "_request", return_value={"count": 0, "total": 0,
+                                                              "abtests": None}):
+            self.assertEqual(alg.active_abtests(), [])
+
+    def test_running_test_is_surfaced(self):
+        payload = {"abtests": [{"abTestId": 7, "name": "grid order", "status": "active"}]}
+        with mock.patch.object(alg, "ANALYTICS_KEY", "test-key"), \
+             mock.patch.object(alg, "_request", return_value=payload):
+            live = alg.active_abtests()
+        self.assertEqual(len(live), 1)
+        self.assertIn("grid order", live[0])
+
+    def test_finished_tests_are_ignored(self):
+        payload = {"abtests": [
+            {"abTestId": 1, "name": "old", "status": "stopped"},
+            {"abTestId": 2, "name": "gone", "status": "expired"},
+        ]}
+        with mock.patch.object(alg, "ANALYTICS_KEY", "test-key"), \
+             mock.patch.object(alg, "_request", return_value=payload):
+            self.assertEqual(alg.active_abtests(), [])
+
+    def test_unknown_is_none_not_empty(self):
+        """'could not tell' must never be indistinguishable from 'clean' --
+        that is how an unnoticed confounder becomes a published number."""
+        with mock.patch.object(alg, "ANALYTICS_KEY", "test-key"), \
+             mock.patch.object(alg, "_request", side_effect=alg.AlgoliaError("x")):
+            self.assertIsNone(alg.active_abtests())
+        with mock.patch.object(alg, "ANALYTICS_KEY", ""):
+            self.assertIsNone(alg.active_abtests())
+
+
 class RequireEnvTests(unittest.TestCase):
     def test_missing_vars_raise_systemexit(self):
         saved = {k: os.environ.pop(k, None) for k in alg.REQUIRED_ENV}
