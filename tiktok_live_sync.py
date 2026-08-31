@@ -182,9 +182,11 @@ def _sign(path: str, params: dict, secret: str) -> str:
 
 def _request(path: str, params: dict, max_attempts: int = 6) -> dict:
     """One signed GET. Refreshes an expired access token once and rides out
-    transient connection resets / rate limits with exponential backoff -- a
-    burst of rapid per-product calls (the live-products detail fetch) trips
-    TikTok's connection shedding far more readily than a single call does."""
+    transient connection resets / rate limits / 5xx errors with exponential
+    backoff -- a burst of rapid per-product calls (the live-products detail
+    fetch) trips TikTok's connection shedding far more readily than a single
+    call does, and the per-product detail endpoint occasionally returns a
+    bare 500 with no error code of its own."""
     secret = os.environ["TIKTOK_APP_SECRET"]
     refreshed = False
     code = None
@@ -208,8 +210,8 @@ def _request(path: str, params: dict, max_attempts: int = 6) -> dict:
             _refresh_access_token()
             refreshed = True
             continue
-        if code in (105050, 105051, 429000) or r.status_code == 429:  # rate limited
-            time.sleep(2 ** attempt)
+        if code in (105050, 105051, 429000) or r.status_code == 429 or r.status_code >= 500:
+            time.sleep(2 ** attempt)  # rate limited, or a transient server-side error
             continue
         if code != 0:
             raise RuntimeError(f"TikTok {path} {r.status_code} code={code}: {data.get('message')}")
@@ -422,39 +424,55 @@ def own_live_days(conn, start: str, end: str) -> list[str]:
 
 
 def sync_live_products(days: list[str]) -> int:
+    """Pull + write one day at a time. Each day is committed to the database as
+    soon as its product scan finishes, so a later day (or a single product
+    within a day) failing after retries can't roll back days that already
+    succeeded -- an earlier version buffered every day's rows in memory and
+    wrote them all at the very end, so one flaky call from the platform
+    discarded the whole window's work."""
     stamp = db.now()
-    rows: list[dict] = []
-    for day in days:
-        nxt = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
-        sellers = _day_sellers(day, nxt)
-        kept = 0
-        for pid in sellers:
-            row = _live_row(pid, day, nxt)
-            if row:
-                row["synced_at"] = stamp
-                rows.append(row)
-                kept += 1
-            time.sleep(0.05)  # pace per-product calls; a tight burst gets connection-reset
-        print(f"  {day}: {len(sellers)} sellers scanned, {kept} with LIVE activity")
-
     conn = db.connect()
     with conn:
         ensure_schema(conn)
+
+    total = 0
+    try:
         for day in days:
-            conn.execute("DELETE FROM tiktok_shop_live_products WHERE date = ?", (day,))
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO tiktok_shop_live_products
-              (product_id, date, live_impressions, live_clicks, live_units,
-               live_gmv, currency, live_avg_visitors, synced_at)
-            VALUES
-              (:product_id, :date, :live_impressions, :live_clicks, :live_units,
-               :live_gmv, :currency, :live_avg_visitors, :synced_at)
-            """,
-            rows,
-        )
-    conn.close()
-    return len(rows)
+            nxt = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+            sellers = _day_sellers(day, nxt)
+            day_rows: list[dict] = []
+            skipped = 0
+            for pid in sellers:
+                try:
+                    row = _live_row(pid, day, nxt)
+                except RuntimeError as e:
+                    skipped += 1
+                    print(f"    {day}: skipping product {pid} after retries exhausted: {e}")
+                    continue
+                if row:
+                    row["synced_at"] = stamp
+                    day_rows.append(row)
+                time.sleep(0.05)  # pace per-product calls; a tight burst gets connection-reset
+
+            with conn:
+                conn.execute("DELETE FROM tiktok_shop_live_products WHERE date = ?", (day,))
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO tiktok_shop_live_products
+                      (product_id, date, live_impressions, live_clicks, live_units,
+                       live_gmv, currency, live_avg_visitors, synced_at)
+                    VALUES
+                      (:product_id, :date, :live_impressions, :live_clicks, :live_units,
+                       :live_gmv, :currency, :live_avg_visitors, :synced_at)
+                    """,
+                    day_rows,
+                )
+            total += len(day_rows)
+            note = f", skipped {skipped} after retries exhausted" if skipped else ""
+            print(f"  {day}: {len(sellers)} sellers scanned, {len(day_rows)} with LIVE activity{note}")
+    finally:
+        conn.close()
+    return total
 
 
 def reconcile(days: list[str]) -> None:

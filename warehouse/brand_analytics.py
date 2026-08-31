@@ -241,3 +241,151 @@ def run_ba_report(report_type: str, week_sunday: date,
         if status == "FATAL":
             raise BAReportFatal(f"{report_type} FATAL: {payload}")
     raise TimeoutError(f"{report_type} did not finish within {timeout_min} min")
+
+
+# ---- streaming download ----------------------------------------------------
+# Some BA reports (Top Search Terms in particular) are market-wide rather than
+# scoped to your own catalog, and can run to millions of records over a wide
+# window. `fetch_ba_records` calls `json.loads()` on the whole document, which
+# materializes the entire thing as Python dicts at once -- fine for a
+# few-thousand-row report, but a caller processing one of the large
+# market-wide reports should walk the gzip stream and decode one record at a
+# time instead, so memory stays flat regardless of how big the document is.
+
+class _ChunkReader(io.RawIOBase):
+    """Adapt a requests iter_content() generator to a readable binary stream."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self._buf = b""
+
+    def readable(self) -> bool:  # noqa: D102
+        return True
+
+    def readinto(self, dest) -> int:  # noqa: D102
+        while not self._buf:
+            try:
+                self._buf = next(self._chunks)
+            except StopIteration:
+                return 0
+        n = min(len(dest), len(self._buf))
+        dest[:n] = self._buf[:n]
+        self._buf = self._buf[n:]
+        return n
+
+
+def _iter_json_array_objects(text_fh, chunk_chars: int = 1 << 20):
+    """Yield objects from the first TOP-LEVEL array-of-objects in a JSON stream.
+
+    'Top-level' is load-bearing: a BA document is
+    {"reportSpecification": {... "marketplaceIds": [...]}, "dataBy...": [...]}
+    so the first '[' in the raw text belongs to marketplaceIds, at depth 2. We
+    track nesting (string- and escape-aware) and take the first '[' seen while
+    depth == 1, which is always the data array.
+    """
+    dec = json.JSONDecoder()
+    buf = ""
+    pos = 0
+    # --- phase 1: locate the data array -----------------------------------
+    depth = 0
+    in_str = False
+    esc = False
+    found = False
+    while not found:
+        while pos < len(buf):
+            ch = buf[pos]
+            pos += 1
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == "[":
+                if depth == 1:
+                    found = True
+                    break
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+        if found:
+            break
+        more = text_fh.read(chunk_chars)
+        if not more:
+            return
+        buf = buf[pos:]
+        pos = 0
+        buf += more
+
+    # --- phase 2: decode elements one at a time ---------------------------
+    # `pos` is an index rather than repeated buf slicing: slicing a 1 MB buffer
+    # once per record would copy terabytes over a multi-million-record document.
+    while True:
+        while pos < len(buf) and buf[pos] in " \t\r\n,":
+            pos += 1
+        if pos < len(buf) and buf[pos] == "]":
+            return
+        if pos < len(buf):
+            try:
+                obj, end = dec.raw_decode(buf, pos)
+            except ValueError:
+                pass  # truncated record -- need more input
+            else:
+                yield obj
+                pos = end
+                if pos > (1 << 20):
+                    buf = buf[pos:]
+                    pos = 0
+                continue
+        more = text_fh.read(chunk_chars)
+        if not more:
+            return
+        buf = buf[pos:]
+        pos = 0
+        buf += more
+
+
+def stream_ba_records(doc_id: str):
+    """Yield a finished report document's records one at a time (flat memory)."""
+    host = _host()
+    headers = {"x-amz-access-token": _access_token()}
+    doc = requests.get(f"{host}/reports/2021-06-30/documents/{doc_id}",
+                       headers=headers, timeout=60).json()
+    r = requests.get(doc["url"], timeout=300, stream=True)
+    r.raise_for_status()
+    binary = io.BufferedReader(_ChunkReader(r.iter_content(1 << 16)))
+    # Trust the magic bytes over the metadata: requests transparently inflates a
+    # Content-Encoding: gzip body, in which case compressionAlgorithm still says
+    # GZIP but the stream is already plain text.
+    if binary.peek(2)[:2] == b"\x1f\x8b":
+        binary = gzip.GzipFile(fileobj=binary)
+    yield from _iter_json_array_objects(io.TextIOWrapper(binary, encoding="utf-8"))
+
+
+def await_ba_report(report_id: str, timeout_min: int = DEFAULT_TIMEOUT_MIN) -> str:
+    """Poll one already-created report to terminal and return its document id.
+
+    Pairs with `create_ba_report` + `stream_ba_records` for a caller that wants
+    the phased create/poll/stream split but only ever has one report in flight
+    (e.g. a single large market-wide report), rather than the many-reports-at-once
+    use case `check_ba_report` is designed for.
+    """
+    deadline = time.time() + timeout_min * 60
+    while time.time() < deadline:
+        time.sleep(POLL_EVERY_SEC)
+        status, payload = check_ba_report(report_id)
+        if status == "DONE":
+            return payload
+        if status == "CANCELLED":
+            raise BAReportCancelled(f"{report_id} CANCELLED (no data for this window)")
+        if status == "FATAL":
+            raise BAReportFatal(f"{report_id} FATAL: {payload}")
+    raise TimeoutError(f"{report_id} did not finish within {timeout_min} min")

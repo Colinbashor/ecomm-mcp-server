@@ -27,10 +27,11 @@ google-auth
 # other script here work without it.
 openpyxl
 
-# Only needed for amazon_ba_sync.py's OPTIONAL brand_watchlist.yaml feature
-# (flagging search terms that contain your own/competitor brand names). The
-# import is wrapped in a try/except, so amazon_ba_sync.py still runs its core
-# reports without this installed — it just skips that one feature.
+# Required by algolia_sync.py and amazon_search_terms_monthly.py (YAML
+# config files). Optional for amazon_ba_sync.py's brand_watchlist.yaml
+# feature specifically — that one import is wrapped in a try/except, so
+# amazon_ba_sync.py still runs its core reports without this installed, it
+# just skips that one feature.
 PyYAML
 
 # Needed by klaviyo_sync.py and tiktok_live_sync.py, which use the stdlib

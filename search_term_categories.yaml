@@ -1,0 +1,75 @@
+# Config for amazon_search_terms_monthly.py.
+#
+# The Brand Analytics Top Search Terms report carries NO category dimension
+# (Amazon's `departmentName` field is always the literal string "Amazon.com").
+# Category must instead be DERIVED from the browse-node classification of
+# each term's top-3 clicked ASINs (via the Catalog Items API). This file
+# defines the category buckets you care about as regex patterns matched
+# against those browse-node titles.
+#
+# BROAD BUCKETS BEAT NARROW BROWSE NODES. Your own catalog usually maps to
+# only a handful of Amazon's many thousands of browse nodes, and the head of
+# the marketplace-wide search-term list is dominated by whatever is popular
+# across the WHOLE marketplace, not specifically your niche. Tracking exact
+# narrow nodes tends to fill slowly, or not at all, because each node
+# competes separately for its own quota against an overwhelming amount of
+# unrelated traffic. Rolling several related narrow nodes into one broad
+# bucket — e.g. treating "Casual Dresses", "Cocktail Dresses", and "Club &
+# Night Out Dresses" all as one "Dresses" bucket — lifts the fill rate
+# substantially, because the bucket now accepts a hit from any of them
+# instead of each node needing its own quota filled independently.
+#
+# Order matters: the FIRST matching bucket wins (top to bottom), so put more
+# specific patterns before more general ones that would otherwise swallow
+# them — e.g. a "Costumes" bucket should come before "Dresses" if you don't
+# want "Women's Costume Bodysuits" to be counted as a dress.
+#
+# This file is required — amazon_search_terms_monthly.py refuses to run with
+# no buckets configured. The buckets below are placeholders for a generic
+# apparel catalog; replace them with your own categories and browse-node
+# patterns (regex, case-insensitive, matched against the ASIN's most-specific
+# Catalog Items classification title).
+
+buckets:
+  Dresses:
+    - "Dress"
+  Tops:
+    - "Shirt"
+    - "Blouse"
+    - "\\bTop\\b"
+  Bottoms:
+    - "Pant"
+    - "Skirt"
+    - "Short"
+  Outerwear:
+    - "Jacket"
+    - "Coat"
+  Footwear:
+    - "Shoe"
+    - "Boot"
+    - "Sandal"
+  Accessories:
+    - "Handbag"
+    - "Jewelry"
+    - "Belt"
+
+# Browse-node titles to always exclude, even if they would otherwise match a
+# bucket pattern above (e.g. a node whose title happens to contain a matching
+# word but is unrelated to your catalog). Optional — leave empty if unneeded.
+exclude_nodes: []
+
+# How many top terms to collect per category before considering it "full".
+terms_per_category: 200
+
+# Only terms at or above this marketplace-wide search-frequency rank
+# (1 = most searched) are even considered as candidates. This bounds both
+# memory (the raw report can run to millions of records) and how deep the
+# scan is willing to go looking for category matches. Loosen this (a larger
+# number) if a category consistently under-fills.
+scan_rank_ceiling: 250000
+
+# Hard cap on new Catalog Items ASIN-category lookups per run. Resolved
+# ASINs are cached forever (see the amazon_asin_category table), so this
+# budget is mostly spent on the first month for a given bucket configuration
+# and stays cheap afterward.
+max_asin_lookups: 60000
