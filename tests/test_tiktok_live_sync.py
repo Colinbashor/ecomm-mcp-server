@@ -105,6 +105,24 @@ class FetchLivesTests(unittest.TestCase):
         self.assertEqual([r["live_id"] for r in rows], ["a", "b"])
 
 
+class RequestRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = patch.dict(os.environ, {
+            "TIKTOK_APP_KEY": "key", "TIKTOK_APP_SECRET": "secret",
+            "TIKTOK_ACCESS_TOKEN": "tok", "TIKTOK_SHOP_CIPHER": "cipher",
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_retries_on_5xx_then_succeeds(self) -> None:
+        with patch.object(tl.time, "sleep"), patch.object(
+            tl.requests, "get", side_effect=[_resp(status=500), _resp(data={"ok": True})]
+        ) as mock_get:
+            data = tl._request("/some/path", {"app_key": "k"})
+        self.assertEqual(data["data"], {"ok": True})
+        self.assertEqual(mock_get.call_count, 2)
+
+
 class DaySellersAndLiveRowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.env = patch.dict(os.environ, {
@@ -224,6 +242,32 @@ class SyncWriteTests(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(row, ("p1", 15.0))
+
+    def test_sync_live_products_skips_a_failed_product_but_keeps_the_rest(self) -> None:
+        """One product's detail call fails permanently (not a retryable code) --
+        the day's write should still land the other product's row instead of
+        losing the whole day, and the run should return that partial count
+        rather than raising."""
+        sellers_page = _resp(data={"products": [
+            {"id": "p1", "overall_performance": {"gmv": {"amount": "10"}}},
+            {"id": "p2", "overall_performance": {"gmv": {"amount": "5"}}},
+        ], "next_page_token": ""})
+        p1_error = _resp(code=88888, message="boom", status=400)
+        p2_detail = _resp(data={"performance": {"intervals": [{
+            "impression_breakdowns": [{"type": "LIVE", "amount": 8}],
+            "page_view_breakdowns": [{"type": "LIVE", "amount": 1}],
+            "unit_sold_breakdowns": [{"type": "LIVE", "amount": 1}],
+            "gmv_breakdowns": [{"type": "LIVE", "amount": 9, "currency": "USD"}],
+        }]}})
+        with patch.object(tl.requests, "get", side_effect=[sellers_page, p1_error, p2_detail]):
+            n = tl.sync_live_products(["2026-01-05"])
+        self.assertEqual(n, 1)
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT product_id FROM tiktok_shop_live_products WHERE date = ?", ("2026-01-05",)
+        ).fetchall()
+        conn.close()
+        self.assertEqual(rows, [("p2",)])
 
 
 if __name__ == "__main__":

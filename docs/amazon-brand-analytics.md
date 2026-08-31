@@ -54,6 +54,53 @@ clock budget so a scheduled run can't be blocked indefinitely).
 - `amazon_ba_market_basket` — frequently co-purchased products
 - `amazon_ba_repeat_purchase` — repeat purchase behavior
 
+## Top search terms by category (monthly)
+
+`amazon_search_terms_monthly.py` (standalone) answers a different question
+than the Top Search Terms grain above: "what are the top N search terms each
+month in the categories I sell in" — grouped by category, not filtered down
+to terms that happen to touch your own catalog.
+
+The SP-API Search Terms report carries **no category dimension** at all
+(`departmentName` is always the literal string `"Amazon.com"`), so category
+is derived from the Catalog Items browse-node classification of each term's
+top-3 clicked ASINs, then rolled up into broad buckets you define — see
+`search_term_categories.yaml` in the project root for the config format and
+a placeholder example, and the module docstring for why broad buckets beat
+narrow browse nodes.
+
+```bash
+python amazon_search_terms_monthly.py --probe                              # readiness check, no API calls
+python amazon_search_terms_monthly.py --asins-file asins.txt --last-month
+python amazon_search_terms_monthly.py --asins-file asins.txt --month 2026-07
+python amazon_search_terms_monthly.py --asins-file asins.txt --backfill     # walk back to the retention floor
+```
+
+**Table:** `amazon_search_term_monthly` (month × category × search_term),
+plus `amazon_asin_category` (a permanent ASIN → browse-node cache) and
+`amazon_search_term_coverage` (what a given month's scan actually asked for
+— read this before trusting an empty or short category; see the module
+docstring's "coverage over presence" rule).
+
+**Test:** `tests/test_amazon_search_terms_monthly.py`
+
+## Building on top of `warehouse/brand_analytics.py`
+
+The shared runner exposes two ways to consume a report's records:
+
+- `fetch_ba_records(doc_id)` — downloads and `json.loads()`s the whole
+  document. Fine for the reports above, which top out in the low thousands of
+  rows.
+- `stream_ba_records(doc_id)` — walks the gzip response stream and yields one
+  record at a time, so memory stays flat no matter how large the document is.
+  Some Brand Analytics reports (Top Search Terms in particular) are
+  market-wide rather than scoped to your own catalog and can run to millions
+  of records over a wide window — a plain `json.loads()` on one of those
+  materializes the entire thing as Python dicts at once. If you're building a
+  connector on a report you expect to be that large, use `stream_ba_records`
+  (paired with `create_ba_report` + `await_ba_report` for the phased
+  create/poll/stream split) instead of `run_ba_report`/`fetch_ba_records`.
+
 ## Notes
 
 **Unit trap across these two tables**: `amazon_sqp` stores shares

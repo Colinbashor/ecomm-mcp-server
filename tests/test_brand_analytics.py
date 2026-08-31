@@ -3,11 +3,15 @@
 Covers: the Sun-Sat week validator/window builder, the FATAL-reason-from-
 document lookup, the create/poll/download phases (create's 429 retry,
 check_ba_report's PENDING/DONE/CANCELLED/FATAL mapping, fetch_ba_records'
-records_key handling), and run_ba_report's terminal-state dispatch
-(DONE/CANCELLED/FATAL/timeout).
+records_key handling), run_ba_report's terminal-state dispatch
+(DONE/CANCELLED/FATAL/timeout), the flat-memory streaming JSON reader
+(top-level-array detection, chunk-boundary splitting, gzip vs. plain-text
+bodies), and await_ba_report's terminal-state dispatch.
 """
 from __future__ import annotations
 
+import gzip
+import io
 import os
 import unittest
 from datetime import date
@@ -203,6 +207,115 @@ class RunBaReportTests(unittest.TestCase):
              patch.object(ba.time, "time", side_effect=[0.0, 100.0]):
             with self.assertRaises(TimeoutError):
                 ba.run_ba_report("SOME_REPORT", date(2026, 7, 19), timeout_min=1)
+
+
+class IterJsonArrayObjectsTests(unittest.TestCase):
+    def test_skips_a_nested_array_and_yields_the_top_level_one(self) -> None:
+        # marketplaceIds is a nested array at depth 2 -- the parser must not
+        # mistake its '[' for the top-level data array's.
+        doc = io.StringIO(
+            '{"reportSpecification": {"marketplaceIds": ["A", "B"]}, '
+            '"dataByAsin": [{"asin": "X"}, {"asin": "Y"}]}'
+        )
+        self.assertEqual(list(ba._iter_json_array_objects(doc)), [{"asin": "X"}, {"asin": "Y"}])
+
+    def test_handles_records_split_across_read_chunks(self) -> None:
+        doc = io.StringIO('{"data": [{"a": 1}, {"a": 2}, {"a": 3}]}')
+        # A tiny chunk size forces many partial reads mid-record.
+        self.assertEqual(
+            list(ba._iter_json_array_objects(doc, chunk_chars=5)),
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+        )
+
+    def test_empty_array_yields_nothing(self) -> None:
+        doc = io.StringIO('{"data": []}')
+        self.assertEqual(list(ba._iter_json_array_objects(doc)), [])
+
+    def test_no_array_at_all_yields_nothing(self) -> None:
+        doc = io.StringIO('{"reportSpecification": {"marketplaceIds": ["A"]}}')
+        self.assertEqual(list(ba._iter_json_array_objects(doc)), [])
+
+
+class StreamBaRecordsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._token_patch = patch.object(ba, "_access_token", return_value="tok")
+        self._token_patch.start()
+        self.addCleanup(self._token_patch.stop)
+
+    def test_streams_a_plain_text_document(self) -> None:
+        body = b'{"data": [{"asin": "X"}, {"asin": "Y"}]}'
+
+        class _StreamResp:
+            status_code = 200
+
+            def json(self):
+                return {"url": "https://example.com/doc.json"}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, chunk_size):
+                yield body
+
+        with patch.object(ba, "_host", return_value="https://host"), \
+             patch.object(ba, "requests") as fake_requests:
+            fake_requests.get.side_effect = [_StreamResp(), _StreamResp()]
+            records = list(ba.stream_ba_records("doc1"))
+        self.assertEqual(records, [{"asin": "X"}, {"asin": "Y"}])
+
+    def test_streams_a_gzip_compressed_document(self) -> None:
+        raw = b'{"data": [{"asin": "Z"}]}'
+        compressed = gzip.compress(raw)
+
+        class _MetaResp:
+            def json(self):
+                return {"url": "https://example.com/doc.json.gz"}
+
+        class _StreamResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, chunk_size):
+                # Split the gzip payload across two chunks to exercise the
+                # buffered-reader chunk boundary.
+                yield compressed[:len(compressed) // 2]
+                yield compressed[len(compressed) // 2:]
+
+        with patch.object(ba, "_host", return_value="https://host"), \
+             patch.object(ba, "requests") as fake_requests:
+            fake_requests.get.side_effect = [_MetaResp(), _StreamResp()]
+            records = list(ba.stream_ba_records("doc1"))
+        self.assertEqual(records, [{"asin": "Z"}])
+
+
+class AwaitBaReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sleep_patch = patch.object(ba.time, "sleep")
+        self.sleep_patch.start()
+        self.addCleanup(self.sleep_patch.stop)
+
+    def test_done_returns_document_id(self) -> None:
+        with patch.object(ba, "check_ba_report", return_value=("DONE", "doc1")):
+            self.assertEqual(ba.await_ba_report("r1"), "doc1")
+
+    def test_cancelled_raises(self) -> None:
+        with patch.object(ba, "check_ba_report", return_value=("CANCELLED", None)):
+            with self.assertRaises(ba.BAReportCancelled):
+                ba.await_ba_report("r1")
+
+    def test_fatal_raises_with_reason(self) -> None:
+        with patch.object(ba, "check_ba_report", return_value=("FATAL", "boom")):
+            with self.assertRaises(ba.BAReportFatal) as cm:
+                ba.await_ba_report("r1")
+        self.assertIn("boom", str(cm.exception))
+
+    def test_pending_forever_times_out(self) -> None:
+        with patch.object(ba, "check_ba_report", return_value=("PENDING", None)), \
+             patch.object(ba.time, "time", side_effect=[0.0, 100.0]):
+            with self.assertRaises(TimeoutError):
+                ba.await_ba_report("r1", timeout_min=1)
 
 
 if __name__ == "__main__":
