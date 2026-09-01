@@ -58,6 +58,8 @@ python amazon_traffic_sync.py --repair               # re-pull only weeks record
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
+python voc_import.py --dir imports/voc               # import every *.csv in a folder
+python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot date
 ```
 
 ## Tables

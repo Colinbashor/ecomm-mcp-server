@@ -107,6 +107,21 @@ All `reacher_*`, created by this script (nothing added to shared
   it. Public profile fields (bio, categories) are kept for niche-fit triage.
 - Rate limits (3,000/hr and 60/min) are self-paced proactively rather than
   handled by retrying 429s reactively.
+- **The video feed has known defects.** Some `posted_date` values are Unix
+  epoch zero or future-dated placeholders (this connector nulls them rather
+  than storing a lie), and `/products/{id}/creators`'s `gmv` field is NULL on
+  every row observed — use `reacher_creator_product_weekly` (from
+  `/videos/leaderboard`) for real creator-x-product attribution instead.
+- **`tc_invites` counts invitation batches; `accepted_tc_count` and
+  `tc_invites_creator_count` count creators.** Pair `accepted_tc_count` with
+  the creator count, not `tc_invites` — and only trust the open-vs-Target-
+  Collab split at weekly/monthly grain, not per-day.
+- **`/creators/performance`'s `total_count` (and `reacher_metrics_daily`'s
+  `creators` metric) has been observed over-reporting** distinct creators on
+  older history — sometimes more in a single month than the account's entire
+  lifetime population. Spot-check before reporting; `reacher_creator_weekly`
+  (filtered to earners) has checked out reliably even when the raw count
+  looks inflated.
 
 ## Tests
 

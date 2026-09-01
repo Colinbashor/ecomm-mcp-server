@@ -50,7 +50,6 @@ python run_sync.py --only amazon          # core campaign metrics, last 7 days
 python amazon_ads_detail_sync.py          # ASIN/keyword/search-term detail, last 3 days
 python amazon_ads_detail_sync.py --days 30
 python amazon_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
-python amazon_ads_detail_sync.py --only search_terms   # just one grain
 ```
 
 `amazon_ads_detail_sync.py` defaults to a 3-day lookback (not the 7 days
@@ -61,6 +60,26 @@ explicit `--start`/`--end` window.
 
 - `ad_metrics` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
 - `amazon_ad_products`, `amazon_ad_targeting`, `amazon_ad_search_terms` (detail)
+
+## Notes
+
+`ad_metrics` covers Sponsored Products, Sponsored Brands, and Sponsored
+Display (`campaign_type` distinguishes them); `amazon_ads_detail_sync.py`'s
+three grains are Sponsored Products only — SB/SD use different report shapes
+at that level of detail. Amazon DSP is not covered by either script — it uses
+a different reporting surface and entity permissions, not the v3
+`/reporting/reports` endpoint.
+
+The detail grains follow the v3 reporting API's retention, which is much
+shorter than the campaign-level history in `ad_metrics` — expect roughly the
+trailing ~95 days to be available, not deep history.
+
+Report generation is asynchronous and can take 30-45+ minutes when Amazon's
+queue is congested; both scripts wait up to `AMAZON_ADS_REPORT_TIMEOUT_MIN`
+(default 60) before giving up. One ad product (core) or report grain/window
+(detail) failing never kills the others — a run that landed some rows logs
+`degraded`, not `error`; only a run that wrote nothing at all is a hard
+failure.
 
 ## Tests
 

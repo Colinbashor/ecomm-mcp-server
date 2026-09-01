@@ -13,7 +13,10 @@ competitiveness, category best-sellers, and competitive visibility.
 2. You must **also** run a one-time `registerGcp` API call before anything
    works — there is no Merchant Center UI for this step; see the module
    docstring in `merchant_center_sync.py` for the exact call.
-3. Fill in `.env`:
+3. Grant the service account access to the merchant account: Merchant Center
+   → Settings → Account access → add the service account's email as a
+   Standard user (Admin isn't needed for day-to-day reporting).
+4. Fill in `.env`:
 
    | Variable | Notes |
    |---|---|
@@ -33,9 +36,9 @@ python merchant_center_sync.py --only bestsellers --brand "Your Brand" --brand "
 ```
 
 `--only` accepts `performance`, `status`, `pricing`, `bestsellers`,
-`visibility` — pass it once per family to select more than one. `--category`,
-`--country`, and `--brand` are also repeatable, and scope the best-sellers
-grain.
+`visibility` — pass it once per family to select more than one. `--category`
+and `--country` are also repeatable and scope both the best-sellers and
+visibility grains; `--brand` is repeatable and scopes best-sellers only.
 
 ## Tables
 
@@ -58,10 +61,13 @@ grain (`gmc_competitive_visibility`) — it doesn't update same-day.
 not your own sales data, and Google only exposes the current snapshot — there
 is no historical backfill for this grain regardless of `--backfill`.
 
-`gmc_product_performance`/`gmc_account_performance`'s `conversion_value`
-splits across currencies with no FX conversion applied — summing it across
-a multi-currency account mixes units. Check the currency column before
-aggregating.
+`gmc_product_performance`/`gmc_account_performance` deliberately carry
+clicks/impressions/conversions only, no revenue column — see the module
+docstring's `conversion_value` trap: selecting a money-valued conversion
+field from this API implicitly segments results by currency, silently
+splitting one logical (date, product) row into several with the
+non-selected currency's numbers reading as zero. Get conversion *value* from
+whichever ads-platform connector already reports attributed revenue instead.
 
 A long `--backfill` run can pause partway (rate-limited or interrupted) and
 resumes where it left off on re-run rather than restarting — it exits with

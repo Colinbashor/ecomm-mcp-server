@@ -46,7 +46,7 @@ python run_sync.py --only google         # core campaign metrics, last 7 days
 python google_ads_detail_sync.py          # search terms, keywords, product demand; default 3-day lookback
 python google_ads_detail_sync.py --days 30
 python google_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
-python google_ads_detail_sync.py --only pmax_search_themes --start 2026-01-01 --end 2026-01-31
+python google_ads_detail_sync.py --only google_pmax_search_themes --start 2026-01-01 --end 2026-01-31
 python google_ads_structure_sync.py       # current-state config snapshot, as of today
 python google_ads_structure_sync.py --date 2026-01-15   # or --only campaigns,asset_groups
 ```

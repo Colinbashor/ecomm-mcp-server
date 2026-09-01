@@ -73,18 +73,29 @@ module docstring before assuming every run behaves the same way.
 
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction. It chunks
-requests by a fixed window length (`CHUNK_DAYS`) and disambiguates a
-"date range too wide" error from a genuine retention-window error (TikTok
-returns similar-looking codes for both) rather than surfacing a confusing
-raw error. It also drops the most recent day or two of unsettled data via
-`latest_available_date`, so don't expect today's numbers to be final yet.
+requests by a fixed window length (`CHUNK_DAYS`) to stay under the
+"date range too wide" error, and treats that same business error code as a
+retention-window miss when it shows up mid-backfill — reporting and skipping
+the chunk rather than failing the whole run. It also drops the most recent
+day or two of unsettled data via `latest_available_date`, so don't expect
+today's numbers to be final yet.
 
-`tiktok_live_sync.py` has a two-endpoint design gotcha: the list endpoint
-ignores a `live_id` filter, so filtering to one broadcast happens client-side
-after fetching the list. `tiktok_shop_lives` is DATE-grain, not
-session-grain — a broadcast spanning midnight splits across two rows — and
-the script runs a reconciliation sanity-check against the funnel totals to
-catch pagination gaps.
+`tiktok_live_sync.py`'s per-product funnel needs two endpoints: the cheap
+"list today's top sellers" endpoint has no content-type breakdown and
+silently ignores a `live_id` filter, so it's only used to find which product
+ids sold anything that day (GMV-sorted, stopping at the first $0 product);
+the per-product detail endpoint is then called once per candidate id to get
+the actual LIVE/VIDEO/PRODUCT_CARD split. `tiktok_shop_live_products` is
+DATE-grain, not session-grain — the detail endpoint buckets by calendar day,
+so multiple same-day broadcasts collapse into one row and per-broadcast
+product performance can't be split back out of this feed alone. By default
+the products crawl only covers days your own account
+(`TIKTOK_LIVE_OWN_ACCOUNT_TYPE`) is recorded as having gone live in
+`tiktok_shop_lives`, not every day in the window — pass `--dates` to force
+specific days regardless. The script also runs a reconciliation sanity-check
+(`reconcile()`) comparing each day's summed per-product LIVE gmv against that
+day's session-level GMV, flagging ratios outside a 0.70–1.20 band rather than
+expecting an exact match.
 
 The per-product LIVE crawl in `sync_live_products` commits **one day at a
 time** as soon as that day's product scan finishes, and wraps each
