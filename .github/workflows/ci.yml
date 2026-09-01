@@ -1,0 +1,105 @@
+name: ci
+
+# The suite is hermetic — no network, no warehouse.db, ~6s — so it runs on
+# every push and PR rather than on a schedule.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  # For `audit`: a dependency CVE appears when it is published, not when you
+  # happen to push. Monday 08:00 UTC.
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  # Runs on THREE operating systems, unlike the upstream private repo which
+  # tests Windows only. That is the point of this repo: people clone it and run
+  # it on their own machine, and the most likely defect in a port from a
+  # Windows-only codebase is a path or newline assumption that only Linux or
+  # macOS would surface. GitHub Actions minutes are free for public repos, so
+  # the extra coverage costs nothing.
+  pytest:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false          # one platform failing must not hide the others
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.14"]
+        include:
+          # README promises "Python 3.11 or newer", so the floor is tested too.
+          # Only on ubuntu: this guards the language level, not the platform,
+          # and that is already covered above.
+          - os: ubuntu-latest
+            python: "3.11"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  # Secret scanning. This repo is published so that other people can point an
+  # agent at it and wire in their own API keys — which means the highest-value
+  # thing CI can do is make sure a credential never reaches a commit here, and
+  # that contributors get the same guard. gitleaks checks hundreds of patterns
+  # and scans HISTORY, not just the working tree.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history: a secret in an OLD commit still leaks
+
+      # Cheap belt-and-braces alongside gitleaks, which matches on CONTENT.
+      # This matches on PATH, so it catches a credential file whose contents
+      # happen to look unremarkable — an empty .env, a service-account JSON
+      # with placeholder values, a TLS private key.
+      - name: No credential files may be tracked
+        run: |
+          tracked=$(git ls-files | grep -E '(^|/)\.env$|\.pem$|\.key$|service-account.*\.json$|(^|/)certs/' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::credential-shaped files are tracked in git:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "no credential-shaped paths tracked"
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Free for public repos on personal accounts. If this repo ever moves
+          # under an ORGANISATION, GITLEAKS_LICENSE must be set or this starts
+          # failing.
+
+  # Dependency CVEs. NOT on pull_request, deliberately: a newly-published
+  # advisory in a transitive dependency would otherwise turn an unrelated PR
+  # red, which trains people to ignore the result.
+  audit:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install pip-audit
+      # Audits the pinned set, so a vulnerable pin is caught before anyone
+      # installs it.
+      - run: pip-audit --requirement requirements.txt --requirement requirements-dev.txt
