@@ -77,6 +77,22 @@ MIGRATIONS = {
 def init_db() -> None:
     """Create tables if they don't exist yet. Safe to run repeatedly."""
     conn = connect()
+    # WAL is load-bearing, not a tuning knob: the MCP server reads this file
+    # while a sync writes it, and in SQLite's default `delete` journal a reader
+    # and a writer block each other, so a query would stall behind the nightly
+    # sync. connect_readonly() deliberately sets no busy timeout because it
+    # assumes WAL -- without this line that assumption is simply false.
+    #
+    # Set OUTSIDE the `with conn:` block below: journal_mode cannot change
+    # inside a transaction. It is a persistent property of the database file,
+    # so this runs once and sticks; running it again is a cheap no-op.
+    mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    if mode.lower() != "wal":
+        # Network filesystems reject WAL and report the mode they kept rather
+        # than raising, which would otherwise be a silent, invisible downgrade.
+        print(f"WARNING: could not enable WAL (journal_mode={mode}); readers "
+              "and writers will block each other. Is the database on a network "
+              "share?")
     with conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         for table, col_defs in MIGRATIONS.items():
