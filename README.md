@@ -119,11 +119,24 @@ Over stdio, which is what Claude Desktop and most MCP clients expect:
 python server.py
 ```
 
-Over HTTP, to share one warehouse with several people:
+Over HTTP, on this machine only (the default):
 
 ```bash
-python server.py --http --port 8787 --allow-host <hostname>
+python server.py --http --port 8787
 ```
+
+Over HTTP, to share one warehouse with several people on your network:
+
+```bash
+python server.py --http --host 0.0.0.0 --port 8787 --allow-host <hostname>
+```
+
+**`--http` binds `127.0.0.1` unless you pass `--host`.** This server answers
+questions about your entire business, so reaching the network is a decision you
+make on purpose rather than a default you inherit by following a README on
+untrusted wifi. The server logs a warning when you widen it, and a second one if
+you widen it without TLS — the bearer token travels in a header, so on a
+cleartext bind anyone on the segment can read and replay it.
 
 In HTTP mode, set `WAREHOUSE_MCP_TOKEN` — clients must then send it as a bearer token.
 Host/Origin validation is on by default; `--allow-host` is repeatable, and the same list

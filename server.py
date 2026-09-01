@@ -7,10 +7,16 @@ read-only tools over your local SQLite warehouse so you can ask things like
 
 Two ways to run it:
   python server.py           # stdio — Claude Desktop launches this locally
-  python server.py --http    # HTTP on 0.0.0.0:8787 for coworkers on the
-                             # network (see SHARING.md). Requires
-                             # WAREHOUSE_MCP_TOKEN in .env and sends it in
-                             # the Authorization Bearer header.
+  python server.py --http    # HTTP on 127.0.0.1:8787 (this machine only)
+  python server.py --http --host 0.0.0.0
+                             # ...and expose it to the network for coworkers
+                             # (see SHARING.md). Requires WAREHOUSE_MCP_TOKEN
+                             # in .env, sent as an Authorization Bearer header.
+
+--http BINDS LOOPBACK BY DEFAULT, deliberately. This server answers questions
+about your whole business, and the bind address is the difference between "my
+laptop" and "every device on this coffee-shop wifi". Widening it is a decision
+the operator makes explicitly with --host, not a default they inherit.
 
 SDK PIN: this module uses the v1 SDK API (mcp.server.fastmcp.FastMCP), so
 requirements.txt pins `mcp[cli]>=1.29,<2`. SDK 2.0.0 (2026-07-28) renames
@@ -948,6 +954,22 @@ def build_server(
     return server
 
 
+def _is_loopback_bind(addr: str) -> bool:
+    """Is this bind address confined to the local machine?
+
+    0.0.0.0 / :: are the obvious wildcards, but an empty string means the same
+    thing to uvicorn, and an unparseable value is not something to guess about
+    — anything we cannot prove is loopback is treated as exposed, so the
+    warning fails loud rather than silent.
+    """
+    if not addr:
+        return False
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return addr.strip().lower() == "localhost"
+
+
 def replaced_transport_security() -> TransportSecuritySettings:
     """The SDK's Host/Origin check, explicitly REPLACED — not removed.
 
@@ -969,6 +991,11 @@ if __name__ == "__main__":
     p.add_argument("--http", action="store_true",
                    help="serve over HTTP for the team instead of stdio")
     p.add_argument("--port", type=int, default=8787)
+    p.add_argument(
+        "--host", default="127.0.0.1", metavar="ADDR",
+        help="address to bind in --http mode (default 127.0.0.1, this machine "
+             "only). Pass 0.0.0.0 to serve the network — see SHARING.md",
+    )
     p.add_argument(
         "--allow-legacy-token-path",
         action="store_true",
@@ -1024,7 +1051,7 @@ if __name__ == "__main__":
             cli_extras=args.allow_host,
         )
         srv = build_server(
-            host="0.0.0.0",
+            host=args.host,
             port=args.port,
             stateless_http=True,   # no per-client session state to lose
             transport_security=replaced_transport_security(),
@@ -1038,10 +1065,23 @@ if __name__ == "__main__":
         tls = os.path.exists(cert) and os.path.exists(key)
         ssl_args = {"ssl_certfile": cert, "ssl_keyfile": key} if tls else {}
         if tls:
-            print(f"Serving warehouse MCP on https://0.0.0.0:{args.port}/mcp (TLS)")
+            print(f"Serving warehouse MCP on https://{args.host}:{args.port}/mcp (TLS)")
         else:
-            print(f"Serving warehouse MCP on http://0.0.0.0:{args.port}/mcp"
+            print(f"Serving warehouse MCP on http://{args.host}:{args.port}/mcp"
                   " (no certs/ — run make_cert.py to enable https)")
+        # Binding beyond loopback is a real exposure decision; say so out loud.
+        # A cleartext bind is worse than it looks: the bearer token travels in
+        # a header, so anyone on the segment can read it and replay it.
+        if not _is_loopback_bind(args.host):
+            host_log.warning(
+                "Serving on %s - reachable from the network, not just this "
+                "machine. The Host/Origin guard and the bearer token are the "
+                "only things between a LAN peer and your warehouse.", args.host)
+            if not tls:
+                host_log.warning(
+                    "NO TLS: the bearer token crosses the network in cleartext "
+                    "and is replayable by anyone who sees it. Run make_cert.py, "
+                    "or put a tunnel/reverse proxy in front (see SHARING.md).")
         if args.allow_any_host:
             host_log.warning("Host/Origin validation DISABLED (--allow-any-host)")
         else:
@@ -1060,6 +1100,6 @@ if __name__ == "__main__":
             guard,
             allow_legacy_path=args.allow_legacy_token_path,
         )
-        uvicorn.run(app, host="0.0.0.0", port=args.port, **ssl_args)
+        uvicorn.run(app, host=args.host, port=args.port, **ssl_args)
     else:
         build_server().run()   # speaks MCP over stdio; Claude Desktop manages it
