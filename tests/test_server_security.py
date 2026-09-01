@@ -836,5 +836,61 @@ class RunSqlTimeoutTests(unittest.TestCase):
         self.assertIn("6", result)
 
 
+class BindAddressDefaultTests(unittest.TestCase):
+    """The bind address is a security decision, so it is pinned here.
+
+    This server answers questions about the whole business. Defaulting --http
+    to a wildcard bind means a user who follows the README on untrusted wifi
+    publishes it to the segment without ever choosing to. The default must be
+    loopback and widening it must be explicit.
+    """
+
+    def _parse(self, argv: list[str]):
+        import argparse
+        p = argparse.ArgumentParser()
+        p.add_argument("--http", action="store_true")
+        p.add_argument("--port", type=int, default=8787)
+        p.add_argument("--host", default="127.0.0.1")
+        return p.parse_args(argv)
+
+    def test_http_binds_loopback_unless_told_otherwise(self) -> None:
+        self.assertEqual(self._parse(["--http"]).host, "127.0.0.1")
+
+    def test_widening_the_bind_is_explicit(self) -> None:
+        self.assertEqual(self._parse(["--http", "--host", "0.0.0.0"]).host,
+                         "0.0.0.0")
+
+    def test_source_carries_no_hardcoded_wildcard_bind(self) -> None:
+        """Regression guard: the wildcard used to be baked into three call
+        sites, so a --host flag alone would not have changed the actual bind.
+
+        Matches on `host=<wildcard literal>` rather than on the text
+        0.0.0.0 anywhere, so documentation and --help may still name it.
+        """
+        import pathlib
+        import re as _re
+        src = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+        hardcoded = _re.findall(r"""host\s*=\s*['"](?:0\.0\.0\.0|::)['"]""", src)
+        self.assertEqual(hardcoded, [], f"wildcard bind hardcoded: {hardcoded}")
+
+    def test_loopback_addresses_are_recognised(self) -> None:
+        for addr in ("127.0.0.1", "127.5.5.5", "::1", "localhost", "LocalHost"):
+            with self.subTest(addr=addr):
+                self.assertTrue(server._is_loopback_bind(addr))
+
+    def test_exposed_addresses_are_recognised(self) -> None:
+        for addr in ("0.0.0.0", "::", "10.0.0.42", "192.168.1.9"):
+            with self.subTest(addr=addr):
+                self.assertFalse(server._is_loopback_bind(addr))
+
+    def test_unprovable_bind_is_treated_as_exposed(self) -> None:
+        """An empty string binds every interface in uvicorn, and an
+        unparseable value is not something to guess about — both must warn
+        rather than stay quiet."""
+        for addr in ("", "   ", "garbage", "not-an-address"):
+            with self.subTest(addr=addr):
+                self.assertFalse(server._is_loopback_bind(addr))
+
+
 if __name__ == "__main__":
     unittest.main()

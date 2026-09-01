@@ -16,19 +16,29 @@ Anthropic's.
 ## 1. Start the server in HTTP mode
 
 ```bash
-python server.py --http --port 8787
+python server.py --http --host 0.0.0.0 --port 8787
 ```
 
 This requires `WAREHOUSE_MCP_TOKEN` in `.env` (any long random string —
 `python -c "import secrets; print(secrets.token_urlsafe(32))"` works). Every
 request must send it as `Authorization: Bearer <token>`.
 
-By default this binds `0.0.0.0:8787` and serves plain HTTP. Claude's connector
-UI and most browser-based MCP clients refuse plain `http://` URLs, so if you
-want teammates to connect from anywhere other than a trusted local network,
-put a real TLS terminator in front of it (a reverse proxy, a Cloudflare
-Tunnel, etc.) rather than relying on the steps below, which are meant for a
-small team on the same LAN.
+**`--host 0.0.0.0` is required and is not the default.** Plain `--http` binds
+`127.0.0.1`, reachable only from the machine it runs on. Sharing with teammates
+means deliberately widening that, which is why this page exists — and why the
+server logs a warning when you do.
+
+Prefer the narrowest address that works: if everyone is on one subnet, binding
+that interface's own IP (`--host 192.168.1.20`) beats the `0.0.0.0` wildcard,
+which also picks up any VPN, hotspot, or guest interface the machine happens to
+have.
+
+Plain HTTP also means the token crosses the network in cleartext. Claude's
+connector UI and most browser-based MCP clients refuse plain `http://` URLs
+anyway, so if you want teammates connecting from anywhere other than a trusted
+local network, put a real TLS terminator in front (a reverse proxy, a
+Cloudflare Tunnel, Tailscale) rather than relying on the steps below, which are
+meant for a small team on the same LAN.
 
 For a LAN-only setup, generate a self-signed certificate once (`cryptography`
 is already in `requirements.txt`, so no separate install is needed if you
@@ -145,7 +155,7 @@ the header-based config out to one teammate at a time without breaking
 everyone else's connection mid-migration.
 
 ```bash
-python server.py --http --port 8787 --allow-legacy-token-path
+python server.py --http --host 0.0.0.0 --port 8787 --allow-legacy-token-path
 ```
 
 Once every teammate's config has moved to the header style, remove the flag
