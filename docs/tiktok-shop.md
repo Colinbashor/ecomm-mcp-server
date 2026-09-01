@@ -86,6 +86,16 @@ session-grain — a broadcast spanning midnight splits across two rows — and
 the script runs a reconciliation sanity-check against the funnel totals to
 catch pagination gaps.
 
+The per-product LIVE crawl in `sync_live_products` commits **one day at a
+time** as soon as that day's product scan finishes, and wraps each
+individual product lookup in its own retry/skip — a product that exhausts
+its retries is logged and skipped rather than aborting the whole window. An
+earlier version buffered every day's rows in memory and wrote them all at
+the very end, so one flaky call late in a multi-day backfill discarded
+everything already fetched. The retry predicate also treats any bare HTTP
+`>= 500` from the per-product detail endpoint as transient, not just
+TikTok's documented rate-limit codes.
+
 `tiktok_finance_sync.py` exists so a report can read a measured, up-to-date
 fee/take-rate from the database instead of hardcoding a guessed commission
 or calling the Finance API live at render time. The load-bearing detail is
