@@ -43,8 +43,9 @@ and API access work before you kick off a full crawl.
 
 ## Tables
 
-- `orders`, `shopify_order_customers`, `shopify_order_discounts` (core, shared
-  across platforms — see the main [README](../README.md#mcp-tools))
+- `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
+- `shopify_order_customers`, `shopify_order_discounts` (order-side extras,
+  written as a side effect of `warehouse/connectors/shopify.py`'s `sync()`)
 - `shopify_customers`, `shopify_customer_metafields`,
   `shopify_customer_flag_history` (customer dimension)
 
