@@ -233,9 +233,10 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 
 | File | Covers |
 |---|---|
-| `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, and legacy-token-path log scrubbing |
+| `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, legacy-token-path log scrubbing, the `--http` loopback-by-default bind and its warnings, and a source grep guarding against a hardcoded wildcard bind |
 | `tests/test_list_tables.py` | `list_tables` surfaces SQL views alongside tables, in both column-listing and name-only mode, and `table_pattern` matches views too |
 | `tests/test_run_sync.py` | One connector failing doesn't abort the rest of a sync run |
+| `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, and that a missing/unconfigured/failing target is skipped rather than raised |
 
