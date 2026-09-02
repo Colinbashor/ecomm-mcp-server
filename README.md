@@ -96,7 +96,7 @@ writes, and its test coverage.
 | Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
 | Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | ad/creative/video-level detail |
 | Amazon Advertising | [docs/amazon-ads.md](docs/amazon-ads.md) | campaign spend/clicks/conversions | per-ASIN, keyword/target, search-term performance |
-| Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
+| Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, AWD (bulk-storage) inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase, monthly search terms by category |
 | Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
 | TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data |
