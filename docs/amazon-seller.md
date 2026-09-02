@@ -1,8 +1,9 @@
 # Amazon Seller (Selling Partner API)
 
-Retail order ground truth (core), plus six standalone scripts covering FBA
-inventory, returns, rank tracking, fees, SKU economics, and sales/traffic —
-and a manual CSV importer for Voice of the Customer, which has no API.
+Retail order ground truth (core), plus seven standalone scripts covering FBA
+inventory, AWD (bulk-storage) inventory, returns, rank tracking, fees, SKU
+economics, and sales/traffic — and a manual CSV importer for Voice of the
+Customer, which has no API.
 
 This is a separate credential set (`SPAPI_*`) from [Amazon Advertising](amazon-ads.md).
 For Brand Analytics (search query performance, market basket, etc.), see
@@ -15,6 +16,7 @@ requires brand registry.
 |---|---|---|
 | `warehouse/connectors/amazon_orders.py` | core, via `run_sync.py --only amazon_orders` | retail orders into `orders` |
 | `amazon_inventory_sync.py` | standalone | FBA inventory snapshots |
+| `amazon_awd_sync.py` | standalone | Amazon Warehousing & Distribution (AWD) bulk-storage inventory snapshots |
 | `amazon_returns_sync.py` | standalone | customer returns |
 | `amazon_rank_sync.py` | standalone | Best-Seller-Rank tracking |
 | `amazon_fees_sync.py` | standalone | SP-API fee reports: previews, storage, reimbursements, promotions, fulfilled shipments/MCF |
@@ -38,7 +40,7 @@ Seller **self-authorization** — no OAuth consent screen:
    | `SPAPI_REGION` | default `NA` |
    | `DATAKIOSK_TIMEOUT_MIN` | optional, how long `amazon_economics_sync.py` waits for a Data Kiosk query (default `150` — these can run 1–2h for a full week) |
 
-All six extras reuse these same variables — nothing new to configure.
+All seven extras reuse these same variables — nothing new to configure.
 `voc_import.py` needs **no credentials at all**: download the export from
 Seller Central (Performance → Voice of the Customer), drop it in a local
 folder, and import it.
@@ -48,6 +50,7 @@ folder, and import it.
 ```bash
 python run_sync.py --only amazon_orders   # core retail orders, last 7 days
 python amazon_inventory_sync.py
+python amazon_awd_sync.py                           # or --probe / --date YYYY-MM-DD
 python amazon_returns_sync.py --start 2026-01-01 --end 2026-01-31   # or no args for the default window
 python amazon_rank_sync.py --asins-file asins.txt   # or --asins B0FOO,B0BAR
 python amazon_fees_sync.py                          # or --week YYYY-MM-DD
@@ -66,6 +69,7 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 
 - `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
 - `amazon_inventory`
+- `amazon_awd_inventory`
 - `amazon_returns`
 - `amazon_sales_rank`
 - `amazon_fee_preview`, `amazon_fba_storage_fees`, `amazon_fba_reimbursements`,
@@ -95,6 +99,24 @@ components, marketplace-specific aliasing), so a plain `SUM(quantity) GROUP
 BY seller_sku` can double-count. Check the module docstring in
 `amazon_inventory_sync.py` before writing aggregate queries against this
 table.
+
+`amazon_awd_inventory` (Amazon Warehousing & Distribution — a bulk-storage
+tier upstream of FBA, only relevant if you use it) is invisible to the FBA
+Inventory API entirely, so it's a genuinely separate stock pool, not a
+variant of `amazon_inventory`. It needs no new credentials — same `SPAPI_*`
+app. **The one thing to get right:** of the four quantities the API returns
+per SKU, only `available_distributable` is stock the FBA feed doesn't
+already know about; `reserved_distributable` and `replenishment_qty` are
+already committed to FBA and typically reappear as one of
+`amazon_inventory`'s `inbound_*` columns for the same SKU, so summing them
+into an FBA position double-counts real units. Read `amazon_awd.py` (a
+shared, read-only reader with exactly one accessor, `available()`, for "how
+much extra stock is there") rather than querying `amazon_awd_inventory`
+directly — the full reasoning is in both modules' docstrings. Like
+`amazon_inventory`, this is current-state-only (no history API), so a
+missed day's snapshot is gone permanently; `amazon_awd.note(...)` renders a
+one-line status footer distinguishing "no AWD stock" from "never synced" —
+always show it alongside any AWD-derived number.
 
 `amazon_economics_sync.py` pulls Data Kiosk's weekly grain, which is aligned
 Sun–Sat. A query with a Mon–Sun (or any other) week boundary will silently
@@ -128,7 +150,8 @@ sold on your own site.
 
 ## Tests
 
-`tests/test_amazon_inventory_sync.py`, `tests/test_amazon_returns_sync.py`,
+`tests/test_amazon_inventory_sync.py`, `tests/test_amazon_awd_sync.py`,
+`tests/test_amazon_awd.py`, `tests/test_amazon_returns_sync.py`,
 `tests/test_amazon_rank_sync.py`, `tests/test_amazon_fees_sync.py`,
 `tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`,
 `tests/test_voc_import.py`
