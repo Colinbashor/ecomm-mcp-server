@@ -55,7 +55,26 @@ python google_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
 python google_ads_detail_sync.py --only google_pmax_search_themes --start 2026-01-01 --end 2026-01-31
 python google_ads_structure_sync.py       # current-state config snapshot, as of today
 python google_ads_structure_sync.py --date 2026-01-15   # or --only campaigns,asset_groups
+
+# google_ads_mutate.py — every subcommand below defaults to validate_only=True
+# (server-side validation, zero changes committed); add --execute to apply it
+python google_ads_mutate.py pause-campaign --campaign-id 18373650912
+python google_ads_mutate.py pause-campaign --campaign-id 18373650912 --execute
+python google_ads_mutate.py remove-campaigns --campaign-id 18373650912 --campaign-id 20593969582 --execute
+python google_ads_mutate.py end-experiment --experiment-id 6477859796 --execute
+python google_ads_mutate.py set-bidding --campaign-id 20593969582 --target-roas 2.5
+python google_ads_mutate.py set-bidding --campaign-id 20593969582 --maximize-conversion-value --execute
+python google_ads_mutate.py replace-filter --campaign-id 20593969582 \
+    --asset-group-id 6477859796 --remove-filter-id 11195896515 \
+    --dimension custom_label_0 --value "Winter - Proven Seller" --parent-id 11195894994 --execute
+python google_ads_mutate.py build-tier-subdivision --campaign-id 22001500480 \
+    --asset-group-id 6536885353 --remove-filter-id 12163354837 \
+    --dimension custom_label_0 --include "A - Hero" --include "B - Scale up" --execute
 ```
+
+`remove-campaigns` accepts repeated `--campaign-id` to remove several in one
+mutate request. Always run a subcommand without `--execute` first, read the
+validation result, then re-run with `--execute` once it validates clean.
 
 Both scripts write each grain independently and mark the run `"degraded"`
 (not `"ok"`) in `sync_log` if one grain fails while others succeed — check
@@ -104,6 +123,14 @@ cross-table rollup:
   which the connector detects (impression share + budget-lost + rank-lost
   should sum to ~1.0 on any real day) and stores as `NULL` rather than as a
   fabricated collapse.
+- **`google_ads_mutate.py` needs the account's permission tier — not the
+  OAuth scope — raised to Standard or Admin.** The Google Ads API has exactly
+  one OAuth scope (`https://www.googleapis.com/auth/adwords`) covering both
+  read and write, so the same refresh token used for every read-only script
+  above also works here with no re-auth. But a Read-only permission tier on
+  the account itself rejects mutate calls even with `validate_only=True` —
+  validation happens server-side against the live account, so the tier check
+  runs before anything is validated, not just before anything is committed.
 
 ## Tests
 

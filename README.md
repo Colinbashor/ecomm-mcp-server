@@ -239,6 +239,7 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | `tests/test_run_sync.py` | One connector failing doesn't abort the rest of a sync run |
 | `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
+| `tests/test_google_ads_connector.py` | `search_impression_share` and its lost-share siblings stay `NULL` only on non-auction campaign types, keep a real `0.0` on Search/Shopping, and a Google-side `0.0/0.0/0.0` placeholder response is detected and nulled rather than stored as a fabricated zero |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, and that a missing/unconfigured/failing target is skipped rather than raised |
 
 Every standalone script under [Connectors, by platform](#connectors-by-platform) above has
