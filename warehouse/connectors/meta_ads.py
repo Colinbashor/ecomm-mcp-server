@@ -83,6 +83,7 @@ def _fetch_range(start_date: str, end_date: str) -> list[dict]:
                     "link_clicks": int(d.get("inline_link_clicks", 0) or 0),
                     "add_to_carts": _action_total(actions, _ATC_TYPES),
                     "checkouts": _action_total(actions, _CHECKOUT_TYPES),
+                    "landing_page_views": _action_total(actions, _LPV_TYPES),
                 }
             )
         # follow pagination
@@ -136,6 +137,9 @@ _PURCHASE_TYPES = ("omni_purchase", "purchase", "offsite_conversion.fb_pixel_pur
 _ATC_TYPES = ("omni_add_to_cart", "add_to_cart", "offsite_conversion.fb_pixel_add_to_cart")
 _CHECKOUT_TYPES = ("omni_initiated_checkout", "initiate_checkout",
                    "offsite_conversion.fb_pixel_initiate_checkout")
+# Link taps that actually rendered the page. Meta returns the omni_ and
+# plain variants with identical values, so take one - same rule as above.
+_LPV_TYPES = ("omni_landing_page_view", "landing_page_view")
 
 
 def _action_total(actions, candidates: tuple[str, ...]) -> float:

@@ -496,6 +496,28 @@ def run_status(total: int, partial: list[str], failed: list[str],
     return "ok", ""
 
 
+def exit_code(status: str, repair: bool, allow_partial: bool) -> int:
+    """Process exit code for a run that logged `status`.
+
+    A DEGRADED REPAIR RUN EXITS 0, and that is the point of this function
+    existing. `degraded` here means "the platform has still not published the
+    final day", which is an EXPECTED upstream lag, not a failure of this job:
+    the coverage table has already recorded it, MAX_REPAIR_ATTEMPTS bounds the
+    retrying, and this feed's freshness is already visible wherever else your
+    monitoring reads sync_log. Exiting nonzero on top of that fails an entire
+    multi-step pipeline over a condition that is already tracked and already
+    surfaced elsewhere — two runs of red for an expected condition is how a
+    status stops meaning anything.
+
+    A `failed` week (an exception, i.e. a real error) still exits 1.
+    """
+    if status == "ok":
+        return 0
+    if status == "degraded" and (allow_partial or repair):
+        return 0
+    return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--week", help="Monday (YYYY-MM-DD) of one specific report week")
@@ -570,9 +592,12 @@ def main() -> int:
     status, message = run_status(total, partial, failed, args.repair)
     warehouse_db.log_sync(PLATFORM, started, total, status, message)
     print(f"Amazon traffic: wrote {total} rows [{status}]" + (f" — {message}" if message else ""))
-    if status == "degraded" and args.allow_partial:
-        return 0
-    return 0 if status == "ok" else 1
+    code = exit_code(status, args.repair, args.allow_partial)
+    if code == 0 and status == "degraded":
+        print("    (degraded, exit 0: the platform has not published the final "
+              "day yet. Recorded in amazon_traffic_coverage; it will be "
+              "re-requested next run.)", flush=True)
+    return code
 
 
 if __name__ == "__main__":

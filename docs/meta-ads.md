@@ -25,7 +25,15 @@ python run_sync.py --only meta   # last 7 days
 
 ## Tables
 
-- `ad_metrics` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
+- `ad_metrics` (core, shared across platforms — see the main [README](../README.md#mcp-tools)).
+  Meta additionally fills `landing_page_views` — Meta's `landing_page_view`
+  action, i.e. link taps that actually finished rendering the page, always
+  `<=` `link_clicks`. If you have a separate analytics tool tracking sessions
+  landing from this traffic, compare it against `landing_page_views`, not
+  `link_clicks` — `link_clicks` counts every tap, including ones that bailed
+  during load, and can meaningfully overstate real arrivals.
+
+Core-connector tests: `tests/test_meta_ads_landing_page_views.py`.
 
 ## Standalone extra: ad/creative/video-level detail
 

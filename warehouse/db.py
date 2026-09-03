@@ -49,6 +49,12 @@ MIGRATIONS = {
     "ad_metrics": [
         "campaign_type TEXT", "reach INTEGER", "link_clicks INTEGER",
         "add_to_carts REAL", "checkouts REAL", "all_conversions REAL",
+        # Meta landing_page_view: link taps that actually rendered the page.
+        # Always <= link_clicks; the gap is people who tapped and bailed
+        # during load. Use THIS, not link_clicks, to compare against a
+        # separate analytics tool's session count -- link_clicks alone
+        # overstates real arrivals.
+        "landing_page_views REAL",
         "search_impression_share REAL",
         # Google auction diagnostics, added 2026-08-05. ALL FIVE ARE RATIOS
         # (0-1) — AVG them, never SUM, same rule as search_impression_share.
@@ -107,6 +113,7 @@ def init_db() -> None:
 _AD_EXTENDED_DEFAULTS = {
     "campaign_type": None, "reach": None, "link_clicks": None,
     "add_to_carts": None, "checkouts": None, "all_conversions": None,
+    "landing_page_views": None,
     "search_impression_share": None,
     "search_budget_lost_impression_share": None,
     "search_rank_lost_impression_share": None,
@@ -129,14 +136,14 @@ def upsert_ad_metrics(rows: list[dict]) -> int:
               (platform, account_id, campaign_id, campaign_name, date,
                impressions, clicks, spend, conversions, revenue, currency, synced_at,
                campaign_type, reach, link_clicks, add_to_carts, checkouts,
-               all_conversions, search_impression_share,
+               all_conversions, landing_page_views, search_impression_share,
                search_budget_lost_impression_share, search_rank_lost_impression_share,
                search_click_share, absolute_top_impression_pct, top_impression_pct)
             VALUES
               (:platform, :account_id, :campaign_id, :campaign_name, :date,
                :impressions, :clicks, :spend, :conversions, :revenue, :currency, :synced_at,
                :campaign_type, :reach, :link_clicks, :add_to_carts, :checkouts,
-               :all_conversions, :search_impression_share,
+               :all_conversions, :landing_page_views, :search_impression_share,
                :search_budget_lost_impression_share, :search_rank_lost_impression_share,
                :search_click_share, :absolute_top_impression_pct, :top_impression_pct)
             """,
