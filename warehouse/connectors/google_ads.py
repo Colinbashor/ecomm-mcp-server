@@ -10,6 +10,69 @@ import os
 
 PLATFORM = "google"
 
+# Channel types that actually run a search auction and therefore have a real
+# search_impression_share (Google returns a meaningless 0 for everything
+# else — Performance Max/Display/Video have no such auction at all).
+SEARCH_AUCTION_CHANNEL_TYPES = {"SEARCH", "SHOPPING"}
+
+
+def _impression_share_fields(r) -> dict:
+    """search_impression_share + the two lost-share metrics, gated on
+    campaign type rather than on the returned value.
+
+    THE BUG THIS REPLACES: a blanket `float(x) or None` treated any 0 as
+    "not applicable" — which is correct for Performance Max/Display (which
+    run no search auction at all, so Google's 0 there is meaningless) but
+    WRONG for Search/Shopping, which do run a search auction and can
+    legitimately post a real 0% impression share on a given day. That
+    pattern silently discarded genuine zero-share days on exactly the
+    campaign types where the metric matters most.
+
+    A SECOND, SEPARATE DEFECT can show up in this same metric family, and
+    it's on Google's side, not the caller's: some accounts have observed
+    Shopping campaigns returning a hard 0.0/0.0/0.0 triple for
+    impression_share/budget_lost/rank_lost even on days the campaign served
+    real impressions. That can't be a genuine auction outcome —
+    impression_share + budget_lost + rank_lost sums to ~1.0 on every real
+    day, and a campaign that served impressions cannot, by definition, have
+    won a real 0% of the auction. So a 0/0/0 triple on a day WITH
+    impressions is treated as Google's own "not computed yet" placeholder
+    and stored as NULL (genuinely unknown), not as a real collapse — storing
+    it verbatim would just swap the NULL-that-reads-as-a-value bug for a
+    fake-0-that-reads-as-a-value one. If you see this firing consistently on
+    recent days rather than intermittently, it's worth a support ticket to
+    Google rather than treating it as expected behavior."""
+    applicable = r.campaign.advertising_channel_type.name in SEARCH_AUCTION_CHANNEL_TYPES
+    if not applicable:
+        return {
+            "search_impression_share": None,
+            "search_budget_lost_impression_share": None,
+            "search_rank_lost_impression_share": None,
+            "search_click_share": None,
+        }
+    impr_share = float(r.metrics.search_impression_share)
+    budget_lost = float(r.metrics.search_budget_lost_impression_share)
+    rank_lost = float(r.metrics.search_rank_lost_impression_share)
+    is_placeholder = (
+        int(r.metrics.impressions) > 0
+        and impr_share == 0.0
+        and budget_lost == 0.0
+        and rank_lost == 0.0
+    )
+    if is_placeholder:
+        return {
+            "search_impression_share": None,
+            "search_budget_lost_impression_share": None,
+            "search_rank_lost_impression_share": None,
+            "search_click_share": None,
+        }
+    return {
+        "search_impression_share": impr_share,
+        "search_budget_lost_impression_share": budget_lost,
+        "search_rank_lost_impression_share": rank_lost,
+        "search_click_share": float(r.metrics.search_click_share),
+    }
+
 
 def _client():
     # Imported lazily so the rest of the project runs even if google-ads
@@ -74,8 +137,6 @@ def sync(start_date: str, end_date: str) -> list[dict]:
                     "currency": None,
                     "campaign_type": r.campaign.advertising_channel_type.name,
                     "all_conversions": float(r.metrics.all_conversions),
-                    # ratio metric; 0 means "not applicable" (non-search campaigns)
-                    "search_impression_share": float(r.metrics.search_impression_share) or None,
                     # Auction diagnostics — ALL RATIOS (0-1), so AVG never SUM.
                     # WHY lost-IS matters: impression share says we're missing
                     # impressions; only the budget/rank split says whether the fix
@@ -83,19 +144,26 @@ def sync(start_date: str, end_date: str) -> list[dict]:
                     # Google buckets low IS as "<10%", so a stored 0.1 is a FLOOR,
                     # and it buckets high values as "> 90%" likewise — treat the
                     # extremes as bounds, not point estimates.
-                    # 0 -> None throughout: Google returns 0 both for "truly zero"
-                    # and "not applicable to this campaign type" (PMax/Display have
-                    # no search auction), and conflating those with a real 0% would
-                    # drag every AVG down. Non-applicable must stay NULL.
-                    "search_budget_lost_impression_share":
-                        float(r.metrics.search_budget_lost_impression_share) or None,
-                    "search_rank_lost_impression_share":
-                        float(r.metrics.search_rank_lost_impression_share) or None,
-                    "search_click_share": float(r.metrics.search_click_share) or None,
+                    #
+                    # NULL-OUT IS GATED ON CAMPAIGN TYPE, NOT ON VALUE — see
+                    # _impression_share_fields()'s docstring. A blanket
+                    # `float(x) or None` protects PMax/Display (whose 0 is
+                    # meaningless) but also silently nulls out GENUINE zeros on
+                    # Search/Shopping, which DO run a search auction and can
+                    # legitimately post 0% some days. Only non-auction channel
+                    # types get forced to None; Search/Shopping keep whatever
+                    # Google actually returned, zero included.
+                    **_impression_share_fields(r),
+                    # Same bug class as above, fixed the same way: 0% top-of-page
+                    # share is a real, common value (Display/Video placements
+                    # routinely never reach top position), and unlike the
+                    # impression-share metrics there's no documented "0 = not
+                    # applicable" sentinel for these two — so store what Google
+                    # returned, unconditionally, rather than mapping 0 -> None.
                     "absolute_top_impression_pct":
-                        float(r.metrics.absolute_top_impression_percentage) or None,
+                        float(r.metrics.absolute_top_impression_percentage),
                     "top_impression_pct":
-                        float(r.metrics.top_impression_percentage) or None,
+                        float(r.metrics.top_impression_percentage),
                 }
             )
     return rows

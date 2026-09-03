@@ -306,6 +306,35 @@ class RunStatusTests(unittest.TestCase):
         self.assertEqual((status, msg), ("ok", ""))
 
 
+class ExitCodeTests(unittest.TestCase):
+    """An expected upstream publishing lag must not fail the pipeline."""
+
+    def test_repair_partial_exits_zero(self) -> None:
+        """The platform not having published the final day yet is EXPECTED.
+        It logs degraded (already visible via sync_log) but must not fail a
+        multi-step pipeline that has already rendered/uploaded everything
+        that depends on this step."""
+        self.assertEqual(traffic.exit_code("degraded", repair=True, allow_partial=False), 0)
+
+    def test_early_pass_partial_still_exits_zero(self) -> None:
+        self.assertEqual(traffic.exit_code("degraded", repair=False, allow_partial=True), 0)
+
+    def test_plain_partial_run_is_still_loud(self) -> None:
+        """A fresh non-repair pull that came back short with no --allow-partial
+        is still a nonzero exit -- that asymmetry is deliberate."""
+        self.assertEqual(traffic.exit_code("degraded", repair=False, allow_partial=False), 1)
+
+    def test_a_failed_week_always_exits_nonzero(self) -> None:
+        """An exception is a real error and stays loud in every mode."""
+        for repair in (True, False):
+            for allow in (True, False):
+                self.assertEqual(
+                    traffic.exit_code("error", repair=repair, allow_partial=allow), 1)
+
+    def test_ok_exits_zero(self) -> None:
+        self.assertEqual(traffic.exit_code("ok", repair=True, allow_partial=False), 0)
+
+
 class RequireEnvTests(unittest.TestCase):
     def test_missing_vars_raise_systemexit(self) -> None:
         saved = {k: os.environ.pop(k, None) for k in traffic.REQUIRED_ENV}

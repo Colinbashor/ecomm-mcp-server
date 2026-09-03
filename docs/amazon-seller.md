@@ -142,6 +142,18 @@ period so a day Amazon will never actually finish publishing doesn't get
 re-requested forever. `--allow-partial` is for the opposite case — an early
 pass expected to be short — and exits 0 instead of failing the run.
 
+The exit code is decided by a small pure function, `exit_code(status, repair,
+allow_partial)`: `degraded` (a short pull) exits `0` when either `--repair` or
+`--allow-partial` was passed, and `1` otherwise; a real `error` status
+(an exception) always exits `1`, in every mode. If you wire this into a
+scheduler that treats any nonzero exit as a pipeline-wide failure, a
+`--repair` pass that still comes back short (Amazon simply hasn't published
+yet, which is already recorded in `amazon_traffic_coverage` and will retry
+next run) should not be allowed to fail steps that already succeeded and
+don't depend on it — that asymmetry (loud on a plain short pull, quiet on an
+expected repair/early-pass one) is the point of `exit_code()` existing as its
+own function rather than inline logic in `main()`.
+
 `amazon_fulfilled_shipments` (written by `amazon_fees_sync.py`) carries
 `sales_channel` and `shopify_order_name` columns, letting you join Amazon's
 Multi-Channel Fulfillment (MCF) shipments back to the Shopify order they

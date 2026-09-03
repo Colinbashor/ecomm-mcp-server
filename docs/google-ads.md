@@ -12,10 +12,16 @@ current-state campaign/asset/conversion-action configuration.
 | `warehouse/connectors/google_ads.py` | core, via `run_sync.py --only google` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `google_ads_detail_sync.py` | standalone | search terms, keywords + Quality Score, paid-vs-organic overlap, conversion-action attribution, device split, Shopping/PMax product demand, PMax search themes |
 | `google_ads_structure_sync.py` | standalone | current-state snapshots: campaigns, asset groups + assets, listing-group filters, conversion-action setup |
+| `google_ads_mutate.py` | standalone, **write-capable** | pause/remove a campaign, change bidding strategy, edit a Performance Max listing-group filter tree, end a Campaign Experiment |
 
 The structure connector in particular is aimed at "this campaign looks funded
 but isn't serving" — a question spend/impression metrics alone usually can't
 answer.
+
+`google_ads_mutate.py` is the one script in this repo that changes anything
+in your live ad account. Every mutate call defaults to `validate_only=True`
+(full server-side validation, zero changes committed) — only `--execute`
+actually applies a change. See its module docstring before using it.
 
 ## Setup
 
@@ -85,7 +91,21 @@ cross-table rollup:
   includes view-through and cross-device attribution well outside your
   actual conversion actions. Don't report it as a business metric; use the
   named conversion-action columns instead.
+- **`search_impression_share` and its two lost-share columns are `NULL`,
+  never `0`, on campaign types that run no search auction at all** (Performance
+  Max, Display, Video) — Google returns a meaningless `0` for those, and
+  `warehouse/connectors/google_ads.py` maps it to `NULL` so it can't be
+  averaged in as a real zero. On Search/Shopping campaigns, which DO run a
+  search auction, a real `0.0` is stored as `0.0`, not `NULL` — don't
+  reintroduce a blanket "any 0 means not applicable" check, that silently
+  discards genuine zero-share days on exactly the campaign types where the
+  metric matters. Some accounts have also been observed getting a hard
+  `0.0/0.0/0.0` triple back from Google on a day with real impressions,
+  which the connector detects (impression share + budget-lost + rank-lost
+  should sum to ~1.0 on any real day) and stores as `NULL` rather than as a
+  fabricated collapse.
 
 ## Tests
 
-`tests/test_google_ads_detail_sync.py`, `tests/test_google_ads_structure_sync.py`
+`tests/test_google_ads_detail_sync.py`, `tests/test_google_ads_structure_sync.py`,
+`tests/test_google_ads_connector.py`, `tests/test_google_ads_mutate.py`
