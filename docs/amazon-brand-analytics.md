@@ -152,4 +152,4 @@ copy a formula from one table to the other.
 ## Tests
 
 `tests/test_amazon_sqp_sync.py`, `tests/test_amazon_ba_sync.py`,
-`tests/test_brand_analytics.py`
+`tests/test_amazon_ba_backfill.py`, `tests/test_brand_analytics.py`
