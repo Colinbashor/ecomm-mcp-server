@@ -117,6 +117,34 @@ and marks which one is configured.
     at the cheap site-total grain and only pulls the expensive, paginated
     query/page grain for `web`.
 
+(8) THE OPTIONAL `query_pages` GRAIN IS THE ONLY BRIDGE FROM A SEARCH TERM TO
+    A SPECIFIC LANDING PAGE, AND ITS IMPRESSIONS DOUBLE-COUNT IN **BOTH**
+    DIRECTIONS. Neither `queries` nor `pages` alone can answer "what did
+    people search to land on this exact page" — `queries` carries no page,
+    `pages` carries no query text. `query_pages` (dims `[date, query, page]`)
+    closes that gap and, measured against a real site, recovered a noticeably
+    BETTER share of the day's clicks than `query`+`device` alone (a third
+    dimension gives the API another way to avoid the per-day row cap in trap
+    (1)) — worth confirming for your own property with `--probe` plus a spot
+    comparison against `search_console_daily`. The cost is that
+    `impressions` on this grain double-counts worse than the page-grain trap
+    in (4), and in both directions at once: summing across a query's pages
+    inflates (one query landing on N URLs is one site impression but N
+    query-page impressions), and summing across a page's queries inflates
+    too. `clicks` stays safe to sum. Always use `search_console_daily` as the
+    impressions denominator, never this table. `device` is deliberately NOT a
+    fourth dimension here — it would multiply an already-large row count for
+    a split `queries` already carries exactly on its own. This grain is
+    noticeably more expensive than `queries`/`pages` (routinely several times
+    the row count per day, since a query can land on many pages), so it is
+    opt-in: run `--only query_pages` or include it via `--only` alongside the
+    others rather than defaulting it into every run. It is worth the cost
+    specifically if you need to join organic search demand to a product/
+    landing-page catalog by URL — measured against a real product catalog,
+    the URLs recovered here matched by exact handle/slug far more reliably
+    than trying to resolve the same products through an analytics platform's
+    own opaque item-id space.
+
 Search queries can contain non-Latin/non-ASCII text — anything that prints
 them needs a UTF-8-safe console/log, or a real query will eventually crash a
 report script that assumes cp1252 or similar.
@@ -140,6 +168,7 @@ USAGE:
     search_console_sync.py --backfill            # retention floor -> yesterday
     search_console_sync.py --backfill --refresh  # ignore coverage, re-pull all
     search_console_sync.py --only queries --only pages
+    search_console_sync.py --only query_pages     # opt-in, see trap (8)
     search_console_sync.py --probe               # reachability, writes nothing
 """
 
@@ -173,7 +202,7 @@ SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 SITE = os.environ.get("SEARCH_CONSOLE_SITE", "")
 API_ROOT = "https://searchconsole.googleapis.com/webmasters/v3"
 
-GRAINS = ("daily", "queries", "pages")
+GRAINS = ("daily", "queries", "pages", "query_pages")
 
 # Cheap grain — one request per type for the WHOLE window, so all five are
 # affordable even though most are near-empty for a typical site.
@@ -184,6 +213,10 @@ DETAIL_TYPES = ("web",)
 
 QUERY_DIMS = ["date", "query", "device"]
 PAGE_DIMS = ["date", "page"]
+# The only dimension set that joins a search term to a specific landing page.
+# See trap (8): opt-in, more expensive than the two grains above, deliberately
+# no `device` split.
+QUERY_PAGE_DIMS = ["date", "query", "page"]
 
 ROW_LIMIT = 25000          # API maximum per request
 MAX_PAGES = 40             # a page count this high would mean something
@@ -273,6 +306,31 @@ CREATE TABLE IF NOT EXISTS search_console_pages (
 CREATE INDEX IF NOT EXISTS idx_sc_p_date ON search_console_pages(date);
 CREATE INDEX IF NOT EXISTS idx_sc_p_page ON search_console_pages(page);
 
+-- Which search query landed on which page — the only grain here that bridges
+-- organic demand to a specific landing page/product. See trap (8): opt-in
+-- (not in every default run), noticeably higher row count than the two
+-- tables above, and its `impressions` double-counts in BOTH directions (sum
+-- across a query's pages, or across a page's queries, and either inflates).
+-- `clicks` is safe to sum; `impressions` never is — use search_console_daily
+-- for that. No `device` dimension — see trap (8) for why.
+CREATE TABLE IF NOT EXISTS search_console_query_pages (
+    date        TEXT NOT NULL,
+    site        TEXT NOT NULL,
+    query       TEXT NOT NULL,      -- may contain non-Latin text; UTF-8
+    page        TEXT NOT NULL,      -- full URL
+    search_type TEXT NOT NULL,
+    clicks      INTEGER,
+    impressions INTEGER,            -- NOT SUMMABLE in either direction
+    ctr         REAL,
+    position    REAL,
+    data_state  TEXT NOT NULL,
+    synced_at   TEXT NOT NULL,
+    PRIMARY KEY (date, site, query, page, search_type)
+);
+CREATE INDEX IF NOT EXISTS idx_sc_qp_date  ON search_console_query_pages(date);
+CREATE INDEX IF NOT EXISTS idx_sc_qp_page  ON search_console_query_pages(page);
+CREATE INDEX IF NOT EXISTS idx_sc_qp_query ON search_console_query_pages(query);
+
 -- What was actually ASKED FOR, so a killed backfill resumes instead of
 -- re-fetching hundreds of days. Written in the SAME transaction as that
 -- day's rows, so coverage can never claim a day whose data did not commit.
@@ -282,7 +340,7 @@ CREATE INDEX IF NOT EXISTS idx_sc_p_page ON search_console_pages(page);
 CREATE TABLE IF NOT EXISTS search_console_coverage (
     date        TEXT    NOT NULL,
     site        TEXT    NOT NULL,
-    grain       TEXT    NOT NULL,   -- queries | pages
+    grain       TEXT    NOT NULL,   -- queries | pages | query_pages
     rows_stored INTEGER NOT NULL,
     data_state  TEXT    NOT NULL,
     was_settled INTEGER NOT NULL,   -- 1 = past the finalization lag when fetched
@@ -411,7 +469,11 @@ def store_daily(conn, session, start: dt.date, end: dt.date, data_state: str,
     return written
 
 
-TABLE_FOR_GRAIN = {"queries": "search_console_queries", "pages": "search_console_pages"}
+TABLE_FOR_GRAIN = {
+    "queries": "search_console_queries",
+    "pages": "search_console_pages",
+    "query_pages": "search_console_query_pages",
+}
 
 
 def seed_coverage_from_data(conn, grain: str) -> int:
@@ -460,6 +522,12 @@ def store_detail(conn, session, days: list[dt.date], grain: str, data_state: str
         cols = ("(date, site, query, device, search_type, clicks, impressions, "
                 "ctr, position, data_state, synced_at)")
         placeholders = "?,?,?,?,?,?,?,?,?,?,?"
+    elif grain == "query_pages":
+        table = "search_console_query_pages"
+        dims, n_keys = QUERY_PAGE_DIMS, 3
+        cols = ("(date, site, query, page, search_type, clicks, impressions, "
+                "ctr, position, data_state, synced_at)")
+        placeholders = "?,?,?,?,?,?,?,?,?,?,?"
     else:
         table = "search_console_pages"
         dims, n_keys = PAGE_DIMS, 2
@@ -495,6 +563,10 @@ def store_detail(conn, session, days: list[dt.date], grain: str, data_state: str
                 k = _keys(r, n_keys)
                 if grain == "queries":
                     # keys = date, query, device
+                    payload.append((k[0], SITE, k[1], k[2], stype,
+                                    *_metrics(r), data_state, stamp))
+                elif grain == "query_pages":
+                    # keys = date, query, page
                     payload.append((k[0], SITE, k[1], k[2], stype,
                                     *_metrics(r), data_state, stamp))
                 else:
@@ -705,6 +777,11 @@ def main() -> None:
     if "pages" in grains:
         plan.append(("search_console_pages", "pages",
                      lambda: store_detail(conn, session, days, "pages",
+                                          args.data_state, stamp,
+                                          refresh=args.refresh)))
+    if "query_pages" in grains:
+        plan.append(("search_console_query_pages", "query_pages",
+                     lambda: store_detail(conn, session, days, "query_pages",
                                           args.data_state, stamp,
                                           refresh=args.refresh)))
 

@@ -169,6 +169,17 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("device", pk)
         self.assertIn("query", pk)
 
+    def test_query_pages_grain_keys_on_query_and_page_not_device(self):
+        """This grain trades device for page — it answers "which page did this
+        query land on", which device can't help with, and adding device back
+        would multiply an already-large row count for no new join value."""
+        pk = [r[1] for r in
+              self.conn.execute("PRAGMA table_info(search_console_query_pages)")
+              if r[5]]
+        self.assertIn("query", pk)
+        self.assertIn("page", pk)
+        self.assertNotIn("device", pk)
+
 
 class CoverageTests(unittest.TestCase):
     """`degraded` must fire on a real gap and stay silent during the lag."""
@@ -339,6 +350,22 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(scs.covered_days(self.conn, "queries"), set())
         self.assertEqual(scs.covered_days(self.conn, "pages"), {day.isoformat()})
 
+    def test_query_pages_grain_stores_and_resumes_independently(self):
+        """The opt-in query_pages grain follows the exact same resume contract
+        as queries/pages -- it must not need its own bespoke resume path."""
+        day = self.settled
+        session = FakeSession([[_row((day.isoformat(), "q", "/products/x"))], []])
+        written = scs.store_detail(self.conn, session, [day], "query_pages",
+                                   "final", "stamp")
+        self.assertEqual(written, 1)
+        self.assertEqual(scs.covered_days(self.conn, "query_pages"),
+                         {day.isoformat()})
+        self.assertEqual(scs.covered_days(self.conn, "queries"), set(),
+                         "query_pages coverage must not leak into queries")
+        session2 = FakeSession([[_row((day.isoformat(), "q", "/products/x"))], []])
+        scs.store_detail(self.conn, session2, [day], "query_pages", "final", "stamp")
+        self.assertEqual(session2.calls, [], "a covered day must cost zero calls")
+
 
 class DateTests(unittest.TestCase):
     def test_date_range_is_inclusive_at_both_ends(self):
@@ -380,9 +407,24 @@ class QueryDimTests(unittest.TestCase):
         date dimension is what keeps each stored row attributable to its day."""
         self.assertEqual(scs.QUERY_DIMS[0], "date")
         self.assertEqual(scs.PAGE_DIMS[0], "date")
+        self.assertEqual(scs.QUERY_PAGE_DIMS[0], "date")
+
+    def test_query_pages_dims_omit_device(self):
+        """See trap (8): device is left out on purpose to bound this grain's
+        already-large row count."""
+        self.assertNotIn("device", scs.QUERY_PAGE_DIMS)
+        self.assertIn("query", scs.QUERY_PAGE_DIMS)
+        self.assertIn("page", scs.QUERY_PAGE_DIMS)
 
     def test_detail_types_are_a_subset_of_daily_types(self):
         self.assertTrue(set(scs.DETAIL_TYPES) <= set(scs.DAILY_TYPES))
+
+    def test_query_pages_grain_is_registered_everywhere_needed(self):
+        """A grain that's in GRAINS but missing from TABLE_FOR_GRAIN would
+        crash the first time --only query_pages tried to seed coverage."""
+        self.assertIn("query_pages", scs.GRAINS)
+        self.assertEqual(scs.TABLE_FOR_GRAIN["query_pages"],
+                         "search_console_query_pages")
 
 
 if __name__ == "__main__":

@@ -15,9 +15,15 @@ amazon_sqp_sync.py.
       MARKET-WIDE (every seller, every search term — this can be a very large
       report). NEVER ingested wholesale — filtered on ingest to terms that
       (1) have one of YOUR ASINs in the top-3 clicks ['ours'], (2) optionally
-      match a brand-name watchlist ['brand'] (see brand_watchlist.yaml), or
-      (3) rank <= rank_flag_max ['rank']. A term's FULL top-3 rows are kept
-      together. Run this grain ALONE (see --only below) given its size.
+      match a brand-name watchlist ['brand'] (see brand_watchlist.yaml),
+      (3) rank <= rank_flag_max ['rank'], or (4) optionally match a
+      configured TOPIC regex ['topic:<name>'] (see brand_watchlist.yaml) —
+      the only one of the four rules that can keep a term because of what it
+      *is*, regardless of whether you sell anything matching it, which is
+      what makes market-research questions ("what's the whole market
+      searching for in this product area") answerable at all. A term's FULL
+      top-3 rows are kept together. Run this grain ALONE (see --only below)
+      given its size.
   (c) GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT -> amazon_ba_market_basket
       What else customers buy alongside your ASINs (co-purchase pairs).
   (d) GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT -> amazon_ba_repeat_purchase
@@ -41,6 +47,21 @@ neither of the other two rules apply. This reads an OPTIONAL
 `brand_watchlist.yaml` in the project root (see that file for the format and
 a placeholder example) — if it's missing, this feature is silently skipped and
 grain (b) still runs on the 'ours'/'rank' rules alone.
+
+OPTIONAL TOPIC CAPTURE (also in `brand_watchlist.yaml`): the three rules
+above are all scoped to what's already yours — your ASINs, your watchlist, or
+the marketplace's overall top-N. That's the right filter for tracking your
+own position, but it makes demand for something you don't sell at all
+invisible, since nothing about such a term matches you. `term_topics` is a
+`{name: [regex, ...]}` map — any term matching one of a topic's regexes
+(case-insensitive, OR'd together) is kept with `match_reason = 'topic:<name>'`
+regardless of who sells it, and stores its full top-3 clicked ASINs — which,
+for a topic term, names the *competitors* currently winning it. Matching is
+counted per unique TERM (not per row) against `topic_max_rows_per_week`
+(default 20,000 — the source report can run into the millions of rows
+uncapped, so this cap is what keeps the ingest runnable at all), since a term
+brings its whole top-3 with it and splitting the cap mid-term would store a
+partial, misleading result.
 
 USAGE:
   python amazon_ba_sync.py --asins-file asins.txt                     # prior BA week: (a)(b)(c)
@@ -74,6 +95,9 @@ DB = Path(os.environ.get("WAREHOUSE_DB", HERE / "warehouse.db"))
 # Default rank cutoff for keeping a Top Search Terms row purely on popularity
 # (see sync_search_terms / _rank_max). Overridable via brand_watchlist.yaml.
 DEFAULT_RANK_FLAG_MAX = 2500
+# Default per-topic-per-week cap for the optional topic-capture rule (see
+# sync_search_terms / _topic_cap). Overridable via brand_watchlist.yaml.
+DEFAULT_TOPIC_MAX_ROWS_PER_WEEK = 20000
 
 DDL = """
 -- Brand Analytics per-ASIN search funnel (whole active catalog, one row/ASIN/wk).
@@ -106,7 +130,7 @@ CREATE TABLE IF NOT EXISTS amazon_ba_search_terms (
     click_share_rank      INTEGER NOT NULL, -- 1..3 within the term
     click_share_pct       REAL,            -- PERCENT
     conversion_share_pct  REAL,            -- PERCENT
-    match_reason          TEXT,            -- 'ours' | 'brand' | 'rank'
+    match_reason          TEXT,            -- 'ours' | 'brand' | 'rank' | 'topic:<name>'
     synced_at             TEXT NOT NULL,
     PRIMARY KEY (week_start, department, search_term, click_share_rank)
 );
@@ -196,6 +220,33 @@ def _rank_max() -> int:
     return int(cfg.get("rank_flag_max", DEFAULT_RANK_FLAG_MAX))
 
 
+def _topics() -> dict[str, list[str]]:
+    """Optional topic capture: {name: [regex, ...]} from brand_watchlist.yaml's
+    `term_topics` section. Empty (feature off) if the key is absent or the
+    file is missing — see the module docstring's "OPTIONAL TOPIC CAPTURE"."""
+    raw = _watchlist_config().get("term_topics") or {}
+    return {str(k): [str(p) for p in (v or [])] for k, v in raw.items()}
+
+
+def _topic_cap() -> int:
+    """Rows kept per topic per week. Top Search Terms can run into the
+    millions of rows uncapped, so an unbounded topic filter is how this
+    connector stops being runnable at all."""
+    cfg = _watchlist_config()
+    return int(cfg.get("topic_max_rows_per_week", DEFAULT_TOPIC_MAX_ROWS_PER_WEEK))
+
+
+def _topic_regexes() -> dict[str, "re.Pattern"]:
+    """name -> compiled regex. Each topic's patterns are OR'd together and
+    matched case-insensitively against the normalized term."""
+    out = {}
+    for name, pats in _topics().items():
+        pats = [p for p in pats if p]
+        if pats:
+            out[name] = re.compile("|".join(f"(?:{p})" for p in pats), re.I)
+    return out
+
+
 def _watch_regex(terms: list[str]):
     """Compile the watchlist into ONE word-boundary regex. Word boundaries are
     load-bearing: naive substring matching would mis-flag a short brand token
@@ -264,6 +315,11 @@ def sync_search_terms(conn, ba_sunday: date, stamp: str, our_asins: set[str]) ->
     week = ba_sunday.isoformat()
     watch_re = _watch_regex(_watchlist())
     rank_max = _rank_max()
+    topic_res = _topic_regexes()
+    topic_cap = _topic_cap()
+    topic_terms: dict[str, set] = {}
+    topic_kept: dict[str, int] = {}
+    topic_dropped: dict[str, int] = {}
     # Full market document (potentially very large). Parse once, filter in two
     # passes over the already-loaded list — run this grain ALONE (see --only).
     recs = run_ba_report("GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT", ba_sunday,
@@ -297,6 +353,27 @@ def sync_search_terms(conn, ba_sunday: date, stamp: str, our_asins: set[str]) ->
                 rank = _g(r, "searchFrequencyRank", "search_frequency_rank")
                 if rank is not None and int(rank) <= rank_max:
                     reason = "rank"
+        if reason is None and topic_res:
+            # TOPIC CAPTURE -- kept for WHAT THE TERM IS, not who sells it.
+            # This is the only rule that can surface demand nobody here sells.
+            low = term.lower()
+            for name, rx in topic_res.items():
+                if not rx.search(low):
+                    continue
+                # Counted per TERM, not per row: a term brings its whole
+                # top-3 with it, and splitting those across the cap would
+                # leave a term half-stored.
+                if tk in topic_terms.setdefault(name, set()):
+                    reason = f"topic:{name}"
+                    break
+                seen = topic_kept.get(name, 0)
+                if seen >= topic_cap:
+                    topic_dropped[name] = topic_dropped.get(name, 0) + 1
+                    break
+                topic_terms[name].add(tk)
+                topic_kept[name] = seen + 1
+                reason = f"topic:{name}"
+                break
         if reason is None:
             continue
         casin = _g(r, "clickedAsin", "clicked_asin") or ""
@@ -316,6 +393,11 @@ def sync_search_terms(conn, ba_sunday: date, stamp: str, our_asins: set[str]) ->
             "INSERT OR REPLACE INTO amazon_ba_search_terms VALUES (?,?,?,?,?,?,?,?,?,?,?)", out)
     kept_terms = len({(o[1], o[2]) for o in out})
     print(f"    ba_search_terms {week}: kept {len(out)} rows ({kept_terms} terms)", flush=True)
+    if topic_kept:
+        for name, n in topic_kept.items():
+            dropped = topic_dropped.get(name, 0)
+            capped = f", {dropped} more term(s) dropped at the cap" if dropped else ""
+            print(f"      topic:{name}: {n} term(s) kept{capped}", flush=True)
     return len(out)
 
 

@@ -27,3 +27,41 @@ competitor_brands:
 # selective (fewer terms kept just for being popular). Tune this to the scale
 # of your own catalog/marketplace.
 rank_flag_max: 2500
+
+# OPTIONAL, separate feature: TOPIC CAPTURE. The three rules above are all
+# scoped to what's already yours (your ASINs, your brand names, the overall
+# top-N) — none of them can surface a search term for a product area you
+# don't currently sell at all, since nothing about such a term matches you.
+# term_topics keeps a term because of WHAT IT IS, regardless of who sells it:
+# any term matching one of a topic's regex patterns is kept, along with its
+# full top-3 clicked ASINs — for a term you don't sell, those top-3 name the
+# competitors currently winning it. This is the only one of the four match
+# rules useful for pure market research (e.g. "what's the whole market
+# searching for in this product category").
+#
+# Format: a map of topic-name -> list of regex patterns (matched
+# case-insensitively against the normalized term; any pattern in the list
+# matching is enough). Omit this whole key, or leave it empty, to skip the
+# feature entirely — the other three rules are unaffected either way.
+#
+# !! YAML QUOTING TRAP — ALWAYS SINGLE-QUOTE THESE PATTERNS, NEVER DOUBLE-QUOTE
+# THEM !! YAML double-quoted scalars process backslash escapes, so a
+# double-quoted "\bwidget\b" silently becomes a literal backspace character
+# on each side of "widget" and matches NOTHING — with no error, so the topic
+# just quietly captures zero terms forever. Single-quoted strings ('\bwidget\b')
+# are literal and don't have this problem. If you need a literal apostrophe
+# inside a single-quoted pattern, double it ('don''t').
+#
+# The example below is a placeholder — replace "example_topic" and its
+# patterns with a real product-area regex for your own catalog.
+term_topics:
+  example_topic:
+    - '\bwidget\b'
+    - '\bwidgets?\b'
+
+# Rows kept per topic per week, counted per unique TERM (not per row — a term
+# brings its whole top-3 clicked-ASIN rows with it). The underlying report is
+# uncapped and can run into the millions of rows market-wide, so this is what
+# keeps a topic-capture ingest runnable at all; raise it if you need deeper
+# coverage of one topic and are willing to pay for a bigger weekly pull.
+topic_max_rows_per_week: 20000
