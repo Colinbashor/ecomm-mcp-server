@@ -4,7 +4,8 @@ For brand-registered sellers: Search Query Performance, Search Catalog
 Performance, Top Search Terms, Market Basket Analysis (frequently
 co-purchased products), and Repeat Purchase Behavior.
 
-**Scripts:** `amazon_sqp_sync.py`, `amazon_ba_sync.py` (standalone)
+**Scripts:** `amazon_sqp_sync.py`, `amazon_ba_sync.py`, `amazon_ba_backfill.py`
+(standalone)
 
 These reports queue for 15–25+ minutes on Amazon's side;
 `warehouse/brand_analytics.py` is the shared create/poll/download runner both
@@ -18,6 +19,12 @@ credentials as [Amazon Seller](amazon-seller.md) — no new variables needed.
 Optional: create `brand_watchlist.yaml` in the project root to flag search
 terms containing your own or a competitor's brand name (used by
 `amazon_ba_sync.py`'s Top Search Terms report) — see that file for the format.
+The same file has a separate, also-optional `term_topics` section for
+**topic capture**: unlike every other Top Search Terms match rule, this one
+keeps a term because of what it *is* (a regex match), not because it's
+already tied to your own ASINs or brand names — the only way to surface
+market demand for a product area you don't currently sell at all, along with
+the competitor ASINs currently winning it.
 
 ## Usage
 
@@ -50,7 +57,9 @@ clock budget so a scheduled run can't be blocked indefinitely).
   impressions/clicks/cart-adds/purchases vs. the whole market
 - `amazon_ba_search_catalog` — Search Catalog Performance
 - `amazon_ba_search_terms` — Top Search Terms (filterable — the raw report is
-  market-wide and can be huge; see the module docstring)
+  market-wide and can be huge; see the module docstring). `match_reason`
+  records why each row was kept: `ours`/`brand`/`rank` from the base three
+  rules, or `topic:<name>` from the optional topic-capture rule above.
 - `amazon_ba_market_basket` — frequently co-purchased products
 - `amazon_ba_repeat_purchase` — repeat purchase behavior
 
@@ -83,6 +92,34 @@ plus `amazon_asin_category` (a permanent ASIN → browse-node cache) and
 docstring's "coverage over presence" rule).
 
 **Test:** `tests/test_amazon_search_terms_monthly.py`
+
+## Deep backfill of Top Search Terms
+
+`amazon_ba_backfill.py` (standalone) walks the Top Search Terms grain
+backward week by week, resuming automatically on a re-run (a week already
+stored is skipped). It's a separate script from `amazon_ba_sync.py --weeks N`
+because this one grain is both the most expensive to re-request and, if
+you're using topic capture, the only one worth deep-backfilling for
+market-research purposes.
+
+```bash
+python amazon_ba_backfill.py --asins-file asins.txt              # walk back to the retention floor
+python amazon_ba_backfill.py --asins-file asins.txt --weeks 12   # bounded run
+python amazon_ba_backfill.py --asins-file asins.txt --start 2025-09-07
+python amazon_ba_backfill.py --status                            # what's stored; no API calls
+```
+
+Amazon doesn't publish how far back this report actually answers for your
+account, and it isn't guaranteed to signal "past retention" consistently —
+some out-of-range weeks come back `FATAL` with the same generic message an
+unpublished, too-recent week produces, rather than the cleaner `CANCELLED`.
+This script stops after a run of consecutive weeks that all yield zero rows,
+whatever the specific reason, rather than waiting for a signal that isn't
+guaranteed to arrive. See the module docstring and
+`warehouse/brand_analytics.py`'s docstring for the full explanation, and pace
+any concurrent probing of multiple candidate weeks conservatively — the
+create-report throttle has been observed to bite well before the documented
+burst limit in practice.
 
 ## Building on top of `warehouse/brand_analytics.py`
 

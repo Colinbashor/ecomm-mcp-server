@@ -106,6 +106,7 @@ writes, and its test coverage.
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
 | Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics |
 | Algolia (on-site search/browse) | [docs/algolia.md](docs/algolia.md) | — | collection-grid placement, search/browse engagement |
+| Factory production tracking | [docs/factory-production.md](docs/factory-production.md) | — | manual-drop vendor spreadsheets, header-matched into one table |
 
 Two more standalone utilities aren't connectors at all — no credentials, no
 data pulled from anywhere: pushing a "sync finished" notification to

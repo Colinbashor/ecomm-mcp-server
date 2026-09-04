@@ -50,35 +50,46 @@ python search_console_sync.py --start 2026-01-01 --end 2026-01-31
 python search_console_sync.py --backfill             # retention floor -> yesterday
 python search_console_sync.py --backfill --refresh   # ignore stored coverage, re-pull all
 python search_console_sync.py --only queries --only pages
+python search_console_sync.py --only query_pages    # opt-in, see Notes
 ```
 
-`--only` accepts `daily`, `queries`, `pages` — repeatable. Run `--probe`
-first on a new property: it lists every site the service account can see and
-confirms which one is configured, without writing anything.
+`--only` accepts `daily`, `queries`, `pages`, `query_pages` — repeatable. Run
+`--probe` first on a new property: it lists every site the service account
+can see and confirms which one is configured, without writing anything.
 
 ## Tables
 
 - `search_console_daily` — **authoritative** site totals per day per search
   type (web/image/video/news/discover). Use this as the denominator for
-  anything computed off the two tables below.
+  anything computed off the tables below.
 - `search_console_queries` — clicks/impressions/CTR/position per query per
   device per day. A **subset** of the site total — some queries are
   anonymized by Google and never appear here at any pull depth.
 - `search_console_pages` — the same, per landing page per day.
   **Impressions here double-count and must never be summed to a site
   figure** — see the module docstring.
+- `search_console_query_pages` — clicks/impressions/CTR/position per query
+  **and** landing page per day (opt-in, not pulled by default). The only
+  grain that bridges a search term to a specific page, useful when your own
+  product/page titles don't share vocabulary with what people actually
+  search. Bigger and slower than the two grains above, and its impressions
+  double-count in **both** directions (across a query's pages, and across a
+  page's queries) — see the module docstring's trap (8).
 
 ## Notes
 
-The module docstring documents seven traps worth reading before building on
+The module docstring documents eight traps worth reading before building on
 this data — among them: the 5,000-row cap on query/page-grain results is
 **per calendar day**, not per request, so days are pulled one at a time;
 pagination must stop on an *empty* page, never a short one, since a capped
 day legitimately returns exactly 5,000 rows; `dataState=all` banks partial,
-never-corrected recent days (the default, `final`, is recommended); and
+never-corrected recent days (the default, `final`, is recommended);
 retention is a **rolling window that slides forward daily**, with the loss
 at the *old* end — a missed backfill window is gone permanently, the
-opposite failure mode from most snapshot-style feeds in this repo.
+opposite failure mode from most snapshot-style feeds in this repo; and the
+optional `query_pages` grain is the only way to join a search term to a
+landing page, at the cost of a noticeably bigger, double-counting-prone
+table.
 
 `data_state` is stored on every row but deliberately **excluded from every
 table's primary key**, so a later `final` pull overwrites an earlier

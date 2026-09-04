@@ -97,6 +97,42 @@ class BrandWatchlistTests(unittest.TestCase):
                  patch.dict("sys.modules", {"yaml": None}):
                 self.assertEqual(ba._watchlist_config(), {})
 
+    def test_missing_term_topics_gives_empty_topics_and_default_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(ba, "HERE", Path(d)):
+                self.assertEqual(ba._topics(), {})
+                self.assertEqual(ba._topic_cap(), ba.DEFAULT_TOPIC_MAX_ROWS_PER_WEEK)
+
+    def test_term_topics_parsed_with_cap_override(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "brand_watchlist.yaml"
+            path.write_text(
+                "term_topics:\n"
+                "  widgets:\n"
+                "    - '\\bwidget\\b'\n"
+                "topic_max_rows_per_week: 5\n",
+                encoding="utf-8",
+            )
+            with patch.object(ba, "HERE", Path(d)):
+                self.assertEqual(ba._topics(), {"widgets": [r"\bwidget\b"]})
+                self.assertEqual(ba._topic_cap(), 5)
+
+    def test_topic_regexes_are_case_insensitive_and_OR_within_a_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "brand_watchlist.yaml"
+            path.write_text(
+                "term_topics:\n"
+                "  widgets:\n"
+                "    - '\\bwidget\\b'\n"
+                "    - '\\bgadget\\b'\n",
+                encoding="utf-8",
+            )
+            with patch.object(ba, "HERE", Path(d)):
+                rx = ba._topic_regexes()["widgets"]
+                self.assertIsNotNone(rx.search("blue WIDGET large"))
+                self.assertIsNotNone(rx.search("a gadget for sale"))
+                self.assertIsNone(rx.search("gizmo only"))
+
 
 class WatchRegexTests(unittest.TestCase):
     def test_empty_list_returns_none(self) -> None:
@@ -220,6 +256,55 @@ class SearchTermsFilterTests(unittest.TestCase):
             "SELECT click_share_pct, conversion_share_pct FROM amazon_ba_search_terms"
         ).fetchone()
         self.assertEqual((click_pct, conv_pct), (50.0, 25.0))
+
+    def test_topic_capture_keeps_a_term_nobody_here_sells(self) -> None:
+        # No 'ours'/'brand'/'rank' rule can fire (rank_max=0), so only topic
+        # capture can be responsible for keeping this row -- this is the
+        # whole point of the feature: surfacing demand for something the
+        # account doesn't sell at all.
+        recs = [self._rec("blue widget", "COMPETITOR1", 999999)]
+        with patch.object(ba, "run_ba_report", return_value=recs), \
+             patch.object(ba, "_watch_regex", return_value=None), \
+             patch.object(ba, "_rank_max", return_value=0), \
+             patch.object(ba, "_topic_regexes",
+                          return_value={"widgets": ba.re.compile(r"widget", ba.re.I)}), \
+             patch.object(ba, "_topic_cap", return_value=100):
+            n = ba.sync_search_terms(self.conn, date(2026, 7, 19), "stamp", set())
+        self.assertEqual(n, 1)
+        asin, reason = self.conn.execute(
+            "SELECT clicked_asin, match_reason FROM amazon_ba_search_terms").fetchone()
+        self.assertEqual(reason, "topic:widgets")
+        self.assertEqual(asin, "COMPETITOR1",
+                         "the competitor ASIN must be kept -- that's the point")
+
+    def test_topic_capture_never_overrides_a_stronger_match_reason(self) -> None:
+        # A term that's already 'ours' must stay 'ours', not get relabeled by
+        # a topic regex that happens to also match it.
+        recs = [self._rec("blue widget", "OURS1", 999999)]
+        with patch.object(ba, "run_ba_report", return_value=recs), \
+             patch.object(ba, "_watch_regex", return_value=None), \
+             patch.object(ba, "_rank_max", return_value=0), \
+             patch.object(ba, "_topic_regexes",
+                          return_value={"widgets": ba.re.compile(r"widget", ba.re.I)}), \
+             patch.object(ba, "_topic_cap", return_value=100):
+            ba.sync_search_terms(self.conn, date(2026, 7, 19), "stamp", {"OURS1"})
+        reason = self.conn.execute(
+            "SELECT match_reason FROM amazon_ba_search_terms").fetchone()[0]
+        self.assertEqual(reason, "ours")
+
+    def test_topic_capture_respects_the_per_topic_weekly_cap(self) -> None:
+        # Counted per TERM, not per row -- so a cap of 1 keeps exactly the
+        # first matching term and drops the second, never a partial term.
+        recs = [self._rec("blue widget", "C1", 999999),
+                self._rec("red widget", "C2", 999999)]
+        with patch.object(ba, "run_ba_report", return_value=recs), \
+             patch.object(ba, "_watch_regex", return_value=None), \
+             patch.object(ba, "_rank_max", return_value=0), \
+             patch.object(ba, "_topic_regexes",
+                          return_value={"widgets": ba.re.compile(r"widget", ba.re.I)}), \
+             patch.object(ba, "_topic_cap", return_value=1):
+            n = ba.sync_search_terms(self.conn, date(2026, 7, 19), "stamp", set())
+        self.assertEqual(n, 1, "the cap must stop at whole terms, not rows")
 
     def test_a_prior_weeks_rows_are_replaced_not_appended(self) -> None:
         recs = [self._rec("term five", "OURS1", 999999)]

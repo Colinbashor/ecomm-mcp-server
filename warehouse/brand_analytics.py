@@ -27,6 +27,23 @@ CANCELLED (Amazon returns no data — e.g. a week past this report's retention
 window) raises `BAReportCancelled`, which callers should treat as a normal,
 non-fatal outcome (e.g. the floor of a backfill walk-back), not an error.
 
+!! DO NOT ASSUME A REPORT PAST ITS RETENTION WINDOW ALWAYS COMES BACK
+CANCELLED — on at least one report type/account, an out-of-retention week
+returned **FATAL** instead, with the exact same generic error message
+("A client error occurred. Please double check that your parameters are
+valid...") that an unpublished, too-*recent* week also produces. Those two
+situations are indistinguishable from the response alone. A backfill walking
+backward in time that stops only on `BAReportCancelled` can therefore run
+forever against a report type/account where retention manifests as FATAL. A
+robust walk-back should stop after a bounded number of consecutive
+non-productive weeks (FATAL or CANCELLED or empty), not rely on one specific
+exception type as "the" floor signal. See `create_ba_report`'s
+`CREATE_BURST_LIMIT` note below for a related measured-vs-documented gap: the
+create-report throttle can be noticeably tighter in practice than the
+documented burst allowance implies, so a backfill that fires several reports
+concurrently to find a retention floor quickly should pace off a conservative
+sustained rate, not the burst limit.
+
 TWO CALLING STYLES:
   * `run_ba_report` — create, poll to terminal, return records. One report at a
     time; the whole 15-25 min queue wait is inline. Fine for a script that only

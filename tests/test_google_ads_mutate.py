@@ -7,9 +7,9 @@ behaviors that would otherwise be easy to silently break:
 
   * `validate_only` is always the inverse of `execute` (the whole safety
     model of this script rests on this one line),
-  * each of the four known request types dispatches to the correct service
-    method name, since `_mutate()` looks that up from a small dict rather
-    than deriving it mechanically from the request type string.
+  * each known request type dispatches to the correct service method name,
+    since `_mutate()` looks that up from a small dict rather than deriving it
+    mechanically from the request type string.
 
 The individual subcommand functions (`pause_campaign`, `set_bidding`, etc.)
 call the real `google.ads.googleads.client.GoogleAdsClient` and are exercised
@@ -70,6 +70,10 @@ class MutateDispatchTests(unittest.TestCase):
                 "mutate_asset_group_listing_group_filters",
             "MutateAssetGroupAssetsRequest": "mutate_asset_group_assets",
             "MutateConversionActionsRequest": "mutate_conversion_actions",
+            "MutateAdGroupCriteriaRequest": "mutate_ad_group_criteria",
+            "MutateAdGroupsRequest": "mutate_ad_groups",
+            "MutateAudiencesRequest": "mutate_audiences",
+            "MutateCampaignCriteriaRequest": "mutate_campaign_criteria",
         }
         for request_type, method_name in expected.items():
             client = self._client()
@@ -105,6 +109,24 @@ class ArgparseWiringTests(unittest.TestCase):
 
         p = sub.add_parser("end-experiment")
         p.add_argument("--experiment-id", required=True)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("flip-campaign-user-list-to-negative")
+        p.add_argument("--campaign-id", required=True)
+        p.add_argument("--old-criterion-id", action="append", required=True)
+        p.add_argument("--user-list-id", action="append", required=True)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("build-shopping-tier-subdivision")
+        p.add_argument("--ad-group-id", required=True)
+        p.add_argument("--parent-id", required=True)
+        p.add_argument("--remove-criterion-id", required=True)
+        p.add_argument("--parent-dimension", required=True,
+                       choices=["product_brand", *gam.CUSTOM_LABEL_INDEX])
+        p.add_argument("--parent-case-value", default="")
+        p.add_argument("--dimension", required=True, choices=gam.CUSTOM_LABEL_INDEX)
+        p.add_argument("--include", action="append", required=True)
+        p.add_argument("--cpc-bid-micros", type=int, default=10000)
         p.add_argument("--execute", action="store_true")
         return ap
 
@@ -145,6 +167,62 @@ class ArgparseWiringTests(unittest.TestCase):
              mock.patch.object(gam, "_customer_id", return_value="999"):
             gam.end_experiment(args)
         client.get_service.return_value.end_experiment.assert_called_once()
+
+    def test_flip_campaign_user_list_requires_paired_lists(self):
+        args = self._parser().parse_args([
+            "flip-campaign-user-list-to-negative", "--campaign-id", "1",
+            "--old-criterion-id", "10", "--user-list-id", "20"])
+        self.assertEqual(args.old_criterion_id, ["10"])
+        self.assertEqual(args.user_list_id, ["20"])
+
+    def test_build_shopping_tier_subdivision_rejects_an_unknown_parent_dimension(self):
+        """--parent-dimension is either 'product_brand' (its own oneof arm) or
+        one of the custom_label_N keys (product_custom_attribute) -- anything
+        else can't be mapped to either branch in build_shopping_tier_subdivision."""
+        with self.assertRaises(SystemExit):
+            self._parser().parse_args([
+                "build-shopping-tier-subdivision", "--ad-group-id", "1",
+                "--parent-id", "2", "--remove-criterion-id", "3",
+                "--parent-dimension", "not_a_real_dimension",
+                "--dimension", "custom_label_0", "--include", "A"])
+
+    def test_build_shopping_tier_subdivision_accepts_product_brand(self):
+        args = self._parser().parse_args([
+            "build-shopping-tier-subdivision", "--ad-group-id", "1",
+            "--parent-id", "2", "--remove-criterion-id", "3",
+            "--parent-dimension", "product_brand",
+            "--dimension", "custom_label_0", "--include", "A"])
+        self.assertEqual(args.parent_dimension, "product_brand")
+
+
+class AudienceGuardTests(unittest.TestCase):
+    """add_audience_user_lists / remove_audience_segment both read the target
+    Audience via a GAQL search before mutating anything -- if it isn't found,
+    they must exit loudly instead of building an update against a resource
+    name that doesn't exist."""
+
+    def _client_with_no_matching_audience(self):
+        client = mock.Mock()
+        ga_service = mock.Mock()
+        ga_service.search_stream.return_value = []  # no batches -> not found
+        client.get_service.return_value = ga_service
+        return client
+
+    def test_add_audience_user_lists_exits_when_audience_not_found(self):
+        client = self._client_with_no_matching_audience()
+        args = SimpleNamespace(audience_id="999", user_list_id=["1"], execute=False)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="1"):
+            with self.assertRaises(SystemExit):
+                gam.add_audience_user_lists(args)
+
+    def test_remove_audience_segment_exits_when_audience_not_found(self):
+        client = self._client_with_no_matching_audience()
+        args = SimpleNamespace(audience_id="999", user_list_id="1", execute=False)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="1"):
+            with self.assertRaises(SystemExit):
+                gam.remove_audience_segment(args)
 
 
 if __name__ == "__main__":
