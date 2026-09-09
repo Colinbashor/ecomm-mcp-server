@@ -54,6 +54,17 @@ so to stay current. One grain failing doesn't stop the others — each is
 fetched and committed independently, and a partial run is logged as
 "degraded" rather than silently reported clean.
 
+SOME VIEWS PUBLISH LATER THAN OTHERS. `paid_organic_search_term_view` in
+particular tends to lag several days behind the rest. A plain `--days 3` run
+covers `[today-3, today]`, so a date only ever falls inside that window on
+the handful of runs where it's still recent — if the view hasn't published
+the date by the last such run, that date drops out of the window forever and
+is never retried, even though the data eventually exists and a later manual
+pull for it would succeed. `LAGGING_GRAINS` gives specific grains a wider,
+independent lookback floor so they get more chances to catch up before that
+window closes; re-pulling is safe (INSERT OR REPLACE on the full primary
+key), so widening the window costs nothing but a few extra API calls.
+
 WHY THIS GRAIN IS DIFFERENT (google_pmax_search_themes). Every other grain
 here is keyed by a specific calendar date, so a daily run just adds new rows.
 `campaign_search_term_insight` isn't like that: Google Ads only returns it as
@@ -311,6 +322,20 @@ REPORTS = {
 #   --only google_pmax_search_themes --start 2026-06-01 --end 2026-06-30
 WINDOW_GRAINS = frozenset({"google_pmax_search_themes"})
 
+# Grains whose source view publishes LATER than the default lookback window
+# reaches back. `paid_organic_search_term_view` in particular tends to lag
+# several days behind `search_term_view` and the others. With a plain
+# `start = end - days` window, a given date is only ever in range on the runs
+# where it's still within `days` of today — once Google hasn't published it
+# by the last such run, that date falls out of the window forever and is
+# never retried, even though a later manual pull for the exact same date
+# would succeed. Re-pulling is idempotent (INSERT OR REPLACE on the full
+# primary key), so the fix is simply to look back further for these grains.
+# The value is a MINIMUM lookback in days — a floor, not a ceiling: an
+# explicit --start that is already wider still wins. Tune per-account if a
+# lagging view's actual publish delay turns out to differ.
+LAGGING_GRAINS = {"google_paid_organic": 10}
+
 
 def ensure_schema(conn) -> None:
     """Create this connector's tables if they don't exist yet. Safe to call
@@ -339,20 +364,30 @@ def run(start: str, end: str, only: list[str] | None = None) -> tuple[int, list[
 
     total = 0
     failures: list[str] = []
+    # Lagging grains need a wider window than the rest (see LAGGING_GRAINS),
+    # so the work list is built per grain instead of from one shared window.
+    work: list[tuple[str, str, str]] = []
+    for t in tables:
+        lookback = LAGGING_GRAINS.get(t)
+        t_start = start if lookback is None else min(
+            start,
+            (date.fromisoformat(end) - timedelta(days=lookback)).isoformat(),
+        )
+        work.extend((lo, hi, t) for lo, hi in _chunks(t_start, end))
+
     try:
-        for lo, hi in _chunks(start, end):
-            for table in tables:
-                cfg = REPORTS[table]
-                try:
-                    rows = cfg["fetch"](lo, hi)
-                except Exception as e:  # noqa: BLE001 — one grain must not kill the rest
-                    failures.append(f"{table} {lo}..{hi}: {str(e)[:120]}")
-                    print(f"    {table} {lo}..{hi} FAILED: {str(e)[:120]}")
-                    continue
-                with conn:  # commit per report — never hold the write lock long
-                    conn.executemany(cfg["insert"], [{**r, "synced_at": stamp} for r in rows])
-                total += len(rows)
-                print(f"    {table} {lo}..{hi}: {len(rows)} rows")
+        for lo, hi, table in sorted(work):
+            cfg = REPORTS[table]
+            try:
+                rows = cfg["fetch"](lo, hi)
+            except Exception as e:  # noqa: BLE001 — one grain must not kill the rest
+                failures.append(f"{table} {lo}..{hi}: {str(e)[:120]}")
+                print(f"    {table} {lo}..{hi} FAILED: {str(e)[:120]}")
+                continue
+            with conn:  # commit per report — never hold the write lock long
+                conn.executemany(cfg["insert"], [{**r, "synced_at": stamp} for r in rows])
+            total += len(rows)
+            print(f"    {table} {lo}..{hi}: {len(rows)} rows")
     finally:
         conn.close()
     if failures and not total:

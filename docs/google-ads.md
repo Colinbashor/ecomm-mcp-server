@@ -141,6 +141,17 @@ cross-table rollup:
 - **`google_paid_organic` has no money columns.** `cost_micros`,
   `conversions`, and `conversions_value` all error against this view; it's
   clicks/impressions only, for paid-vs-organic overlap.
+- **A few grains publish later than the default lookback window reaches.**
+  `google_paid_organic` in particular tends to lag several days behind the
+  others. `google_ads_detail_sync.py`'s `LAGGING_GRAINS` dict gives such a
+  grain its own wider minimum lookback so a slow-to-publish date gets more
+  chances to land before it ages out of every future run's window — without
+  it, a date that Google hasn't published yet by the last run still inside
+  the default window is dropped permanently, even though the data shows up
+  eventually and a manual re-pull for that date would succeed. If you add a
+  grain that behaves this way, add it to `LAGGING_GRAINS` rather than
+  widening the connector's default `--days`, which would cost every other
+  grain extra API calls it doesn't need.
 - **Never sum `google_conversion_actions_daily.conversions` with
   `ad_metrics`** — the two attribute the same conversions differently, and
   adding them double-counts.
