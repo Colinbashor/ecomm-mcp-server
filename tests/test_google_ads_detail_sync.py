@@ -162,6 +162,36 @@ class RunTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("google_search_terms", failures[0])
 
+    def test_lagging_grain_looks_back_further_than_the_requested_start(self) -> None:
+        seen_windows: list[tuple[str, str]] = []
+
+        def _tracking_fetch(start, end):
+            seen_windows.append((start, end))
+            return []
+
+        with patch.dict(gads.REPORTS, {
+            "google_paid_organic": {**gads.REPORTS["google_paid_organic"],
+                                     "fetch": _tracking_fetch},
+        }), patch.dict(gads.LAGGING_GRAINS, {"google_paid_organic": 10}):
+            gads.run("2026-06-10", "2026-06-10", only=["google_paid_organic"])
+        # The requested window is a single day, but the grain's lookback floor
+        # (10 days) should have pulled the start back to cover it.
+        self.assertEqual(seen_windows, [("2026-05-31", "2026-06-10")])
+
+    def test_non_lagging_grain_is_unaffected_by_lagging_grains(self) -> None:
+        seen_windows: list[tuple[str, str]] = []
+
+        def _tracking_fetch(start, end):
+            seen_windows.append((start, end))
+            return []
+
+        with patch.dict(gads.REPORTS, {
+            "google_search_terms": {**gads.REPORTS["google_search_terms"],
+                                     "fetch": _tracking_fetch},
+        }):
+            gads.run("2026-06-10", "2026-06-10", only=["google_search_terms"])
+        self.assertEqual(seen_windows, [("2026-06-10", "2026-06-10")])
+
     def test_run_raises_when_every_requested_grain_fails(self) -> None:
         def _broken(start, end):
             raise RuntimeError("simulated API failure")
