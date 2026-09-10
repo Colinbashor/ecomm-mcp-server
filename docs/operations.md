@@ -31,6 +31,41 @@ never raises, so a notification failure can't take down whatever pipeline
 called it. See the module docstring for full setup (webhook creation, SMTP
 setup for email).
 
+### Sending a fully custom HTML email — `notify.send_email()`
+
+`send()`'s email target auto-converts the same short chat-markdown text sent
+to Slack/Chat into HTML. For a real report — a formatted table, embedded or
+hotlinked images, its own layout — build the HTML yourself and call
+`send_email()` directly instead:
+
+```python
+from warehouse import notify
+ok = notify.send_email(
+    subject="Weekly Top Sellers",
+    html_body="<table>...</table>",
+    to=["team@example.com"],
+    plaintext_body="Weekly Top Sellers (see HTML version)",  # optional
+)
+if not ok:
+    ...  # the email is usually the only copy of this report — handle the failure
+```
+
+Unlike `send()`, a missing SMTP config or an exhausted retry loop is **not**
+swallowed — it's reported back via the `False` return value (and printed),
+since an email built this way is typically the deliverable itself rather than
+a side notification of a report that exists elsewhere. It retries a transient
+SMTP failure (`SMTP_SEND_RETRIES`, linear backoff) and uses a longer socket
+timeout than the webhook path (`SMTP_TIMEOUT_SECONDS`, default 60s) since a
+large image-heavy HTML body can take longer than a plain webhook POST to send
+over SMTP.
+
+Uses the same `SMTP_*` variables as above — no separate configuration needed.
+
+Sending through the Gmail API's own draft/send path is deliberately avoided
+for this: Gmail's compose sanitizer strips remote `<img src="...">` tags on
+save, which silently breaks any report built around hotlinked product images.
+Sending a hand-built MIME message directly over SMTP bypasses that rewrite.
+
 ## Backups — `backup_db.py`
 
 Makes a same-disk rotating copy of `warehouse.db` using SQLite's online

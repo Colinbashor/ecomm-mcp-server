@@ -40,12 +40,21 @@ chat-markdown text used for Slack/Chat into real HTML (bold, bulleted `<ul>`
 lists, a clickable link for a "Label: https://..." line), and every email
 carries both the plain-text original (for text-only clients) and the HTML
 version — one message body to build per report, two renderings.
+
+For a report that IS a real HTML document already (tables, images, custom
+layout — not derived from chat-markdown source text), call `send_email()`
+directly instead of routing it through `send(dest=...)`: it takes a
+ready-made HTML body verbatim and, unlike `send()`, reports failure back via
+its `False` return rather than swallowing it, since such an email is usually
+the report's only copy rather than a side notification of one that exists
+elsewhere.
 """
 from __future__ import annotations
 
 import os
 import re
 import smtplib
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -59,6 +68,18 @@ TIMEOUT_SECONDS = 10
 # Truncate to the tighter limit (with margin) so one send() path fits both.
 # Email has no such constraint and is sent untruncated.
 MAX_CHARS = 3800
+
+# send_email() below is for a fully custom HTML document (a real report --
+# tables, hotlinked images), which can run well past send()'s short digest
+# text. A wide image-heavy report is mostly hotlinked <img> tags (cheap in
+# payload bytes) but the TLS handshake + login + send over a typical SMTP
+# relay (e.g. Gmail's) does not reliably finish within TIMEOUT_SECONDS once
+# the body reaches several hundred KB -- observed live as a timed-out read
+# on an ~850KB send. Kept separate from TIMEOUT_SECONDS so the cheap webhook
+# path isn't slowed down for everyone.
+SMTP_TIMEOUT_SECONDS = 60
+SMTP_SEND_RETRIES = 3
+SMTP_RETRY_BACKOFF_SECONDS = 15
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or "587")
@@ -188,6 +209,79 @@ def _send_email(to_csv: str, subject: str, body: str) -> None:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_FROM, recipients, msg.as_string())
+
+
+def send_email(subject: str, html_body: str, to: list[str],
+                plaintext_body: str | None = None, cc: list[str] | None = None) -> bool:
+    """Send a fully custom HTML email over the SMTP mailbox configured in
+    .env (SMTP_HOST/PORT/USER/PASSWORD/FROM). This is a separate entry point
+    from send(dest=...)'s email target: that path takes the same short
+    chat-markdown text sent to Slack/Chat and auto-converts it to HTML via
+    to_email_html(), which is the right fit for a digest-style notification.
+    This function instead takes an already-built HTML document verbatim --
+    the right fit for a real report (tables, images, custom layout) that
+    doesn't come from chat-markdown source text at all.
+
+    UNLIKE send(): that one is a best-effort *side* notification for a report
+    that already exists elsewhere (a file, a dashboard link), so a missing or
+    unreachable target is silently skipped by design. An email built by this
+    function is usually the deliverable *itself* -- no other copy goes to the
+    recipient -- so a missing SMTP config or an exhausted retry loop is
+    reported back via the `False` return value (and printed) rather than
+    swallowed. A caller that cares (e.g. a scheduled report send) should
+    check the return value and surface the failure some other way (a chat
+    push, a nonzero exit code) rather than assume delivery succeeded.
+
+    WHY SMTP AND NOT A GMAIL-API DRAFT/SEND: a draft created through the
+    Gmail API's compose path is run through Gmail's own sanitizer on save,
+    which silently strips remote <img src="..."> tags -- so a report built
+    around hotlinked product images loses every image the moment the draft
+    is resaved. Sending a hand-built MIME message directly over SMTP avoids
+    that rewrite entirely, and is also the only path that can run unattended
+    from a non-interactive scheduled job (an interactive OAuth session
+    cannot)."""
+    if not (SMTP_USER and SMTP_PASSWORD):
+        print("[notify] SMTP not configured in .env -- email not sent")
+        return False
+    if not to:
+        print("[notify] send_email() called with no recipients -- not sent")
+        return False
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    # Plain text first, HTML second -- a client renders the LAST alternative
+    # part it understands, and HTML is the one wanted when supported.
+    if plaintext_body:
+        msg.attach(MIMEText(plaintext_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    recipients = list(to) + list(cc or [])
+    body = msg.as_string()
+    # A large image-heavy send can hit a transient rejection from the relay
+    # (observed live: Gmail's own "421 Temporary System Problem" twice in a
+    # row, then a third identical attempt went through clean) -- so this
+    # retries rather than treating one transient error as a hard rejection
+    # of the message's shape or size. A scheduled send has nobody to notice
+    # and retry by hand.
+    for attempt in range(1, SMTP_SEND_RETRIES + 1):
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, recipients, body)
+            print(f"[notify] emailed {len(recipients)} recipient(s): {subject!r}")
+            return True
+        except Exception as exc:  # noqa: BLE001 - reported to caller via return value
+            if attempt == SMTP_SEND_RETRIES:
+                print(f"[notify] email send failed after {attempt} attempt(s): {exc}")
+                return False
+            print(f"[notify] email send attempt {attempt} failed ({exc}), retrying...")
+            time.sleep(SMTP_RETRY_BACKOFF_SECONDS * attempt)
+    return False  # unreachable, keeps type-checkers happy
 
 
 def send(text: str, dest: str) -> None:
