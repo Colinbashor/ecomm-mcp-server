@@ -123,6 +123,55 @@ All `reacher_*`, created by this script (nothing added to shared
   (filtered to earners) has checked out reliably even when the raw count
   looks inflated.
 
+## Writing back to Reacher — `reacher_sample_limits.py`
+
+Everything above is read-only. This is a separate, deliberately human-invoked
+script that can cap (or clear) how many free samples Reacher will
+**auto-approve** for creators, per product, per month — useful when a product
+is selling out and you want to stop new automated samples for it without
+touching anything else, then remove the cap again later.
+
+It's a distinct file rather than an addition to `reacher_sync.py` on purpose:
+that connector's `_assert_read_only()` guard refuses any write outright, so
+an unattended sync can never use the write half of a `read_write`-scoped API
+key by accident. This script is the deliberate exception, kept separate so
+that guard stays absolute.
+
+```bash
+python reacher_sample_limits.py zero --product-id 1729401428505563994             # dry run
+python reacher_sample_limits.py zero --product-id 1729401428505563994 --yes       # actually cap it to 0
+python reacher_sample_limits.py zero --sku YOUR-SKU --reason "selling out" --yes
+python reacher_sample_limits.py reset --product-id 1729401428505563994 --yes      # clear the cap
+python reacher_sample_limits.py reset --all --yes                                 # clear every override this tool set
+python reacher_sample_limits.py status                                            # tracked overrides + live drift check
+```
+
+**Every command defaults to a dry run** that prints what it would do; pass
+`--yes` to actually call the API.
+
+**Identity:** a Reacher `productId` is your TikTok Shop SPU (item_group_id).
+This script needs no warehouse table to resolve one — pass `--product-id`
+directly (most reliable), or `--sku`, which matches against the `sku` field
+Reacher itself returns on each existing product-config row (i.e. whatever SKU
+value your Reacher account already has on file for that product — independent
+of any catalog data in your own warehouse). A product Reacher was never given
+a SKU for won't resolve by `--sku`; use `--product-id` for those. If you've
+built your own SKU → TikTok-product-id mapping, extend `resolve_by_sku()` to
+check it first.
+
+**This does not fully stop sampling.** `monthlySampleLimit` only caps
+Reacher's own automated approval funnel for that product. Most TikTok Shop
+sellers can also approve sample requests manually in Seller Center, and this
+endpoint has no reach into that path — a human reviewer can still approve a
+request regardless of what this script sets.
+
+**State:** active overrides are tracked in a local
+`reacher_sample_limit_overrides.json` (next to the script, not the warehouse
+database — this is operational state about a live external system, not
+warehouse data), so `reset --all` needs no memorized product list. Every
+actual write is also appended to `reacher_sample_limits_log.txt` as a
+plain-text audit trail.
+
 ## Tests
 
-`tests/test_reacher_sync.py`
+`tests/test_reacher_sync.py`, `tests/test_reacher_sample_limits.py`

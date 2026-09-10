@@ -171,6 +171,86 @@ class SendEmailTests(unittest.TestCase):
         self.assertIn("Body text", by_type["text/html"].get_payload(decode=True).decode("utf-8"))
 
 
+class SendEmailFunctionTests(unittest.TestCase):
+    """Tests for the standalone send_email() entry point (a ready-made HTML
+    document sent verbatim), distinct from the internal _send_email() used
+    by send(dest=...)'s markdown-derived email target."""
+
+    def setUp(self) -> None:
+        self._orig = (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
+                      notify.SMTP_HOST, notify.SMTP_PORT)
+        notify.SMTP_USER = "sender@example.com"
+        notify.SMTP_PASSWORD = "app-password"
+        notify.SMTP_FROM = "sender@example.com"
+        notify.SMTP_HOST = "smtp.gmail.com"
+        notify.SMTP_PORT = 587
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
+         notify.SMTP_HOST, notify.SMTP_PORT) = self._orig
+
+    def test_missing_credentials_returns_false_without_raising(self) -> None:
+        notify.SMTP_PASSWORD = ""
+        self.assertFalse(notify.send_email("Subj", "<p>hi</p>", ["a@example.com"]))
+
+    def test_no_recipients_returns_false_without_raising(self) -> None:
+        self.assertFalse(notify.send_email("Subj", "<p>hi</p>", []))
+
+    @patch("warehouse.notify.smtplib.SMTP")
+    def test_sends_html_and_plaintext_alternative(self, smtp_cls: Mock) -> None:
+        server = Mock()
+        smtp_cls.return_value.__enter__.return_value = server
+        ok = notify.send_email("Report subject", "<p>rich html</p>", ["a@example.com"],
+                                plaintext_body="plain fallback")
+        self.assertTrue(ok)
+        smtp_cls.assert_called_once_with("smtp.gmail.com", 587,
+                                          timeout=notify.SMTP_TIMEOUT_SECONDS)
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("sender@example.com", "app-password")
+        args, _ = server.sendmail.call_args
+        from_addr, recipients, raw_message = args
+        self.assertEqual(from_addr, "sender@example.com")
+        self.assertEqual(recipients, ["a@example.com"])
+        parsed = message_from_string(raw_message)
+        self.assertEqual(parsed["Subject"], "Report subject")
+        by_type = {part.get_content_type(): part for part in parsed.get_payload()}
+        self.assertIn("plain fallback", by_type["text/plain"].get_payload(decode=True).decode())
+        self.assertIn("rich html", by_type["text/html"].get_payload(decode=True).decode())
+
+    @patch("warehouse.notify.smtplib.SMTP")
+    def test_cc_recipients_get_the_message_and_the_header(self, smtp_cls: Mock) -> None:
+        server = Mock()
+        smtp_cls.return_value.__enter__.return_value = server
+        notify.send_email("Subj", "<p>hi</p>", ["a@example.com"], cc=["b@example.com"])
+        _, recipients, raw_message = server.sendmail.call_args.args
+        self.assertEqual(recipients, ["a@example.com", "b@example.com"])
+        self.assertEqual(message_from_string(raw_message)["Cc"], "b@example.com")
+
+    @patch("warehouse.notify.time.sleep")
+    @patch("warehouse.notify.smtplib.SMTP")
+    def test_retries_on_transient_failure_then_succeeds(self, smtp_cls: Mock,
+                                                          sleep: Mock) -> None:
+        server = Mock()
+        smtp_cls.return_value.__enter__.side_effect = [
+            ConnectionError("421 Temporary System Problem"),
+            server,
+        ]
+        ok = notify.send_email("Subj", "<p>hi</p>", ["a@example.com"])
+        self.assertTrue(ok)
+        self.assertEqual(smtp_cls.call_count, 2)
+        sleep.assert_called_once_with(notify.SMTP_RETRY_BACKOFF_SECONDS)
+
+    @patch("warehouse.notify.time.sleep")
+    @patch("warehouse.notify.smtplib.SMTP")
+    def test_exhausting_retries_returns_false_without_raising(self, smtp_cls: Mock,
+                                                                sleep: Mock) -> None:
+        smtp_cls.return_value.__enter__.side_effect = ConnectionError("boom")
+        ok = notify.send_email("Subj", "<p>hi</p>", ["a@example.com"])
+        self.assertFalse(ok)
+        self.assertEqual(smtp_cls.call_count, notify.SMTP_SEND_RETRIES)
+
+
 class SendTests(unittest.TestCase):
     def setUp(self) -> None:
         for key in list(os.environ):
