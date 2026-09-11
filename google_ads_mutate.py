@@ -124,6 +124,8 @@ def _mutate(client, service, request_type: str, customer_id: str, operations: li
     req.validate_only = not execute
     method = getattr(service, {
         "MutateCampaignsRequest": "mutate_campaigns",
+        "MutateCampaignBudgetsRequest": "mutate_campaign_budgets",
+        "MutateAdGroupAdsRequest": "mutate_ad_group_ads",
         "MutateAssetGroupListingGroupFiltersRequest": "mutate_asset_group_listing_group_filters",
         "MutateAssetGroupAssetsRequest": "mutate_asset_group_assets",
         "MutateConversionActionsRequest": "mutate_conversion_actions",
@@ -131,6 +133,7 @@ def _mutate(client, service, request_type: str, customer_id: str, operations: li
         "MutateAdGroupsRequest": "mutate_ad_groups",
         "MutateAudiencesRequest": "mutate_audiences",
         "MutateCampaignCriteriaRequest": "mutate_campaign_criteria",
+        "MutateCampaignSharedSetsRequest": "mutate_campaign_shared_sets",
     }[request_type])
     return method(request=req)
 
@@ -769,9 +772,9 @@ def add_shopping_tier_include(args):
 
 
 def add_keywords(args):
-    """Bulk-add BROAD match keyword criteria to an ad group, one operation
-    per line in `--file` (blank lines skipped). All in ONE mutate call so
-    `validate_only` checks the whole batch atomically."""
+    """Bulk-add keyword criteria to an ad group, one operation per line in
+    `--file` (blank lines skipped). All in ONE mutate call so `validate_only`
+    checks the whole batch atomically."""
     client = _client()
     from google.ads.googleads.errors import GoogleAdsException
 
@@ -786,12 +789,395 @@ def add_keywords(args):
         crit = op.create
         crit.ad_group = ag_path
         crit.keyword.text = term
-        crit.keyword.match_type = client.enums.KeywordMatchTypeEnum.BROAD
+        crit.keyword.match_type = getattr(
+            client.enums.KeywordMatchTypeEnum, getattr(args, "match_type", "BROAD"))
         ops.append(op)
 
     try:
         resp = _mutate(client, svc, "MutateAdGroupCriteriaRequest", _customer_id(), ops, args.execute)
         _report_result(resp, args.execute, f"add {len(ops)} keyword(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+# ---------------------------------------------------------------------------
+# CREATION. Sequential rather than one atomic MutateGoogleAdsRequest with temp
+# resource ids: each step validates against REAL prior state, which is what you
+# want when standing a campaign up by hand, and a half-built campaign costs
+# nothing because create-search-campaign lands PAUSED. Order:
+#   create-budget -> create-search-campaign -> create-ad-group -> add-keywords
+# No ad is created. A Search campaign cannot serve without one, so leaving the
+# RSA out is both an extra safety interlock and honest about ownership: ad copy
+# needs a human.
+# ---------------------------------------------------------------------------
+def create_budget(args):
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignBudgetOperation")
+    b = op.create
+    b.name = args.name
+    b.amount_micros = int(round(args.daily_amount * 1_000_000))
+    b.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    b.explicitly_shared = False
+    try:
+        resp = _mutate(client, svc, "MutateCampaignBudgetsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"create budget '{args.name}' at ${args.daily_amount:,.2f}/day")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def create_search_campaign(args):
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignService")
+    op = client.get_type("CampaignOperation")
+    c = op.create
+    c.name = args.name
+    c.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
+    # ALWAYS paused on creation. Un-pausing is a deliberate, separate human act
+    # in the UI once the ads and the review are done.
+    c.status = client.enums.CampaignStatusEnum.PAUSED
+    c.campaign_budget = client.get_service("CampaignBudgetService").campaign_budget_path(
+        _customer_id(), args.budget_id)
+    if args.target_roas is not None:
+        c.maximize_conversion_value.target_roas = args.target_roas
+    else:
+        c.maximize_conversion_value = client.get_type("MaximizeConversionValue")()
+    # Search only. Search-partners and Display expansion are separate decisions
+    # and both default ON if left unset, which would silently widen the test.
+    # Required on create since v24 (the API rejects the campaign without it) --
+    # set this to whichever value is factually true for your own account/ads.
+    c.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING)
+    c.network_settings.target_google_search = True
+    c.network_settings.target_search_network = False
+    c.network_settings.target_content_network = False
+    c.network_settings.target_partner_search_network = False
+    try:
+        resp = _mutate(client, svc, "MutateCampaignsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute, f"create PAUSED search campaign '{args.name}'")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def create_ad_group(args):
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("AdGroupService")
+    op = client.get_type("AdGroupOperation")
+    g = op.create
+    g.name = args.name
+    g.campaign = client.get_service("CampaignService").campaign_path(
+        _customer_id(), args.campaign_id)
+    g.type_ = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+    g.status = client.enums.AdGroupStatusEnum.ENABLED
+    try:
+        resp = _mutate(client, svc, "MutateAdGroupsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute, f"create ad group '{args.name}'")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def copy_rsa(args):
+    """Clone the ENABLED responsive search ad from one ad group into another.
+
+    The new ad is created ENABLED: the campaign-level PAUSE is the interlock, so
+    leaving the ad enabled means going live is one deliberate action (unpause
+    the campaign) rather than two easily-desynced ones.
+    """
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    ga = client.get_service("GoogleAdsService")
+    rows = list(ga.search(customer_id=_customer_id(), query=f"""
+        SELECT ad_group_ad.ad.responsive_search_ad.headlines,
+               ad_group_ad.ad.responsive_search_ad.descriptions,
+               ad_group_ad.ad.responsive_search_ad.path1,
+               ad_group_ad.ad.responsive_search_ad.path2,
+               ad_group_ad.ad.final_urls
+        FROM ad_group_ad
+        WHERE ad_group.id = {args.source_ad_group_id}
+          AND ad_group_ad.ad.type = RESPONSIVE_SEARCH_AD
+          AND ad_group_ad.status = 'ENABLED'
+        LIMIT 1"""))
+    if not rows:
+        print(f"No ENABLED RSA found in ad group {args.source_ad_group_id}")
+        sys.exit(2)
+    src = rows[0].ad_group_ad.ad
+
+    svc = client.get_service("AdGroupAdService")
+    op = client.get_type("AdGroupAdOperation")
+    aga = op.create
+    aga.ad_group = client.get_service("AdGroupService").ad_group_path(
+        _customer_id(), args.target_ad_group_id)
+    aga.status = client.enums.AdGroupAdStatusEnum.ENABLED
+    rsa = aga.ad.responsive_search_ad
+    for h in src.responsive_search_ad.headlines:
+        rsa.headlines.append(h)
+    for d in src.responsive_search_ad.descriptions:
+        rsa.descriptions.append(d)
+    rsa.path1 = src.responsive_search_ad.path1
+    rsa.path2 = src.responsive_search_ad.path2
+    aga.ad.final_urls.extend(src.final_urls)
+
+    print(f"  source: {len(rsa.headlines)} headlines, {len(rsa.descriptions)} descriptions, "
+          f"final_urls={list(aga.ad.final_urls)}")
+    try:
+        resp = _mutate(client, svc, "MutateAdGroupAdsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"copy RSA into ad group {args.target_ad_group_id}")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def set_campaign_geo(args):
+    """Add positive LOCATION criteria. Without one a campaign targets EVERY
+    location on earth - the API does not inherit or default to anything."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignCriterionService")
+    ops = []
+    for geo in args.geo_target_constant:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = client.get_service("CampaignService").campaign_path(
+            _customer_id(), args.campaign_id)
+        c.location.geo_target_constant = f"geoTargetConstants/{geo}"
+        ops.append(op)
+    try:
+        resp = _mutate(client, svc, "MutateCampaignCriteriaRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute, f"add {len(ops)} location target(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def set_campaign_language(args):
+    """Add LANGUAGE criteria. Same trap as geo: absent means all languages."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignCriterionService")
+    ops = []
+    for lang in args.language_constant:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = client.get_service("CampaignService").campaign_path(
+            _customer_id(), args.campaign_id)
+        c.language.language_constant = f"languageConstants/{lang}"
+        ops.append(op)
+    try:
+        resp = _mutate(client, svc, "MutateCampaignCriteriaRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute, f"add {len(ops)} language target(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def add_campaign_negative_keywords(args):
+    """Campaign-level negative keywords, one per line in --file.
+
+    TIMING IS THE WHOLE POINT. When a term graduates to an exact campaign it
+    must be negated in the discovery campaign, or both bid on the same query.
+    But negate it BEFORE the exact campaign is live and the term serves
+    nowhere. Run this in the same window as enable-campaign, not ahead of it.
+    """
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    with open(args.file, encoding="utf-8") as f:
+        terms = [line.strip() for line in f if line.strip()]
+
+    svc = client.get_service("CampaignCriterionService")
+    ops = []
+    for term in terms:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = client.get_service("CampaignService").campaign_path(
+            _customer_id(), args.campaign_id)
+        c.negative = True
+        c.keyword.text = term
+        c.keyword.match_type = getattr(client.enums.KeywordMatchTypeEnum, args.match_type)
+        ops.append(op)
+    try:
+        resp = _mutate(client, svc, "MutateCampaignCriteriaRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute,
+                       f"add {len(ops)} {args.match_type} negative(s) to campaign {args.campaign_id}")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def enable_campaign(args):
+    """Flip a campaign to ENABLED. The deliberate go-live action."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+    from google.api_core.protobuf_helpers import field_mask
+
+    svc = client.get_service("CampaignService")
+    op = client.get_type("CampaignOperation")
+    c = op.update
+    c.resource_name = svc.campaign_path(_customer_id(), args.campaign_id)
+    c.status = client.enums.CampaignStatusEnum.ENABLED
+    op.update_mask.CopyFrom(field_mask(None, c._pb))
+    try:
+        resp = _mutate(client, svc, "MutateCampaignsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute, f"ENABLE campaign {args.campaign_id}")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def add_campaign_negative_brand_list(args):
+    """Exclude a BRANDS shared set from a campaign (a brand-safety guard some
+    accounts apply to every non-brand campaign)."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignCriterionService")
+    op = client.get_type("CampaignCriterionOperation")
+    c = op.create
+    c.campaign = client.get_service("CampaignService").campaign_path(
+        _customer_id(), args.campaign_id)
+    c.negative = True
+    c.brand_list.shared_set = client.get_service("SharedSetService").shared_set_path(
+        _customer_id(), args.shared_set_id)
+    try:
+        resp = _mutate(client, svc, "MutateCampaignCriteriaRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"exclude brand list {args.shared_set_id} from campaign {args.campaign_id}")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def attach_shared_set(args):
+    """Attach a shared NEGATIVE_KEYWORDS set to a campaign."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("CampaignSharedSetService")
+    op = client.get_type("CampaignSharedSetOperation")
+    css = op.create
+    css.campaign = client.get_service("CampaignService").campaign_path(
+        _customer_id(), args.campaign_id)
+    css.shared_set = client.get_service("SharedSetService").shared_set_path(
+        _customer_id(), args.shared_set_id)
+    try:
+        resp = _mutate(client, svc, "MutateCampaignSharedSetsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"attach shared set {args.shared_set_id} to campaign {args.campaign_id}")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def set_keyword_urls(args):
+    """Per-keyword final URLs from a TSV of `keyword<TAB>url`.
+
+    ad_group_criterion.final_urls overrides the ad's final_urls for that
+    keyword, so one ad group can route 25 keywords to 25 destinations without
+    splitting into 25 ad groups. Keywords absent from the file keep the ad's
+    URL, which is the safe default - a wrong landing page is worse than a
+    generic one.
+    """
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+    from google.api_core.protobuf_helpers import field_mask
+
+    want = {}
+    with open(args.file, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            kw, url = line.rstrip("\n").split("\t")
+            want[kw.strip().lower()] = url.strip()
+
+    ga = client.get_service("GoogleAdsService")
+    rows = list(ga.search(customer_id=_customer_id(), query=f"""
+        SELECT ad_group_criterion.criterion_id, ad_group_criterion.keyword.text
+        FROM ad_group_criterion
+        WHERE ad_group.id = {args.ad_group_id}
+          AND ad_group_criterion.type = KEYWORD
+          AND ad_group_criterion.status != 'REMOVED'"""))
+
+    svc = client.get_service("AdGroupCriterionService")
+    ops, matched = [], []
+    for r in rows:
+        kw = r.ad_group_criterion.keyword.text.strip().lower()
+        if kw not in want:
+            continue
+        op = client.get_type("AdGroupCriterionOperation")
+        c = op.update
+        c.resource_name = svc.ad_group_criterion_path(
+            _customer_id(), args.ad_group_id, r.ad_group_criterion.criterion_id)
+        c.final_urls.append(want[kw])
+        op.update_mask.CopyFrom(field_mask(None, c._pb))
+        ops.append(op)
+        matched.append(kw)
+
+    missing = sorted(set(want) - set(matched))
+    print(f"  {len(ops)} keyword(s) will be pointed at a specific page")
+    for kw in matched:
+        print(f"    {kw:<32} -> {want[kw]}")
+    if missing:
+        print("  in file but not in ad group:", ", ".join(missing))
+    if not ops:
+        print("nothing to do")
+        return
+    try:
+        resp = _mutate(client, svc, "MutateAdGroupCriteriaRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute, f"set {len(ops)} keyword final URL(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def update_budget(args):
+    """Change a campaign budget's daily amount.
+
+    Prints what else uses the budget before mutating, because a shared budget
+    changes spend for every campaign referencing it, not just the one you had
+    in mind.
+    """
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+    from google.api_core.protobuf_helpers import field_mask
+
+    ga = client.get_service("GoogleAdsService")
+    for r in ga.search(customer_id=_customer_id(), query=f"""
+            SELECT campaign_budget.id, campaign_budget.name,
+                   campaign_budget.amount_micros, campaign_budget.explicitly_shared,
+                   campaign_budget.reference_count
+            FROM campaign_budget WHERE campaign_budget.id = {args.budget_id}"""):
+        b = r.campaign_budget
+        print(f"  '{b.name}' currently ${b.amount_micros/1e6:,.2f}/day "
+              f"-> ${args.daily_amount:,.2f}/day  (shared={b.explicitly_shared}, "
+              f"refs={b.reference_count})")
+        if b.reference_count > 1:
+            print("  !! SHARED BUDGET - this changes every campaign on it")
+
+    svc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignBudgetOperation")
+    b = op.update
+    b.resource_name = svc.campaign_budget_path(_customer_id(), args.budget_id)
+    b.amount_micros = int(round(args.daily_amount * 1_000_000))
+    op.update_mask.CopyFrom(field_mask(None, b._pb))
+    try:
+        resp = _mutate(client, svc, "MutateCampaignBudgetsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"set budget {args.budget_id} to ${args.daily_amount:,.2f}/day")
     except GoogleAdsException as ex:
         _report_failure(ex)
 
@@ -985,7 +1371,85 @@ def main():
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=add_shopping_tier_include)
 
+    p = sub.add_parser("create-budget")
+    p.add_argument("--name", required=True)
+    p.add_argument("--daily-amount", type=float, required=True, help="in account currency")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=create_budget)
+
+    p = sub.add_parser("create-search-campaign")
+    p.add_argument("--name", required=True)
+    p.add_argument("--budget-id", required=True)
+    p.add_argument("--target-roas", type=float)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=create_search_campaign)
+
+    p = sub.add_parser("create-ad-group")
+    p.add_argument("--name", required=True)
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=create_ad_group)
+
+    p = sub.add_parser("copy-rsa")
+    p.add_argument("--source-ad-group-id", required=True)
+    p.add_argument("--target-ad-group-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=copy_rsa)
+
+    p = sub.add_parser("set-campaign-geo")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--geo-target-constant", action="append", required=True,
+                   help="numeric id, e.g. 2840 = United States")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=set_campaign_geo)
+
+    p = sub.add_parser("set-campaign-language")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--language-constant", action="append", required=True,
+                   help="numeric id, e.g. 1000 = English")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=set_campaign_language)
+
+    p = sub.add_parser("add-campaign-negative-keywords")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--file", required=True)
+    p.add_argument("--match-type", default="EXACT",
+                   choices=["BROAD", "PHRASE", "EXACT"])
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=add_campaign_negative_keywords)
+
+    p = sub.add_parser("enable-campaign")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=enable_campaign)
+
+    p = sub.add_parser("add-campaign-negative-brand-list")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--shared-set-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=add_campaign_negative_brand_list)
+
+    p = sub.add_parser("attach-shared-set")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--shared-set-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=attach_shared_set)
+
+    p = sub.add_parser("set-keyword-urls")
+    p.add_argument("--ad-group-id", required=True)
+    p.add_argument("--file", required=True, help="TSV: keyword<TAB>final_url")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=set_keyword_urls)
+
+    p = sub.add_parser("update-budget")
+    p.add_argument("--budget-id", required=True)
+    p.add_argument("--daily-amount", type=float, required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=update_budget)
+
     p = sub.add_parser("add-keywords")
+    p.add_argument("--match-type", default="BROAD",
+                   choices=["BROAD", "PHRASE", "EXACT"])
     p.add_argument("--ad-group-id", required=True)
     p.add_argument("--file", required=True, help="one keyword term per line")
     p.add_argument("--execute", action="store_true")

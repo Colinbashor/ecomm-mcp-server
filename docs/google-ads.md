@@ -12,7 +12,7 @@ current-state campaign/asset/conversion-action configuration.
 | `warehouse/connectors/google_ads.py` | core, via `run_sync.py --only google` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `google_ads_detail_sync.py` | standalone | search terms, keywords + Quality Score, paid-vs-organic overlap, conversion-action attribution, device split, Shopping/PMax product demand, PMax search themes |
 | `google_ads_structure_sync.py` | standalone | current-state snapshots: campaigns, asset groups + assets, listing-group filters, conversion-action setup |
-| `google_ads_mutate.py` | standalone, **write-capable** | pause/remove a campaign or ad group, change bidding strategy or TIS bid ceiling, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment |
+| `google_ads_mutate.py` | standalone, **write-capable** | pause/remove a campaign or ad group, change bidding strategy or TIS bid ceiling, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
 
 The structure connector in particular is aimed at "this campaign looks funded
 but isn't serving" — a question spend/impression metrics alone usually can't
@@ -103,11 +103,61 @@ python google_ads_mutate.py add-pmax-tier-include --asset-group-id 6536885353 \
     --parent-id 12163354837 --dimension custom_label_0 --value "C - Maintain" --execute
 python google_ads_mutate.py add-shopping-tier-include --ad-group-id 118472772345 \
     --parent-id 987651 --dimension custom_label_0 --value "C - Maintain" --execute
+
+# stand up a new Search campaign from scratch — each step validates against
+# REAL prior state rather than building one atomic multi-resource request
+python google_ads_mutate.py create-budget --name "Brand — US" --daily-amount 50 --execute
+python google_ads_mutate.py create-search-campaign --name "Brand — US" --budget-id 22334455 \
+    --target-roas 4.0 --execute
+python google_ads_mutate.py create-ad-group --name "Brand terms" --campaign-id 20593969582 --execute
+python google_ads_mutate.py set-campaign-geo --campaign-id 20593969582 \
+    --geo-target-constant 2840 --execute            # 2840 = United States
+python google_ads_mutate.py set-campaign-language --campaign-id 20593969582 \
+    --language-constant 1000 --execute               # 1000 = English
+python google_ads_mutate.py add-keywords --ad-group-id 118472772345 --file keywords.txt \
+    --match-type EXACT --execute
+python google_ads_mutate.py enable-campaign --campaign-id 20593969582 --execute   # the deliberate go-live step
+
+# copy an existing ENABLED responsive search ad into a new ad group
+python google_ads_mutate.py copy-rsa --source-ad-group-id 118472772345 \
+    --target-ad-group-id 118472772999 --execute
+
+# campaign-level negative keywords + shared negative sets
+python google_ads_mutate.py add-campaign-negative-keywords --campaign-id 20593969582 \
+    --file negatives.txt --match-type EXACT --execute
+python google_ads_mutate.py add-campaign-negative-brand-list --campaign-id 20593969582 \
+    --shared-set-id 998877 --execute
+python google_ads_mutate.py attach-shared-set --campaign-id 20593969582 \
+    --shared-set-id 998877 --execute
+
+# per-keyword landing pages from a TSV of `keyword<TAB>final_url`
+python google_ads_mutate.py set-keyword-urls --ad-group-id 118472772345 --file urls.tsv --execute
+
+# raise or lower a (possibly shared) budget's daily amount
+python google_ads_mutate.py update-budget --budget-id 22334455 --daily-amount 75 --execute
 ```
 
 `remove-campaigns` accepts repeated `--campaign-id` to remove several in one
 mutate request. Always run a subcommand without `--execute` first, read the
 validation result, then re-run with `--execute` once it validates clean.
+
+`create-search-campaign` always creates the campaign **paused** — un-pausing
+(`enable-campaign`) is a deliberate, separate step once ad copy and review are
+done. It also creates no ad: a Search campaign can't serve without one, and
+requiring a human to add ad copy (via the UI, or `copy-rsa` from an existing
+ad group) is both a safety interlock and honest about who owns ad content.
+`create-search-campaign` and `set-campaign-geo`/`set-campaign-language` exist
+because the API has no default for either targeting dimension — an unset
+geo or language target means "target literally everywhere," not "inherit a
+sensible default." `add-keywords`' `--match-type` defaults to `BROAD`
+(preserving its original hardcoded behavior); `add-campaign-negative-keywords`
+defaults to `EXACT` instead, deliberately, since a negative keyword
+defaulting to broad match would exclude a much wider set of queries than
+likely intended.
+
+`update-budget` prints every campaign referencing the budget (and its
+`reference_count`) before mutating, since a shared budget change affects
+every campaign on it, not just the one you had in mind.
 
 `end-experiment` has no `validate_only` mode at all — the API call itself
 isn't dry-runnable, so `--execute` is the *only* thing standing between a
