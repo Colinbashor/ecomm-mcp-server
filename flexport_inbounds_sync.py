@@ -64,6 +64,18 @@ load_dotenv()
 
 BASE = "https://logistics-api.flexport.com/logistics/api/2024-06"
 PAGE = 100                 # this endpoint caps at 100 per page
+# Flexport sits behind AWS API Gateway (look for an x-amz-apigw-id response
+# header), which enforces a hard ~29-second integration timeout. This
+# endpoint's backend cost scales with offset+limit, so a deep-offset crawl at
+# a fixed page size can hit a WALL well before the feed actually ends: past a
+# certain offset, a 100-row page consistently exceeds 29s and the gateway
+# returns `504 {"message": "Endpoint request timed out"}`, while the same
+# offset at a smaller limit succeeds in a few seconds. This is DETERMINISTIC,
+# not transient — retrying the identical request never works, since the
+# gateway will time it out again every time. The fix is to shrink the page on
+# a 504 (see FlexportGatewayTimeout / _request below), not to back off and
+# retry unchanged.
+MIN_PAGE = 10              # floor for the shrink
 DEFAULT_MAX_PAGES = 1000   # runaway guard, well past any realistic shipment count
 _MAX_RETRIES = 12
 _BACKOFF_CAP = 90
@@ -120,6 +132,21 @@ class FlexportTransient(RuntimeError):
     survive) and a re-run converges the snapshot, rather than crashing."""
 
 
+class FlexportGatewayTimeout(FlexportTransient):
+    """A 504 from AWS API Gateway: this exact request is too expensive.
+
+    The remedy is the OPPOSITE of an ordinary transient 5xx — that one wants
+    the same request retried after a wait, this wants a SMALLER request
+    issued immediately, since retrying it unchanged is futile by construction
+    (the gateway will time out the identical request again).
+
+    Subclasses FlexportTransient deliberately: the page-size shrink loop
+    catches this specific type, but if the shrink is exhausted all the way
+    down to MIN_PAGE it still needs to land in the caller's existing
+    graceful-pause/resume path rather than escape as an unhandled traceback.
+    """
+
+
 def _request(path: str, params: dict) -> requests.Response:
     """GET with exponential backoff on transient failures; 401/other-4xx are
     hard-fatal; retry exhaustion raises FlexportTransient so the caller can
@@ -142,6 +169,15 @@ def _request(path: str, params: dict) -> requests.Response:
             continue
         if resp.status_code == 401:
             raise RuntimeError("Flexport 401: token expired or revoked — get a new one from the portal.")
+        if resp.status_code == 504:
+            # Raised, not retried: the gateway killed an over-expensive query
+            # and the identical request will always be over-expensive. The
+            # caller shrinks the page instead of burning the backoff budget.
+            raise FlexportGatewayTimeout(
+                f"504 after {resp.elapsed.total_seconds():.0f}s "
+                f"(params {params}) - request too expensive for the API "
+                f"Gateway's integration timeout"
+            )
         if resp.status_code >= 500:
             last_error = f"{resp.status_code} server error"
             time.sleep(backoff)
@@ -153,11 +189,36 @@ def _request(path: str, params: dict) -> requests.Response:
 
 
 def iter_shipments(max_pages: int):
-    """Yield inbound-shipment dicts, walking offset 0, 100, ... newest-first
-    until a short/empty page (no Link cursor on this endpoint)."""
+    """Yield inbound-shipment dicts, walking offset newest-first to the end.
+
+    Two rules, both learned from a real gateway-timeout incident (see the
+    MIN_PAGE note above):
+
+    1. ON A 504, SHRINK THE PAGE — do not retry it unchanged. The gateway
+       timeout is a function of offset+limit, so a smaller page for the same
+       offset can succeed where the larger one cannot.
+    2. STOP ONLY ON AN EMPTY PAGE, NEVER A SHORT ONE. A short page under an
+       adaptively-shrunk limit is expected and must not be read as
+       end-of-feed — a short page means "that is all this request could
+       carry", not "that is all there is". Past the real end of the feed
+       this endpoint returns 200 with 0 rows, which is an unambiguous
+       terminator.
+
+    Offset advances by the number of rows ACTUALLY returned, so a shrunken
+    page can never skip records.
+    """
     offset = 0
+    limit = PAGE
     for _ in range(max_pages):
-        resp = _request("/inbounds/shipments", {"limit": PAGE, "offset": offset})
+        try:
+            resp = _request("/inbounds/shipments", {"limit": limit, "offset": offset})
+        except FlexportGatewayTimeout:
+            if limit > MIN_PAGE:
+                limit = max(MIN_PAGE, limit // 2)
+                print(f"  [504 at offset {offset}] page too expensive for the "
+                      f"gateway timeout - shrinking to limit={limit}", flush=True)
+                continue
+            raise
         batch = resp.json()
         recs = batch if isinstance(batch, list) else (batch.get("data") or [])
         if not recs:
@@ -165,9 +226,7 @@ def iter_shipments(max_pages: int):
         for rec in recs:
             if isinstance(rec, dict) and rec.get("id"):
                 yield rec
-        if len(recs) < PAGE:
-            return
-        offset += PAGE
+        offset += len(recs)
         time.sleep(0.1)
 
 

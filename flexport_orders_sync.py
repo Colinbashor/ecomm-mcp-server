@@ -229,13 +229,32 @@ class FlexportTransient(RuntimeError):
 _MAX_RETRIES = 12
 _BACKOFF_CAP = 90
 
+# Flexport sits behind AWS API Gateway (look for an x-amz-apigw-id response
+# header), which enforces a hard ~29-second integration timeout, and some
+# endpoints (e.g. /events) run close enough to it that ordinary variance in
+# their own per-request latency tips a page over the edge — not a malformed
+# request or a backend outage, just a request landing right at the ceiling.
+# A 504 here shrinks the page size instead of sleeping and retrying unchanged
+# (see _request below): if the caller uses cursor-based paging this is safe
+# with no call-site change, since a shorter page still returns its own next
+# cursor and nothing can be skipped.
+_MIN_PAGE = 10
+
 
 def _request(path: str, params: dict) -> requests.Response:
     """GET with resilience: connection blips and 429/5xx are retried with
     exponential backoff; 401/other 4xx are hard-fatal; retry exhaustion raises
     FlexportTransient so the caller can pause-and-resume instead of crashing.
-    Returns the Response so callers can read the Link cursor header."""
+    Returns the Response so callers can read the Link cursor header.
+
+    A 504 SHRINKS THE PAGE INSTEAD OF SLEEPING (see the ceiling note above):
+    the gateway killed an over-expensive query, so the identical request is
+    over-expensive too and re-issuing it unchanged is futile. A smaller page
+    is a genuinely different request, so it retries immediately with no
+    backoff.
+    """
     token = os.environ["FLEXPORT_API_TOKEN"]
+    params = dict(params)       # local copy: never mutate the caller's dict
     last_error = None
     bad_cursor = False
     for attempt in range(_MAX_RETRIES):
@@ -255,6 +274,18 @@ def _request(path: str, params: dict) -> requests.Response:
         if resp.status_code == 401:
             raise RuntimeError("Flexport 401: token expired or revoked — "
                                "merchant tokens last about a year; get a new one from the portal.")
+        if resp.status_code == 504:
+            limit = params.get("limit")
+            if isinstance(limit, int) and limit > _MIN_PAGE:
+                params["limit"] = max(_MIN_PAGE, limit // 2)
+                last_error = (f"504 timeout at limit {limit}; shrank to "
+                              f"{params['limit']}")
+                print(f"  [504 after ~29s] {path} too expensive at limit "
+                      f"{limit} - retrying at {params['limit']}", flush=True)
+                continue        # no sleep: a smaller page is a DIFFERENT request
+            last_error = "504 Endpoint request timed out (already at min page)"
+            time.sleep(backoff)
+            continue
         if resp.status_code >= 500:
             last_error = f"{resp.status_code} server error"
             time.sleep(backoff)
