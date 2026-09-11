@@ -281,6 +281,43 @@ class RequestRetryTests(unittest.TestCase):
             with self.assertRaises(fo.FlexportTransient):
                 fo._request("/events", {})
 
+    def test_504_shrinks_the_page_and_retries_immediately(self) -> None:
+        """A 504 means THIS request (at this page size) is too expensive for
+        the API Gateway's own timeout — the fix is a smaller page, issued
+        right away, not a sleep-and-retry of the identical request."""
+        calls = [_resp({}, status=504), _resp({"ok": True})]
+
+        def fake_get(url, params, headers, timeout):
+            return calls.pop(0)
+
+        with patch.object(fo.requests, "get", side_effect=fake_get), \
+             patch.object(fo.time, "sleep") as sleep_mock, \
+             patch.dict(fo.os.environ, {"FLEXPORT_API_TOKEN": "tok"}):
+            resp = fo._request("/events", {"limit": 100})
+        self.assertEqual(resp.json(), {"ok": True})
+        sleep_mock.assert_not_called()  # shrink retries immediately, no backoff
+
+    def test_504_does_not_mutate_the_callers_params_dict(self) -> None:
+        calls = [_resp({}, status=504), _resp({"ok": True})]
+
+        def fake_get(url, params, headers, timeout):
+            return calls.pop(0)
+
+        original = {"limit": 100}
+        with patch.object(fo.requests, "get", side_effect=fake_get), \
+             patch.object(fo.time, "sleep"), \
+             patch.dict(fo.os.environ, {"FLEXPORT_API_TOKEN": "tok"}):
+            fo._request("/events", original)
+        self.assertEqual(original["limit"], 100)
+
+    def test_504_at_min_page_falls_back_to_backoff_sleep(self) -> None:
+        with patch.object(fo.requests, "get", return_value=_resp({}, status=504)), \
+             patch.object(fo.time, "sleep") as sleep_mock, \
+             patch.dict(fo.os.environ, {"FLEXPORT_API_TOKEN": "tok"}):
+            with self.assertRaises(fo.FlexportTransient):
+                fo._request("/events", {"limit": fo._MIN_PAGE})
+        sleep_mock.assert_called()
+
 
 class RowBuildingTests(unittest.TestCase):
     def test_rows_for_order_flags_international_and_sums_weight(self) -> None:

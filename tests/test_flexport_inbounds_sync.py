@@ -30,22 +30,31 @@ class SchemaTests(unittest.TestCase):
 
 class OffsetPaginationTests(unittest.TestCase):
     """Unlike the orders/returns endpoints, this one has no Link cursor at
-    all — plain offset paging that stops on a short/empty page."""
+    all — plain offset paging that stops ONLY on a genuinely empty page.
 
-    def test_walks_offset_until_short_page(self) -> None:
+    A short page must NOT stop the walk: under the adaptive gateway-timeout
+    shrink (see AdaptivePageShrinkTests below), a page smaller than the
+    nominal PAGE size is expected and does not mean the feed has ended."""
+
+    def test_walks_offset_past_a_short_page_until_truly_empty(self) -> None:
         full_page = [{"id": f"S{i}"} for i in range(fi.PAGE)]
-        short_page = [{"id": "SLAST"}]
+        short_page = [{"id": "SLAST"}]  # short but NOT empty: must not stop the walk
         calls = []
 
         def fake_request(path, params):
             calls.append(dict(params))
-            return _resp(full_page if params["offset"] == 0 else short_page)
+            if params["offset"] == 0:
+                return _resp(full_page)
+            if params["offset"] == fi.PAGE:
+                return _resp(short_page)
+            return _resp([])
 
         with patch.object(fi, "_request", side_effect=fake_request), patch.object(fi.time, "sleep"):
             recs = list(fi.iter_shipments(max_pages=10))
 
         self.assertEqual(len(recs), fi.PAGE + 1)
-        self.assertEqual([c["offset"] for c in calls], [0, fi.PAGE])
+        # offset advances by rows ACTUALLY returned, not the nominal page size
+        self.assertEqual([c["offset"] for c in calls], [0, fi.PAGE, fi.PAGE + 1])
 
     def test_stops_immediately_on_empty_first_page(self) -> None:
         with patch.object(fi, "_request", return_value=_resp([])), patch.object(fi.time, "sleep"):
@@ -56,6 +65,40 @@ class OffsetPaginationTests(unittest.TestCase):
         with patch.object(fi, "_request", return_value=_resp(page)), patch.object(fi.time, "sleep"):
             recs = list(fi.iter_shipments(max_pages=1))
         self.assertEqual(recs, [{"id": "OK"}])
+
+
+class AdaptivePageShrinkTests(unittest.TestCase):
+    """A 504 from the API Gateway means THIS request is too expensive at its
+    current page size — the fix is to shrink the page, not to back off and
+    retry the identical request."""
+
+    def test_shrinks_page_on_gateway_timeout_and_keeps_going(self) -> None:
+        calls = []
+
+        def fake_request(path, params):
+            calls.append(dict(params))
+            if params["limit"] == fi.PAGE:
+                raise fi.FlexportGatewayTimeout("504 too expensive")
+            if len(calls) == 2:
+                return _resp([{"id": "S1"}])
+            return _resp([])
+
+        with patch.object(fi, "_request", side_effect=fake_request), patch.object(fi.time, "sleep"):
+            recs = list(fi.iter_shipments(max_pages=5))
+
+        self.assertEqual(recs, [{"id": "S1"}])
+        self.assertEqual(calls[0]["limit"], fi.PAGE)
+        self.assertLess(calls[1]["limit"], fi.PAGE)
+        self.assertGreaterEqual(calls[1]["limit"], fi.MIN_PAGE)
+
+    def test_reraises_gateway_timeout_once_min_page_is_reached(self) -> None:
+        with patch.object(fi, "_request", side_effect=fi.FlexportGatewayTimeout("504")), \
+                patch.object(fi.time, "sleep"):
+            with self.assertRaises(fi.FlexportGatewayTimeout):
+                list(fi.iter_shipments(max_pages=20))
+
+    def test_gateway_timeout_is_a_flexport_transient_subclass(self) -> None:
+        self.assertTrue(issubclass(fi.FlexportGatewayTimeout, fi.FlexportTransient))
 
 
 class RowBuildingTests(unittest.TestCase):

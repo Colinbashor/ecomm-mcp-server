@@ -94,6 +94,37 @@ pause/resume handling — a transient failure there fails the run outright
 rather than pausing, so don't assume identical resilience across all three
 crawlers.
 
+**Both crawlers shrink their page size on a 504, rather than retrying the
+identical request.** Flexport sits behind AWS API Gateway (look for an
+`x-amz-apigw-id` response header), which enforces a hard ~29-second
+integration timeout. Some endpoints' backend cost scales with page size (and,
+for offset-paginated endpoints, with offset too), so a deep crawl at a fixed
+page size can hit a wall well before the feed actually ends — past a certain
+point every request at that page size consistently exceeds 29s and comes back
+as `504 {"message": "Endpoint request timed out"}`, while the identical
+request at a smaller page size succeeds in a few seconds. This is
+deterministic, not transient: retrying the identical request never works. A
+504 raises `FlexportGatewayTimeout` (a `FlexportTransient` subclass), which
+the pagination loop catches to halve the page size and retry immediately (no
+backoff, since a smaller page is a genuinely different, cheaper request); an
+exhausted shrink still lands in the ordinary graceful-pause path. If you add
+another paginated Flexport caller, measure its own per-page latency at a few
+page sizes before assuming one page size is safe everywhere — the two
+existing crawlers needed different steady-state sizes because their cost
+profiles differ (`flexport_inbounds_sync.py`'s offset-based `/inbounds/shipments`
+scales with offset+limit and shrinks-then-recovers; `flexport_orders_sync.py`'s
+cursor-based `/events` has a mostly-fixed per-request cost close to the
+ceiling regardless of page size, so it keeps a larger default page and just
+tolerates the occasional shrink-and-retry).
+
+For offset-based pagination specifically (`flexport_inbounds_sync.py`), the
+walk must also stop **only on a genuinely empty page, never a short one** — a
+short page under an adaptively-shrunk limit is expected and does not mean the
+feed has ended, and the offset must advance by the number of rows *actually*
+returned rather than the requested page size, so a shrunk page can't skip
+records. Cursor-based pagination doesn't have this trap: a shorter page still
+returns its own valid next-cursor with no call-site change needed.
+
 ## Tests
 
 `tests/test_flexport_sync.py`, `tests/test_flexport_orders_sync.py`,
