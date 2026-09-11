@@ -66,6 +66,8 @@ class MutateDispatchTests(unittest.TestCase):
     def test_each_known_request_type_dispatches_to_its_own_method(self):
         expected = {
             "MutateCampaignsRequest": "mutate_campaigns",
+            "MutateCampaignBudgetsRequest": "mutate_campaign_budgets",
+            "MutateAdGroupAdsRequest": "mutate_ad_group_ads",
             "MutateAssetGroupListingGroupFiltersRequest":
                 "mutate_asset_group_listing_group_filters",
             "MutateAssetGroupAssetsRequest": "mutate_asset_group_assets",
@@ -74,6 +76,7 @@ class MutateDispatchTests(unittest.TestCase):
             "MutateAdGroupsRequest": "mutate_ad_groups",
             "MutateAudiencesRequest": "mutate_audiences",
             "MutateCampaignCriteriaRequest": "mutate_campaign_criteria",
+            "MutateCampaignSharedSetsRequest": "mutate_campaign_shared_sets",
         }
         for request_type, method_name in expected.items():
             client = self._client()
@@ -127,6 +130,36 @@ class ArgparseWiringTests(unittest.TestCase):
         p.add_argument("--dimension", required=True, choices=gam.CUSTOM_LABEL_INDEX)
         p.add_argument("--include", action="append", required=True)
         p.add_argument("--cpc-bid-micros", type=int, default=10000)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("create-budget")
+        p.add_argument("--name", required=True)
+        p.add_argument("--daily-amount", type=float, required=True)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("create-search-campaign")
+        p.add_argument("--name", required=True)
+        p.add_argument("--budget-id", required=True)
+        p.add_argument("--target-roas", type=float)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("add-campaign-negative-keywords")
+        p.add_argument("--campaign-id", required=True)
+        p.add_argument("--file", required=True)
+        p.add_argument("--match-type", default="EXACT",
+                       choices=["BROAD", "PHRASE", "EXACT"])
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("add-keywords")
+        p.add_argument("--match-type", default="BROAD",
+                       choices=["BROAD", "PHRASE", "EXACT"])
+        p.add_argument("--ad-group-id", required=True)
+        p.add_argument("--file", required=True)
+        p.add_argument("--execute", action="store_true")
+
+        p = sub.add_parser("set-campaign-geo")
+        p.add_argument("--campaign-id", required=True)
+        p.add_argument("--geo-target-constant", action="append", required=True)
         p.add_argument("--execute", action="store_true")
         return ap
 
@@ -194,6 +227,36 @@ class ArgparseWiringTests(unittest.TestCase):
             "--dimension", "custom_label_0", "--include", "A"])
         self.assertEqual(args.parent_dimension, "product_brand")
 
+    def test_create_budget_requires_name_and_daily_amount(self):
+        with self.assertRaises(SystemExit):
+            self._parser().parse_args(["create-budget", "--name", "Test Budget"])
+
+    def test_create_search_campaign_target_roas_is_optional(self):
+        args = self._parser().parse_args([
+            "create-search-campaign", "--name", "Test", "--budget-id", "1"])
+        self.assertIsNone(args.target_roas)
+
+    def test_add_campaign_negative_keywords_defaults_to_exact_match(self):
+        """Deliberately a DIFFERENT default from add-keywords (BROAD): a
+        negative keyword defaulting to broad match would exclude a much wider
+        set of queries than the operator likely intended."""
+        args = self._parser().parse_args([
+            "add-campaign-negative-keywords", "--campaign-id", "1", "--file", "f.txt"])
+        self.assertEqual(args.match_type, "EXACT")
+
+    def test_add_keywords_defaults_to_broad_match(self):
+        """Preserves add_keywords' pre-existing hardcoded behavior now that
+        --match-type is a flag rather than an always-BROAD constant."""
+        args = self._parser().parse_args([
+            "add-keywords", "--ad-group-id", "1", "--file", "f.txt"])
+        self.assertEqual(args.match_type, "BROAD")
+
+    def test_set_campaign_geo_accepts_multiple_targets(self):
+        args = self._parser().parse_args([
+            "set-campaign-geo", "--campaign-id", "1",
+            "--geo-target-constant", "2840", "--geo-target-constant", "2124"])
+        self.assertEqual(args.geo_target_constant, ["2840", "2124"])
+
 
 class AudienceGuardTests(unittest.TestCase):
     """add_audience_user_lists / remove_audience_segment both read the target
@@ -223,6 +286,40 @@ class AudienceGuardTests(unittest.TestCase):
              mock.patch.object(gam, "_customer_id", return_value="1"):
             with self.assertRaises(SystemExit):
                 gam.remove_audience_segment(args)
+
+
+class CopyRsaGuardTests(unittest.TestCase):
+    """copy_rsa reads the source ad group's ENABLED responsive search ad via
+    a GAQL search before building anything to clone -- if none is found, it
+    must exit loudly rather than build a create operation against an empty
+    ad."""
+
+    def test_exits_when_no_enabled_rsa_in_source_ad_group(self):
+        client = mock.Mock()
+        ga_service = mock.Mock()
+        ga_service.search.return_value = []
+        client.get_service.return_value = ga_service
+        args = SimpleNamespace(source_ad_group_id="1", target_ad_group_id="2", execute=False)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="999"):
+            with self.assertRaises(SystemExit):
+                gam.copy_rsa(args)
+
+
+class CreateSearchCampaignTests(unittest.TestCase):
+    """A newly created search campaign must always land PAUSED -- going live
+    is a separate, deliberate action (enable-campaign), never a side effect
+    of creation."""
+
+    def test_new_campaign_status_is_paused(self):
+        client = mock.Mock()
+        args = SimpleNamespace(name="Test", budget_id="1", target_roas=None, execute=False)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="999"):
+            gam.create_search_campaign(args)
+        sent_request = client.get_service.return_value.mutate_campaigns.call_args.kwargs["request"]
+        created_campaign = sent_request.operations[0].create
+        self.assertEqual(created_campaign.status, client.enums.CampaignStatusEnum.PAUSED)
 
 
 if __name__ == "__main__":
