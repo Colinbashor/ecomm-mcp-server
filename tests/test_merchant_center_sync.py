@@ -402,6 +402,28 @@ class RowShapeTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+#  empty-pull logging
+# --------------------------------------------------------------------------- #
+class LogGrainTests(unittest.TestCase):
+    """A grain that logs `ok` on any request that didn't raise — ignoring the
+    row count — reads identically whether nothing changed today or the feed
+    has silently stopped advancing. `_log_grain` must distinguish the two."""
+
+    def test_nonzero_rows_log_ok(self) -> None:
+        with patch.object(gmc.db, "log_sync") as log_sync:
+            gmc._log_grain("gmc_pricing", "2026-01-01T00:00:00", 42)
+        log_sync.assert_called_once_with("gmc_pricing", "2026-01-01T00:00:00", 42, "ok")
+
+    def test_zero_rows_log_degraded_not_ok(self) -> None:
+        with patch.object(gmc.db, "log_sync") as log_sync:
+            gmc._log_grain("gmc_visibility", "2026-01-01T00:00:00", 0)
+        args, _ = log_sync.call_args
+        self.assertEqual(args[0], "gmc_visibility")
+        self.assertEqual(args[2], 0)
+        self.assertEqual(args[3], "degraded")
+
+
+# --------------------------------------------------------------------------- #
 #  CLI-level failure mode
 # --------------------------------------------------------------------------- #
 class MainEnvGuardTests(unittest.TestCase):

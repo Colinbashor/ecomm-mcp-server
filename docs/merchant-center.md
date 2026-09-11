@@ -78,6 +78,15 @@ The sync distinguishes throttling (retry the same request) from a permanent
 per-item error (skip and move on) rather than retrying everything uniformly
 — see the module docstring if you're debugging a partial/`"degraded"` run.
 
+**Every grain logs `"degraded"` (never `"ok"`) on a pull that returned zero
+rows.** A grain that logs `"ok"` on any request that didn't raise — ignoring
+the row count entirely — reads identically in `sync_log` whether nothing
+changed today or the feed has silently stopped advancing; a run of "ok, 0
+rows" looks exactly like "ok, quiet day" until someone happens to check the
+table directly. This does *not* change the process exit code (an empty pull
+isn't a resumable pause), it just makes the log line honest so a downstream
+health check can tell the two cases apart — see `_log_grain()`.
+
 ## Tests
 
 `tests/test_merchant_center_sync.py`

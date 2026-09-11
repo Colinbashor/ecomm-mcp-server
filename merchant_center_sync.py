@@ -958,6 +958,31 @@ def _parse_category(spec: str) -> dict:
     return {"id": int(cid), "name": name}
 
 
+def _log_grain(platform: str, started: str, rows: int) -> None:
+    """Log a completed grain, treating an EMPTY pull as degraded, never `ok`.
+
+    A grain that logs `"ok"` on any request that didn't raise — ignoring the
+    row count entirely — can hide a real outage for as long as the upstream
+    keeps answering with 200 and zero rows: a run of "ok, 0 rows" reads
+    identically to "ok, nothing changed today" in a sync_log listing, so a
+    feed that has silently stopped advancing looks indistinguishable from a
+    quiet day until someone happens to check the table directly.
+
+    This does NOT change the process exit code — an empty pull isn't a
+    resumable pause (that's a `degraded`/paused exit reserved for a connector
+    checkpointing through a real upstream fault); it's a downstream health
+    check's job to decide when a streak of empty pulls becomes an error.
+    """
+    if rows:
+        db.log_sync(platform, started, rows, "ok")
+        return
+    db.log_sync(
+        platform, started, 0, "degraded",
+        "request succeeded but returned NO rows — an empty pull is not a "
+        "healthy pull",
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1019,7 +1044,7 @@ def main() -> None:
                 db.log_sync("gmc_performance", started, n, "degraded",
                             f"backfill paused (throttled); resume --start {resume}")
             else:
-                db.log_sync("gmc_performance", started, n, "ok")
+                _log_grain("gmc_performance", started, n)
             print(f"  performance: {n:,} rows")
         except Exception as exc:  # noqa: BLE001 — logged and continued
             failed = True
@@ -1030,7 +1055,7 @@ def main() -> None:
         started = db.now()
         try:
             n = sync_status(conn, client)
-            db.log_sync("gmc_status", started, n, "ok")
+            _log_grain("gmc_status", started, n)
             print(f"  status: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
             failed = True
@@ -1041,7 +1066,7 @@ def main() -> None:
         started = db.now()
         try:
             n = sync_pricing(conn, client)
-            db.log_sync("gmc_pricing", started, n, "ok")
+            _log_grain("gmc_pricing", started, n)
             print(f"  pricing: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
             failed = True
@@ -1053,7 +1078,7 @@ def main() -> None:
         try:
             n = sync_best_sellers(conn, client, categories, countries, args.top_n)
             n += sync_best_seller_brands(conn, client, categories, countries, brands, args.top_n)
-            db.log_sync("gmc_bestsellers", started, n, "ok")
+            _log_grain("gmc_bestsellers", started, n)
             print(f"  bestsellers: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
             failed = True
@@ -1071,7 +1096,7 @@ def main() -> None:
                 print(f"  visibility window {vis_start} .. {vis_end} "
                       f"(lag-shifted {VISIBILITY_LAG_DAYS}d — see VISIBILITY_LAG_DAYS)")
             n = sync_visibility(conn, client, categories, countries, vis_start, vis_end)
-            db.log_sync("gmc_visibility", started, n, "ok")
+            _log_grain("gmc_visibility", started, n)
             print(f"  visibility: {n:,} rows")
         except Exception as exc:  # noqa: BLE001
             failed = True
