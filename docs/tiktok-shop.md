@@ -43,13 +43,31 @@ configure.
 
 ```bash
 python run_sync.py --only tiktok      # core orders, last 7 days
-python tiktok_videos_sync.py
-python tiktok_live_sync.py
-python tiktok_creators_sync.py api      # or `import path/to/export.csv` for the manual path
-python tiktok_analytics_sync.py
+
+python tiktok_videos_sync.py                       # trailing 30 days (default)
+python tiktok_videos_sync.py --days 60
+python tiktok_videos_sync.py --start 2026-01-01 --end 2026-01-31
+python tiktok_videos_sync.py --current-window      # trailing 30 days ending tomorrow -- for a daily cron
+python tiktok_videos_sync.py --account-types AFFILIATES     # default is AFFILIATES,LINKED_ACCOUNTS; also accepts ALL
+python tiktok_videos_sync.py --gmv-positive-only   # cheaper: stop paging at the first zero-GMV video
+
+python tiktok_live_sync.py                         # both lives + per-product funnel, trailing 30 days
+python tiktok_live_sync.py --only lives             # or `products` -- skip the other half
+python tiktok_live_sync.py --account-types ALL      # default OFFICIAL_ACCOUNTS,AFFILIATE_ACCOUNTS,MARKETING_ACCOUNTS
+python tiktok_live_sync.py --dates 2026-01-05,2026-01-06   # force specific days for the products crawl
+
+python tiktok_creators_sync.py api                  # or `import path/to/export.csv` for the manual path
+python tiktok_creators_sync.py import --dir exports/   # import every .xlsx/.csv in a folder
+python tiktok_creators_sync.py api --dry-run        # fetch + report, write nothing (also on `import`)
+
+python tiktok_analytics_sync.py                     # trailing 30 days (default)
+python tiktok_analytics_sync.py --start 2026-01-01 --end 2026-01-31
+python tiktok_analytics_sync.py --dry-run           # fetch and report, write nothing
+
 python tiktok_finance_sync.py                 # settlements, last 30 days
 python tiktok_finance_sync.py --backfill      # 365-day window
 python tiktok_finance_sync.py --no-components # statements only, fast
+python tiktok_finance_sync.py --no-orders     # skip retaining per-order fee rows (statements + components only)
 ```
 
 ## Tables

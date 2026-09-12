@@ -30,6 +30,11 @@ Two auth modes — pick one:
    `KlaviyoAuthError`. Together they write `KLAVIYO_CLIENT_ID`,
    `KLAVIYO_CLIENT_SECRET`, and `KLAVIYO_REFRESH_TOKEN`. `klaviyo_sync.py`
    prefers OAuth automatically whenever all three are set.
+2. Two more OAuth variables have sensible defaults and rarely need touching:
+   `KLAVIYO_REDIRECT_URI` (default `https://localhost` — no trailing slash)
+   must match what's registered on the OAuth client if you change it, and
+   `KLAVIYO_OAUTH_SCOPES` overrides the requested scope set if the default
+   doesn't fit your use case.
 
 Either way, also set:
 

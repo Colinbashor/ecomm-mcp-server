@@ -91,7 +91,7 @@ writes, and its test coverage.
 
 | Platform | Doc | Core connector | Standalone extras |
 |---|---|---|---|
-| Google Ads | [docs/google-ads.md](docs/google-ads.md) | campaign spend/clicks/conversions | search terms, keywords, Shopping/PMax demand, campaign structure |
+| Google Ads | [docs/google-ads.md](docs/google-ads.md) | campaign spend/clicks/conversions | search terms, keywords, Shopping/PMax demand, campaign structure; **write-capable** `google_ads_mutate.py` for pausing/creating/editing live campaigns |
 | Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages, new-vs-returning |
 | Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
 | Google Search Console | [docs/search-console.md](docs/search-console.md) | — | organic search clicks/impressions/position by query and landing page |
@@ -104,7 +104,7 @@ writes, and its test coverage.
 | Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | campaign/flow performance, audience growth, attributed revenue |
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
-| Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics |
+| Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics; **write-capable** `reacher_sample_limits.py` for capping/clearing per-product sample auto-approval |
 | Algolia (on-site search/browse) | [docs/algolia.md](docs/algolia.md) | — | collection-grid placement, search/browse engagement |
 | Factory production tracking | [docs/factory-production.md](docs/factory-production.md) | — | manual-drop vendor spreadsheets, header-matched into one table |
 
