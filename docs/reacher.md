@@ -141,13 +141,16 @@ that guard stays absolute.
 python reacher_sample_limits.py zero --product-id 1729401428505563994             # dry run
 python reacher_sample_limits.py zero --product-id 1729401428505563994 --yes       # actually cap it to 0
 python reacher_sample_limits.py zero --sku YOUR-SKU --reason "selling out" --yes
+python reacher_sample_limits.py zero --product-id 1729401428505563994 --limit 5 --yes  # cap to 5, not 0
 python reacher_sample_limits.py reset --product-id 1729401428505563994 --yes      # clear the cap
 python reacher_sample_limits.py reset --all --yes                                 # clear every override this tool set
 python reacher_sample_limits.py status                                            # tracked overrides + live drift check
 ```
 
 **Every command defaults to a dry run** that prints what it would do; pass
-`--yes` to actually call the API.
+`--yes` to actually call the API. `zero` defaults to a cap of `0`; pass
+`--limit N` to cap at some other positive number instead (the subcommand name
+is a bit of a misnomer once you use `--limit`).
 
 **Identity:** a Reacher `productId` is your TikTok Shop SPU (item_group_id).
 This script needs no warehouse table to resolve one — pass `--product-id`
