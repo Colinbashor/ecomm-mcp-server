@@ -57,6 +57,7 @@ USAGE:
   python merchant_center_sync.py --category 166:"Apparel & Accessories" --country US --country GB
   python merchant_center_sync.py --brand "Your Brand" --brand "Competitor Brand"
   python merchant_center_sync.py --backfill                          # walk performance back until it runs dry
+  python merchant_center_sync.py --only bestsellers --report-date 2026-08-24  # targeted manual backfill of one date
 
 GOTCHAS WORTH KNOWING BEFORE YOU MODIFY THIS FILE
 --------------------------------------------------
@@ -114,11 +115,23 @@ time; adjust or drop this parsing entirely for your own id scheme.
 BEST SELLERS IS A MARKET RANKING, NOT YOUR OWN SALES. It answers "what's in
 demand in this category across all of Google Shopping", not "what do we
 sell". Two things follow from that:
-  * SNAPSHOT-ONLY, NO BACKFILL. Exactly one report_date is retrievable per
-    granularity at any given time, and the API rejects a >= or BETWEEN filter
-    on report_date. History exists only because each run stores a new
-    snapshot — there is no way to ask for last month's report once this
-    month's has replaced it.
+  * THE API REJECTS A RANGE FILTER ON report_date (a >= or BETWEEN clause both
+    error with "operator cannot be applied to 'report_date'"), which is easy
+    to misread as "this report is snapshot-only, no backfill possible" — it
+    isn't. A plain EQUALITY filter (`report_date = 'YYYY-MM-DD'`) works fine
+    and returns that date's full report, as long as the date is one Google
+    actually published (WEEKLY report_date values are Mondays, MONTHLY are the
+    1st of the month) and isn't so old it's aged out of Google's own retention.
+    Without a report_date filter at all, the API serves only whichever report
+    is CURRENT — that's the case a naive daily sync hits, and the one that
+    creates the illusion of "no history": a sync that misses a day doesn't
+    just skip a snapshot, it can permanently lose whichever report_date was
+    current on exactly that day once a newer one replaces it. `heal_best_sellers()`
+    below closes that gap: it walks recent report_date candidates, finds which
+    ones this database doesn't hold yet, and re-asks for exactly those with the
+    equality filter — at zero extra API cost on a run with no gap to heal. See
+    "HEALING A MISSED report_date" further down for the mechanics and the one
+    trap (never batch multiple dates into one query).
   * A PLAIN TOP-N CUT CAN MISS EVERYTHING YOU ACTUALLY STOCK. Categories can
     hold tens of thousands of ranked products, and most retailers carry only
     a sliver of any one category's total catalog — so a bare "top 1,000"
@@ -128,6 +141,23 @@ sell". Two things follow from that:
     indicates you carry that product, regardless of its rank. Each stored
     row records which query produced it in `pull_reason`, so a gap in the
     rank sequence is never mistaken for missing data.
+
+HEALING A MISSED report_date. `heal_best_sellers()` enumerates every
+report_date Google could plausibly have published by now (`best_seller_candidates()`
+— Mondays for WEEKLY, month-starts for MONTHLY, going back BEST_SELLER_HEAL_WEEKS/
+_MONTHS, and only counting a date as due once it's at least BEST_SELLER_DUE_DAYS
+old, since Google publishes these reports well in arrears and the lag varies), diffs
+that list against what `gmc_best_seller_coverage` already holds, and re-pulls only
+the gaps. This costs zero API calls on a normal run. A missing date is recorded in
+`gmc_best_seller_coverage` either way (found or "not published yet") — same
+"record what was asked, absence of rows is never the resume marker" pattern used
+elsewhere in this codebase — so a date Google will genuinely never publish (older
+than the heal window) simply drops off the candidate list instead of being re-asked
+forever. ONE report_date PER QUERY, NEVER `report_date IN (...)`: the API accepts
+`IN (...)` but the top_n variant's `LIMIT n` applies to the COMBINED result set
+across every date in the clause, not per date — two dates queried together can each
+come back with roughly half the rows a single-date query would return, with no
+error, which is a much worse failure mode than an outright rejection.
 
 COMPETITIVE VISIBILITY VARIES BY traffic_source. The `ALL` / `ADS` / `ORGANIC`
 values return genuinely different competitor rank orderings for the same
@@ -162,7 +192,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import requests
 from google.oauth2 import service_account
@@ -304,6 +334,23 @@ CREATE TABLE IF NOT EXISTS gmc_best_seller_brands (
     pull_reason          TEXT,  -- 'top_n' | 'tracked_brand'
     synced_at            TEXT NOT NULL,
     PRIMARY KEY (report_date, report_granularity, report_country_code, report_category_id, rank)
+);
+
+CREATE TABLE IF NOT EXISTS gmc_best_seller_coverage (
+    -- Records what was ASKED (one row per report_date this connector has
+    -- ever requested with an equality filter), never derived from what
+    -- gmc_best_sellers happens to hold — a legitimately unpublished date
+    -- must stay distinguishable from a date nobody has checked yet. See
+    -- "HEALING A MISSED report_date" in the module docstring.
+    report_granularity   TEXT NOT NULL,  -- 'WEEKLY' | 'MONTHLY'
+    report_country_code  TEXT NOT NULL,
+    report_date          TEXT NOT NULL,
+    rows_returned        INTEGER NOT NULL,
+    is_present            INTEGER NOT NULL,  -- 0 if Google had nothing for this date yet
+    attempts              INTEGER NOT NULL DEFAULT 1,
+    first_asked_at        TEXT NOT NULL,
+    last_asked_at         TEXT NOT NULL,
+    PRIMARY KEY (report_granularity, report_country_code, report_date)
 );
 
 CREATE TABLE IF NOT EXISTS gmc_competitive_visibility (
@@ -711,14 +758,146 @@ VALUES (:report_date, :report_granularity, :report_country_code,
 """
 
 
+# --------------------------------------------------------------------------- #
+#  best sellers: healing a missed report_date
+# --------------------------------------------------------------------------- #
+# How far back a hole is still worth chasing. This IS the give-up guard: a
+# report_date that ages past the window drops out of the candidate list, so
+# the poison case (a date Google will never publish, re-asked forever) is
+# bounded by construction rather than by an attempt counter that could
+# expire a date while Google is merely running late.
+BEST_SELLER_HEAL_WEEKS = 8
+BEST_SELLER_HEAL_MONTHS = 3
+
+# ...and how long to wait before calling a date missing AT ALL. Google
+# publishes best sellers well in arrears and the lag varies — verify it for
+# your own account (compare the newest report_date on hand against today)
+# before trusting this default. Asking earlier than the true lag just burns
+# queries on a report that doesn't exist yet and makes the coverage table
+# read as failure.
+BEST_SELLER_DUE_DAYS = 14
+
+
+def _report_date_clause(report_date: str | None) -> str:
+    """The exact-equals filter, or nothing at all.
+
+    Nothing at all is NOT the same as "all dates" — an unfiltered best-sellers
+    query returns only the CURRENT report. That asymmetry is the whole reason
+    the heal pass exists, so it's stated here rather than at each call site.
+
+    ONE DATE PER QUERY, deliberately — see "HEALING A MISSED report_date" in
+    the module docstring for why `report_date IN (...)` silently halves the
+    top_n cut instead of erroring."""
+    return f" AND report_date = '{report_date}'" if report_date else ""
+
+
+def best_seller_candidates(granularity: str, today: dt.date,
+                            weeks: int = BEST_SELLER_HEAL_WEEKS,
+                            months: int = BEST_SELLER_HEAL_MONTHS,
+                            due_days: int = BEST_SELLER_DUE_DAYS
+                            ) -> tuple[str, ...]:
+    """Every report_date Google could plausibly have published by now.
+
+    WEEKLY report_date is the Monday a week starts and MONTHLY is the first
+    of the month — enumerating them is what lets a hole be named without a
+    range query the API won't accept.
+
+    Newest first, and only dates at least `due_days` old."""
+    out: list[dt.date] = []
+    if granularity == "WEEKLY":
+        cursor = today - dt.timedelta(days=today.weekday())   # this Monday
+        for _ in range(weeks):
+            out.append(cursor)
+            cursor -= dt.timedelta(days=7)
+    elif granularity == "MONTHLY":
+        cursor = today.replace(day=1)
+        for _ in range(months):
+            out.append(cursor)
+            cursor = (cursor - dt.timedelta(days=1)).replace(day=1)
+    else:
+        raise ValueError(f"unknown granularity {granularity!r}")
+    return tuple(d.isoformat() for d in out if (today - d).days >= due_days)
+
+
+def missing_report_dates(held: set[str], candidates: Sequence[str]) -> tuple[str, ...]:
+    """Candidates we hold no row for, oldest first.
+
+    Oldest first deliberately: if a run is cut short, the dates nearest
+    falling out of the give-up window are the ones already fetched."""
+    return tuple(sorted(d for d in candidates if d not in held))
+
+
+def _held_report_dates(conn, country: str, granularity: str) -> set[str]:
+    return {r[0] for r in conn.execute(
+        "SELECT DISTINCT report_date FROM gmc_best_sellers "
+        "WHERE report_country_code = ? AND report_granularity = ?",
+        (country, granularity))}
+
+
+def _record_coverage(conn, granularity: str, country: str,
+                      report_date: str, rows: int) -> None:
+    """Record the ASK. See gmc_best_seller_coverage's comment in the DDL."""
+    now = db.now()
+    with conn:
+        conn.execute(
+            "INSERT INTO gmc_best_seller_coverage "
+            " (report_granularity, report_country_code, report_date, "
+            "  rows_returned, is_present, attempts, first_asked_at, "
+            "  last_asked_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?) "
+            "ON CONFLICT(report_granularity, report_country_code, report_date) "
+            "DO UPDATE SET rows_returned = excluded.rows_returned, "
+            "  is_present = excluded.is_present, "
+            "  attempts = attempts + 1, "
+            "  last_asked_at = excluded.last_asked_at",
+            (granularity, country, report_date, rows, int(rows > 0), now, now))
+
+
+def heal_best_sellers(conn, client: Client, categories, countries, brands,
+                       top_n: int = DEFAULT_TOP_N,
+                       granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY"),
+                       today: dt.date | None = None) -> int:
+    """Fetch any report_date we're missing that Google is old enough to have.
+
+    Costs ZERO queries when there's no hole, which is the normal case — the
+    candidate list is compared against what's already held before anything
+    is requested."""
+    today = today or dt.date.today()
+    total = 0
+    for country in countries:
+        for gran in granularities:
+            candidates = best_seller_candidates(gran, today)
+            missing = missing_report_dates(
+                _held_report_dates(conn, country, gran), candidates)
+            for d in missing:
+                # One date per call — see _report_date_clause on why batching
+                # these silently halves the top_n cut.
+                n = sync_best_sellers(conn, client, categories, (country,), top_n,
+                                       (gran,), report_date=d)
+                n += sync_best_seller_brands(conn, client, categories, (country,),
+                                              brands, top_n, (gran,), report_date=d)
+                _record_coverage(conn, gran, country, d, n)
+                total += n
+                # An empty answer isn't a failure here — it means Google
+                # hasn't published that date yet. The coverage row is what
+                # keeps those two cases distinguishable instead of
+                # re-guessing every run.
+                print(f"  heal {gran:7} {country} {d}: {n:,} rows"
+                      f"{'' if n else '  (not published)'}")
+    return total
+
+
 def sync_best_sellers(conn, client: Client, categories, countries,
                        top_n: int = DEFAULT_TOP_N,
-                       granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY")) -> int:
+                       granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY"),
+                       report_date: str | None = None) -> int:
     """Market best sellers, as the UNION of three targeted queries per
     category — see "A PLAIN TOP-N CUT CAN MISS EVERYTHING YOU ACTUALLY STOCK"
     above. The third variant (rows with rising relative demand) surfaces
     products gaining momentum even if they're not yet ranked near the top or
-    in your own inventory — an early signal worth watching."""
+    in your own inventory — an early signal worth watching. `report_date`
+    pins the query to one historical date instead of "whichever report is
+    current" — see heal_best_sellers() and _report_date_clause()."""
     now = db.now()
     total = 0
     for country in countries:
@@ -727,7 +906,8 @@ def sync_best_sellers(conn, client: Client, categories, countries,
                 cid = cat["id"]
                 base = (f"report_country_code = '{country}' "
                         f"AND report_granularity = '{gran}' "
-                        f"AND report_category_id = {cid}")
+                        f"AND report_category_id = {cid}"
+                        + _report_date_clause(report_date))
                 variants = (
                     ("top_n", f"SELECT {_BS_SELECT} FROM "
                               f"best_sellers_product_cluster_view WHERE {base} "
@@ -793,11 +973,14 @@ VALUES (:report_date, :report_granularity, :report_country_code,
 
 def sync_best_seller_brands(conn, client: Client, categories, countries, brands,
                              top_n: int = DEFAULT_TOP_N,
-                             granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY")) -> int:
+                             granularities: tuple[str, ...] = ("WEEKLY", "MONTHLY"),
+                             report_date: str | None = None) -> int:
     """Brand-level market demand. `brands` (from --brand, case-insensitive) is
     fetched with an EXPLICIT `brand IN (...)` query, because a specific brand
     you care about can sit far outside any reasonable top-N cutoff (a small
-    or niche brand can rank in the thousands within a broad category)."""
+    or niche brand can rank in the thousands within a broad category).
+    `report_date` pins the query to one historical date — see
+    heal_best_sellers() and _report_date_clause()."""
     now = db.now()
     tracked = brands or []
     tracked_lower = {b.lower() for b in tracked}
@@ -811,7 +994,8 @@ def sync_best_seller_brands(conn, client: Client, categories, countries, brands,
                 cid = cat["id"]
                 base = (f"report_country_code = '{country}' "
                         f"AND report_granularity = '{gran}' "
-                        f"AND report_category_id = {cid}")
+                        f"AND report_category_id = {cid}"
+                        + _report_date_clause(report_date))
                 variants = [
                     ("top_n", f"SELECT {sel} FROM best_sellers_brand_view "
                               f"WHERE {base} ORDER BY rank ASC LIMIT {top_n}"),
@@ -1002,6 +1186,13 @@ def main() -> None:
                     help="brand name to track explicitly in bestsellers, even "
                          "outside the top-n cutoff (repeatable)")
     p.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
+    p.add_argument("--report-date",
+                    help="bestsellers only: pull exactly this report_date "
+                         "(YYYY-MM-DD, a Monday for WEEKLY or the 1st for "
+                         "MONTHLY) instead of the current report — for a "
+                         "manual/targeted backfill of one known-missing date. "
+                         "See heal_best_sellers() for the automatic version "
+                         "that runs on every normal bestsellers sync.")
     args = p.parse_args()
 
     merchant_id = os.environ.get("GMC_MERCHANT_ID")
@@ -1076,8 +1267,17 @@ def main() -> None:
     if "bestsellers" in families:
         started = db.now()
         try:
-            n = sync_best_sellers(conn, client, categories, countries, args.top_n)
-            n += sync_best_seller_brands(conn, client, categories, countries, brands, args.top_n)
+            if args.report_date:
+                n = sync_best_sellers(conn, client, categories, countries, args.top_n,
+                                       report_date=args.report_date)
+                n += sync_best_seller_brands(conn, client, categories, countries, brands,
+                                              args.top_n, report_date=args.report_date)
+            else:
+                n = sync_best_sellers(conn, client, categories, countries, args.top_n)
+                n += sync_best_seller_brands(conn, client, categories, countries, brands, args.top_n)
+                # Zero extra API cost when there's no gap — see
+                # "HEALING A MISSED report_date" in the module docstring.
+                n += heal_best_sellers(conn, client, categories, countries, brands, args.top_n)
             _log_grain("gmc_bestsellers", started, n)
             print(f"  bestsellers: {n:,} rows")
         except Exception as exc:  # noqa: BLE001

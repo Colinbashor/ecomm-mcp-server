@@ -33,6 +33,7 @@ python merchant_center_sync.py --only performance --only pricing
 python merchant_center_sync.py --backfill              # walk performance history back until it runs dry
 python merchant_center_sync.py --only bestsellers --category 1604 --country US --top-n 50
 python merchant_center_sync.py --only bestsellers --brand "Your Brand" --brand "Competitor"
+python merchant_center_sync.py --only bestsellers --report-date 2026-08-24   # manual backfill of one date
 ```
 
 `--only` accepts `performance`, `status`, `pricing`, `bestsellers`,
@@ -50,6 +51,9 @@ visibility grains; `--brand` is repeatable and scopes best-sellers only.
   including a "riser" signal for products gaining demand outside the usual
   top-N cut, and `--brand` for tracking specific brands (yours or a
   competitor's) regardless of rank
+- `gmc_best_seller_coverage` — records which best-sellers `report_date`s have
+  actually been asked for and whether Google had published them yet; backs
+  the automatic heal pass below, not meant for direct querying
 - `gmc_competitive_visibility` — competitive visibility
 
 ## Notes
@@ -57,9 +61,24 @@ visibility grains; `--brand` is repeatable and scopes best-sellers only.
 See the module docstring for a lag-in-publishing gotcha on the visibility
 grain (`gmc_competitive_visibility`) — it doesn't update same-day.
 
-`gmc_best_sellers`/`gmc_best_seller_brands` are a **market ranking snapshot**,
-not your own sales data, and Google only exposes the current snapshot — there
-is no historical backfill for this grain regardless of `--backfill`.
+`gmc_best_sellers`/`gmc_best_seller_brands` are a **market ranking**, not your
+own sales data, and a plain (unfiltered) query only ever returns whichever
+report is *current* — so a sync that misses a run can permanently lose
+whichever `report_date` was current on exactly that day once a newer one
+replaces it. Every normal `bestsellers` sync therefore also runs
+`heal_best_sellers()`: it works out which recent WEEKLY (Monday) and MONTHLY
+(1st-of-month) `report_date`s this database should already hold, checks
+`gmc_best_seller_coverage`/`gmc_best_sellers` for gaps, and re-pulls only the
+missing ones with an exact `report_date = '...'` filter — at zero extra API
+cost when there's no gap to heal. A date Google hasn't published yet is
+recorded as such (not left unrecorded, and not re-asked on every single run
+forever — it ages out of the heal window eventually). For a manual, targeted
+backfill of one known date, use `--report-date` directly. See "HEALING A
+MISSED report_date" in the module docstring for the one hard rule this all
+depends on: never batch more than one `report_date` into a single query — the
+API silently accepts `report_date IN (...)` but applies the top-N `LIMIT`
+across the *combined* result set, quietly halving each date's row count with
+no error.
 
 `gmc_product_performance`/`gmc_account_performance` deliberately carry
 clicks/impressions/conversions only, no revenue column — see the module

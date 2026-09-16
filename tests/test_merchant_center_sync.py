@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 import requests
@@ -195,7 +196,7 @@ class RowShapeTests(unittest.TestCase):
         self.assertTrue({
             "gmc_product_performance", "gmc_account_performance", "gmc_product_status",
             "gmc_product_issues", "gmc_price_competitiveness", "gmc_best_sellers",
-            "gmc_best_seller_brands", "gmc_competitive_visibility",
+            "gmc_best_seller_brands", "gmc_best_seller_coverage", "gmc_competitive_visibility",
         } <= tables)
 
     def test_sync_performance_writes_expected_row_shape(self) -> None:
@@ -421,6 +422,179 @@ class LogGrainTests(unittest.TestCase):
         self.assertEqual(args[0], "gmc_visibility")
         self.assertEqual(args[2], 0)
         self.assertEqual(args[3], "degraded")
+
+
+# --------------------------------------------------------------------------- #
+#  best sellers: healing a missed report_date
+# --------------------------------------------------------------------------- #
+class BestSellerCandidateTests(unittest.TestCase):
+    """The heal pass can only name a hole it can enumerate: the API rejects
+    BETWEEN on report_date, so every candidate date is generated, not
+    queried for."""
+
+    TODAY = date(2026, 9, 14)           # a Monday
+
+    def test_weekly_candidates_are_all_mondays(self) -> None:
+        got = gmc.best_seller_candidates("WEEKLY", self.TODAY)
+        self.assertTrue(got)
+        for d in got:
+            self.assertEqual(date.fromisoformat(d).weekday(), 0, d)
+
+    def test_monthly_candidates_are_all_firsts(self) -> None:
+        got = gmc.best_seller_candidates("MONTHLY", self.TODAY)
+        self.assertTrue(got)
+        for d in got:
+            self.assertEqual(date.fromisoformat(d).day, 1, d)
+
+    def test_dates_younger_than_the_due_window_are_not_yet_missing(self) -> None:
+        """Google publishes best sellers in arrears. Asking sooner burns
+        queries on a report that doesn't exist yet and writes a coverage row
+        that reads like a failure."""
+        got = gmc.best_seller_candidates("WEEKLY", self.TODAY)
+        self.assertNotIn("2026-09-14", got)     # 0 days old
+        self.assertNotIn("2026-09-07", got)     # 7 days old
+        self.assertIn("2026-08-31", got)        # 14 days old — exactly due
+
+    def test_the_window_itself_is_the_give_up_guard(self) -> None:
+        """Bounded by construction, so a date Google never publishes stops
+        being asked for without an attempt counter that could also expire a
+        date Google is merely late with."""
+        got = gmc.best_seller_candidates("WEEKLY", self.TODAY, weeks=3)
+        self.assertEqual(len(got), 1)           # only 08-31 is both due and in
+        self.assertNotIn("2026-06-01",
+                          gmc.best_seller_candidates("MONTHLY", self.TODAY))
+
+    def test_unknown_granularity_raises_rather_than_returning_nothing(self) -> None:
+        with self.assertRaises(ValueError):
+            gmc.best_seller_candidates("DAILY", self.TODAY)
+
+
+class MissingReportDateTests(unittest.TestCase):
+    def test_only_dates_we_hold_nothing_for(self) -> None:
+        self.assertEqual(
+            gmc.missing_report_dates({"2026-08-31", "2026-08-17"},
+                                      ["2026-08-31", "2026-08-24", "2026-08-17"]),
+            ("2026-08-24",))
+
+    def test_oldest_first(self) -> None:
+        """A run cut short should have fetched the dates nearest falling out
+        of the give-up window."""
+        self.assertEqual(
+            gmc.missing_report_dates(set(), ["2026-08-31", "2026-08-03"]),
+            ("2026-08-03", "2026-08-31"))
+
+    def test_no_holes_means_no_queries(self) -> None:
+        self.assertEqual(
+            gmc.missing_report_dates({"2026-08-31"}, ["2026-08-31"]), ())
+
+
+class ReportDateClauseTests(unittest.TestCase):
+    def test_absent_date_filters_nothing(self) -> None:
+        """And "nothing" is NOT "every date" — an unfiltered best-sellers
+        query returns only the CURRENT report. That asymmetry is why the
+        heal pass exists."""
+        self.assertEqual(gmc._report_date_clause(None), "")
+        self.assertEqual(gmc._report_date_clause(""), "")
+
+    def test_exact_equals_because_between_is_rejected(self) -> None:
+        """The API accepts `=` and `IN`, rejects `>=` and `BETWEEN`."""
+        self.assertEqual(gmc._report_date_clause("2026-08-24"),
+                          " AND report_date = '2026-08-24'")
+
+    def test_dates_are_never_batched_into_an_in_clause(self) -> None:
+        """The API accepts IN, but the top_n variant carries ORDER BY rank
+        LIMIT n and that LIMIT applies to the COMBINED result set — batching
+        two dates into one query silently halves each date's top_n cut with
+        no error, which is worse than an outright rejection."""
+        self.assertNotIn("IN (", gmc._report_date_clause("2026-08-24"))
+
+
+class HealBestSellersTests(unittest.TestCase):
+    """Integration-level: heal_best_sellers() against an in-memory db, a
+    fake client, and a fixed 'today' so the candidate list is deterministic."""
+
+    def setUp(self) -> None:
+        self.conn = sqlite3.connect(":memory:")
+        gmc.ensure_schema(self.conn)
+        self.today = date(2026, 9, 14)  # a Monday; 2026-08-31 is the one due WEEKLY date within weeks=1
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _row(self, report_date: str) -> dict:
+        y, m, d = (int(p) for p in report_date.split("-"))
+        return {
+            "reportDate": {"year": y, "month": m, "day": d},
+            "reportGranularity": "WEEKLY", "reportCountryCode": "US",
+            "reportCategoryId": "166", "rank": "5", "previousRank": "7",
+            "title": "Example Product", "brand": "Example Brand",
+            "relativeDemand": "HIGH", "relativeDemandChange": "FLAT",
+            "inventoryStatus": "IN_STOCK",
+        }
+
+    def test_no_gap_costs_zero_queries(self) -> None:
+        # Every WEEKLY candidate in the default heal window is already held.
+        for d in gmc.best_seller_candidates("WEEKLY", self.today):
+            self.conn.execute(
+                "INSERT INTO gmc_best_sellers (report_date, report_granularity, "
+                "report_country_code, report_category_id, rank, synced_at) "
+                "VALUES (?, 'WEEKLY', 'US', '166', 1, '2026-09-01T00:00:00')", (d,))
+        self.conn.commit()
+
+        class _NoCallClient:
+            def search(self, query, **kw):
+                raise AssertionError("heal_best_sellers must not query a held date")
+
+        n = gmc.heal_best_sellers(self.conn, _NoCallClient(),
+                                   [{"id": 166, "name": "Apparel"}], ["US"], [],
+                                   top_n=10, granularities=("WEEKLY",),
+                                   today=self.today)
+        self.assertEqual(n, 0)
+
+    def test_missing_date_is_fetched_and_recorded_as_present(self) -> None:
+        client = _FakeSearchClient([self._row("2026-08-31")])
+        n = gmc.heal_best_sellers(self.conn, client,
+                                   [{"id": 166, "name": "Apparel"}], ["US"], [],
+                                   top_n=10, granularities=("WEEKLY",),
+                                   today=self.today)
+        self.assertGreater(n, 0)
+        row = self.conn.execute(
+            "SELECT rows_returned, is_present, attempts FROM gmc_best_seller_coverage "
+            "WHERE report_date = '2026-08-31'").fetchone()
+        self.assertIsNotNone(row)
+        rows_returned, is_present, attempts = row
+        self.assertGreater(rows_returned, 0)
+        self.assertEqual(is_present, 1)
+        self.assertEqual(attempts, 1)
+
+    def test_unpublished_date_is_recorded_present_false_not_left_unrecorded(self) -> None:
+        """An empty answer means Google hasn't published that date yet — not
+        a failure. The coverage row is what keeps that case distinguishable
+        from a date nobody has checked, instead of re-guessing every run."""
+        client = _FakeSearchClient([])
+        gmc.heal_best_sellers(self.conn, client,
+                               [{"id": 166, "name": "Apparel"}], ["US"], [],
+                               top_n=10, granularities=("WEEKLY",),
+                               today=self.today)
+        row = self.conn.execute(
+            "SELECT is_present FROM gmc_best_seller_coverage "
+            "WHERE report_date = '2026-08-31'").fetchone()
+        self.assertEqual(row, (0,))
+
+    def test_repeated_heal_of_the_same_missing_date_increments_attempts(self) -> None:
+        client = _FakeSearchClient([])
+        gmc.heal_best_sellers(self.conn, client,
+                               [{"id": 166, "name": "Apparel"}], ["US"], [],
+                               top_n=10, granularities=("WEEKLY",),
+                               today=self.today)
+        gmc.heal_best_sellers(self.conn, client,
+                               [{"id": 166, "name": "Apparel"}], ["US"], [],
+                               top_n=10, granularities=("WEEKLY",),
+                               today=self.today)
+        attempts = self.conn.execute(
+            "SELECT attempts FROM gmc_best_seller_coverage "
+            "WHERE report_date = '2026-08-31'").fetchone()[0]
+        self.assertEqual(attempts, 2)
 
 
 # --------------------------------------------------------------------------- #

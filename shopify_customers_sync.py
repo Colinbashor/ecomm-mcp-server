@@ -83,6 +83,7 @@ Usage:
     .venv\\Scripts\\python.exe shopify_customers_sync.py --dry-run    # crawl + parse, print a sample, write nothing
     .venv\\Scripts\\python.exe shopify_customers_sync.py              # full crawl, current snapshot of every customer
     .venv\\Scripts\\python.exe shopify_customers_sync.py --since 2026-01-01   # only customers updated since this date
+    .venv\\Scripts\\python.exe shopify_customers_sync.py --days 3             # same, expressed as a rolling window
 
 Requires the same Shopify credentials as warehouse/connectors/shopify.py
 (SHOPIFY_SHOP + SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET, or legacy
@@ -104,7 +105,7 @@ import json
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -540,6 +541,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="crawl and parse but write nothing; prints a sample")
     ap.add_argument("--since", help="only customers updated on/after this date (YYYY-MM-DD)")
+    ap.add_argument("--days", type=int,
+                    help="incremental window in days (same convention as "
+                         "run_sync.py's --days); computes --since as today "
+                         "minus N days. Ignored if --since is given.")
     args = ap.parse_args()
 
     _check_env()
@@ -548,13 +553,17 @@ def main() -> int:
         _probe()
         return 0
 
+    since = args.since
+    if since is None and args.days is not None:
+        since = (date.today() - timedelta(days=args.days)).isoformat()
+
     require_scope()
     started = db.now()
     db.init_db()
     conn = db.connect()
     ensure_schema(conn)
     try:
-        url, objcount = _submit(_query_doc(args.since))
+        url, objcount = _submit(_query_doc(since))
         if not url:
             print("no customers returned (empty window)")
             db.log_sync(PLATFORM, started, 0, "ok", "empty")

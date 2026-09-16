@@ -35,6 +35,7 @@ python run_sync.py --only shopify     # core orders, last 7 days
 python shopify_customers_sync.py --probe     # cheap scope/permission check — run this first
 python shopify_customers_sync.py --dry-run   # preview without writing
 python shopify_customers_sync.py --since 2026-01-01
+python shopify_customers_sync.py --days 3    # same idea, as a rolling window — pair with a scheduler
 python shopify_customers_sync.py             # full crawl, all customers
 ```
 

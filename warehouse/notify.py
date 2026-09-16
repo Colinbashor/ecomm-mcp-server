@@ -47,7 +47,9 @@ directly instead of routing it through `send(dest=...)`: it takes a
 ready-made HTML body verbatim and, unlike `send()`, reports failure back via
 its `False` return rather than swallowing it, since such an email is usually
 the report's only copy rather than a side notification of one that exists
-elsewhere.
+elsewhere. `send(dest=...)`'s own email target is built on top of the same
+`send_email()`, so both paths share one retry-capable SMTP sender rather than
+keeping two independent ways to open an SMTP connection.
 """
 from __future__ import annotations
 
@@ -80,12 +82,6 @@ MAX_CHARS = 3800
 SMTP_TIMEOUT_SECONDS = 60
 SMTP_SEND_RETRIES = 3
 SMTP_RETRY_BACKOFF_SECONDS = 15
-
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or "587")
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", "") or SMTP_USER
 
 
 def to_chat_markdown(md_text: str) -> str:
@@ -191,36 +187,65 @@ def to_email_html(text: str) -> str:
     )
 
 
-def _send_email(to_csv: str, subject: str, body: str) -> None:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        raise RuntimeError("SMTP_USER/SMTP_PASSWORD not configured in .env")
-    recipients = [addr.strip() for addr in to_csv.split(",") if addr.strip()]
-    if not recipients:
-        raise RuntimeError(f"no valid recipients in {to_csv!r}")
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
-    msg["To"] = ", ".join(recipients)
-    # Plain text first, HTML second — email clients render the LAST alternative
-    # part they understand, and HTML is the one we want when supported.
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    msg.attach(MIMEText(to_email_html(body), "html", "utf-8"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT_SECONDS) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, recipients, msg.as_string())
+def send(text: str, dest: str) -> None:
+    """Push `text` to every target configured for `dest` (Slack/Chat webhook
+    POST, or an email via send_email()). Best-effort per platform: a failing
+    or unconfigured destination is logged and skipped, never raised — the
+    caller (typically a report-rendering step) must keep running regardless
+    of notification state. NOTE: send_email() itself is NOT best-effort (a
+    missing SMTP config or a hard failure after retries is a real problem for
+    its own direct callers) -- here it's just one more target among several,
+    so its bool return is what decides the [notify] log line, never an
+    exception that would skip the remaining targets."""
+    targets = _targets(dest)
+    if not targets:
+        print(f"[notify] no target configured for dest={dest!r} — skipped")
+        return
+    body = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "\n…(truncated)"
+    for platform, value in targets.items():
+        if platform == "email":
+            recipients = [addr.strip() for addr in value.split(",") if addr.strip()]
+            if not recipients:
+                print(f"[notify] email (dest={dest}) failed: no valid recipients in {value!r}")
+                continue
+            # Email has no chat-length constraint -- send the full text, not
+            # the truncated `body` used for the webhook platforms below.
+            if send_email(_email_subject(text), to_email_html(text), recipients, plaintext_body=text):
+                print(f"[notify] posted to email (dest={dest})")
+            continue
+        try:
+            r = requests.post(value, json={"text": body}, timeout=TIMEOUT_SECONDS)
+            r.raise_for_status()
+            print(f"[notify] posted to {platform} (dest={dest})")
+        except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
+            print(f"[notify] {platform} (dest={dest}) failed: {exc}")
+
+
+def _smtp_config() -> tuple[str, int, str, str, str] | None:
+    """Read SMTP_* from the environment at CALL time, not import time -- so a
+    caller (or a test) that sets these right before sending sees them take
+    effect, and a process that starts before .env is fully populated doesn't
+    freeze a blank config for its whole lifetime. Returns None if the account
+    isn't configured (SMTP_USER/SMTP_PASSWORD unset)."""
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.environ.get("SMTP_PORT", "587") or "587")
+    user = os.environ.get("SMTP_USER", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+    from_addr = os.environ.get("SMTP_FROM", "") or user
+    if not (user and password):
+        return None
+    return host, port, user, password, from_addr
 
 
 def send_email(subject: str, html_body: str, to: list[str],
                 plaintext_body: str | None = None, cc: list[str] | None = None) -> bool:
     """Send a fully custom HTML email over the SMTP mailbox configured in
-    .env (SMTP_HOST/PORT/USER/PASSWORD/FROM). This is a separate entry point
-    from send(dest=...)'s email target: that path takes the same short
-    chat-markdown text sent to Slack/Chat and auto-converts it to HTML via
-    to_email_html(), which is the right fit for a digest-style notification.
-    This function instead takes an already-built HTML document verbatim --
-    the right fit for a real report (tables, images, custom layout) that
-    doesn't come from chat-markdown source text at all.
+    .env (SMTP_HOST/PORT/USER/PASSWORD/FROM). This is the one SMTP-sending
+    path in this module -- `send(dest=...)`'s email target calls this too
+    (with an HTML body auto-converted from the same chat-markdown text sent
+    to Slack/Chat via to_email_html()), so both a digest-style notification
+    and a fully custom report share the same retry behavior instead of one
+    of the two paths quietly lacking it.
 
     UNLIKE send(): that one is a best-effort *side* notification for a report
     that already exists elsewhere (a file, a dashboard link), so a missing or
@@ -240,16 +265,18 @@ def send_email(subject: str, html_body: str, to: list[str],
     that rewrite entirely, and is also the only path that can run unattended
     from a non-interactive scheduled job (an interactive OAuth session
     cannot)."""
-    if not (SMTP_USER and SMTP_PASSWORD):
+    cfg = _smtp_config()
+    if cfg is None:
         print("[notify] SMTP not configured in .env -- email not sent")
         return False
     if not to:
         print("[notify] send_email() called with no recipients -- not sent")
         return False
+    host, port, user, password, from_addr = cfg
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
+    msg["From"] = from_addr
     msg["To"] = ", ".join(to)
     if cc:
         msg["Cc"] = ", ".join(cc)
@@ -269,10 +296,10 @@ def send_email(subject: str, html_body: str, to: list[str],
     # and retry by hand.
     for attempt in range(1, SMTP_SEND_RETRIES + 1):
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+            with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_SECONDS) as server:
                 server.starttls()
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, recipients, body)
+                server.login(user, password)
+                server.sendmail(from_addr, recipients, body)
             print(f"[notify] emailed {len(recipients)} recipient(s): {subject!r}")
             return True
         except Exception as exc:  # noqa: BLE001 - reported to caller via return value
@@ -282,26 +309,3 @@ def send_email(subject: str, html_body: str, to: list[str],
             print(f"[notify] email send attempt {attempt} failed ({exc}), retrying...")
             time.sleep(SMTP_RETRY_BACKOFF_SECONDS * attempt)
     return False  # unreachable, keeps type-checkers happy
-
-
-def send(text: str, dest: str) -> None:
-    """Push `text` to every target configured for `dest` (Slack/Chat webhook
-    POST, or an email send). Best-effort per platform: a failing or
-    unconfigured destination is logged and skipped, never raised — the
-    caller (typically a report-rendering step) must keep running regardless
-    of notification state."""
-    targets = _targets(dest)
-    if not targets:
-        print(f"[notify] no target configured for dest={dest!r} — skipped")
-        return
-    body = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "\n…(truncated)"
-    for platform, value in targets.items():
-        try:
-            if platform == "email":
-                _send_email(value, _email_subject(text), text)
-            else:
-                r = requests.post(value, json={"text": body}, timeout=TIMEOUT_SECONDS)
-                r.raise_for_status()
-            print(f"[notify] posted to {platform} (dest={dest})")
-        except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
-            print(f"[notify] {platform} (dest={dest}) failed: {exc}")
