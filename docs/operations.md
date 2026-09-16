@@ -28,8 +28,10 @@ Targets are configured per named `dest` in `.env`:
 Different callers can point at different channels/spaces/inboxes with no code
 change, and a `dest` with nothing configured is silently skipped — `send()`
 never raises, so a notification failure can't take down whatever pipeline
-called it. See the module docstring for full setup (webhook creation, SMTP
-setup for email).
+called it. `send()`'s email target is built on `send_email()` below, so it
+gets the same transient-failure retry as a direct `send_email()` call rather
+than a second, weaker SMTP path. See the module docstring for full setup
+(webhook creation, SMTP setup for email).
 
 ### Sending a fully custom HTML email — `notify.send_email()`
 
@@ -88,6 +90,17 @@ A backup that fails to verify (can't open, no tables) is discarded rather
 than kept, so a corrupt copy never silently replaces a good one. Wire it into
 your OS's scheduler (Task Scheduler, cron, launchd) to run before your main
 sync job.
+
+Rotation runs *before* the copy attempt (down to `WAREHOUSE_BACKUP_KEEP`),
+not after — so a run never needs headroom for `KEEP+1` copies at once — and
+a stale `.partial` left by an earlier interrupted run is swept first, since
+the rotation glob doesn't match it. Before copying, the script checks free
+disk space against the source database's size with a margin and, if that's
+tight, drops to `KEEP-1` rather than fail outright — one fewer backup beats
+a full disk, which can stop every other writer on the machine. Every skip or
+failure is logged to `sync_log` (platform `warehouse_backup`) so it's
+visible wherever else you already watch that table, not just in this
+script's own console output.
 
 ## Tests
 

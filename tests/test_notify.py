@@ -124,75 +124,65 @@ class ToEmailHtmlTests(unittest.TestCase):
         self.assertTrue(out.endswith("</html>"))
 
 
-class SendEmailTests(unittest.TestCase):
+_SMTP_ENV = {
+    "SMTP_HOST": "smtp.gmail.com",
+    "SMTP_PORT": "587",
+    "SMTP_USER": "sender@example.com",
+    "SMTP_PASSWORD": "app-password",
+    "SMTP_FROM": "sender@example.com",
+}
+
+
+class SmtpConfigTests(unittest.TestCase):
+    """_smtp_config() reads os.environ at CALL time (not import time), so a
+    caller that sets/clears these env vars right before sending sees the
+    change take effect immediately."""
+
     def setUp(self) -> None:
-        self._orig = (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
-                      notify.SMTP_HOST, notify.SMTP_PORT)
-        notify.SMTP_USER = "sender@example.com"
-        notify.SMTP_PASSWORD = "app-password"
-        notify.SMTP_FROM = "sender@example.com"
-        notify.SMTP_HOST = "smtp.gmail.com"
-        notify.SMTP_PORT = 587
-        self.addCleanup(self._restore)
+        for key in _SMTP_ENV:
+            os.environ.pop(key, None)
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in _SMTP_ENV])
 
-    def _restore(self) -> None:
-        (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
-         notify.SMTP_HOST, notify.SMTP_PORT) = self._orig
+    def test_unconfigured_returns_none(self) -> None:
+        self.assertIsNone(notify._smtp_config())
 
-    def test_missing_credentials_raises(self) -> None:
-        notify.SMTP_PASSWORD = ""
-        with self.assertRaises(RuntimeError):
-            notify._send_email("a@example.com", "subj", "body")
+    def test_missing_password_returns_none(self) -> None:
+        os.environ["SMTP_USER"] = "sender@example.com"
+        self.assertIsNone(notify._smtp_config())
 
-    def test_no_valid_recipients_raises(self) -> None:
-        with self.assertRaises(RuntimeError):
-            notify._send_email("  , ,", "subj", "body")
+    def test_configured_returns_tuple(self) -> None:
+        with patch.dict(os.environ, _SMTP_ENV):
+            self.assertEqual(notify._smtp_config(),
+                              ("smtp.gmail.com", 587, "sender@example.com",
+                               "app-password", "sender@example.com"))
 
-    @patch("warehouse.notify.smtplib.SMTP")
-    def test_sends_via_starttls_and_login(self, smtp_cls: Mock) -> None:
-        server = Mock()
-        smtp_cls.return_value.__enter__.return_value = server
-        notify._send_email("a@example.com, b@example.com", "Subject line", "Body text")
+    def test_host_and_port_default_to_gmail(self) -> None:
+        with patch.dict(os.environ, {"SMTP_USER": "sender@example.com",
+                                      "SMTP_PASSWORD": "app-password"}):
+            host, port, _, _, _ = notify._smtp_config()
+            self.assertEqual((host, port), ("smtp.gmail.com", 587))
 
-        smtp_cls.assert_called_once_with("smtp.gmail.com", 587, timeout=notify.TIMEOUT_SECONDS)
-        server.starttls.assert_called_once()
-        server.login.assert_called_once_with("sender@example.com", "app-password")
-        self.assertEqual(server.sendmail.call_count, 1)
-        args, _ = server.sendmail.call_args
-        from_addr, recipients, raw_message = args
-        self.assertEqual(from_addr, "sender@example.com")
-        self.assertEqual(recipients, ["a@example.com", "b@example.com"])
-        parsed = message_from_string(raw_message)
-        self.assertEqual(parsed["Subject"], "Subject line")
-        self.assertTrue(parsed.is_multipart())
-        by_type = {part.get_content_type(): part for part in parsed.get_payload()}
-        self.assertEqual(by_type["text/plain"].get_payload(decode=True).decode("utf-8"),
-                          "Body text")
-        self.assertIn("Body text", by_type["text/html"].get_payload(decode=True).decode("utf-8"))
+    def test_from_defaults_to_user(self) -> None:
+        with patch.dict(os.environ, {"SMTP_USER": "sender@example.com",
+                                      "SMTP_PASSWORD": "app-password"}):
+            *_, from_addr = notify._smtp_config()
+            self.assertEqual(from_addr, "sender@example.com")
 
 
 class SendEmailFunctionTests(unittest.TestCase):
-    """Tests for the standalone send_email() entry point (a ready-made HTML
-    document sent verbatim), distinct from the internal _send_email() used
-    by send(dest=...)'s markdown-derived email target."""
+    """Tests for send_email() -- the one SMTP-sending path in this module,
+    used both directly (a ready-made HTML document sent verbatim) and by
+    send(dest=...)'s email target (an HTML body auto-converted from
+    chat-markdown text)."""
 
     def setUp(self) -> None:
-        self._orig = (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
-                      notify.SMTP_HOST, notify.SMTP_PORT)
-        notify.SMTP_USER = "sender@example.com"
-        notify.SMTP_PASSWORD = "app-password"
-        notify.SMTP_FROM = "sender@example.com"
-        notify.SMTP_HOST = "smtp.gmail.com"
-        notify.SMTP_PORT = 587
-        self.addCleanup(self._restore)
-
-    def _restore(self) -> None:
-        (notify.SMTP_USER, notify.SMTP_PASSWORD, notify.SMTP_FROM,
-         notify.SMTP_HOST, notify.SMTP_PORT) = self._orig
+        self._env_patch = patch.dict(os.environ, _SMTP_ENV)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
 
     def test_missing_credentials_returns_false_without_raising(self) -> None:
-        notify.SMTP_PASSWORD = ""
-        self.assertFalse(notify.send_email("Subj", "<p>hi</p>", ["a@example.com"]))
+        with patch.dict(os.environ, {"SMTP_PASSWORD": ""}):
+            self.assertFalse(notify.send_email("Subj", "<p>hi</p>", ["a@example.com"]))
 
     def test_no_recipients_returns_false_without_raising(self) -> None:
         self.assertFalse(notify.send_email("Subj", "<p>hi</p>", []))
@@ -260,18 +250,28 @@ class SendTests(unittest.TestCase):
     def test_no_destination_configured_does_not_raise(self) -> None:
         notify.send("hello", "unconfigured_dest")  # must not raise
 
-    @patch("warehouse.notify._send_email")
+    @patch("warehouse.notify.send_email")
     def test_email_destination_calls_send_email(self, send_email: Mock) -> None:
         os.environ["WEEKLY_DIGEST_EMAIL_TO"] = "a@example.com"
+        send_email.return_value = True
         notify.send("*Weekly Digest*\nline two", "weekly_digest")
         send_email.assert_called_once_with(
-            "a@example.com", "Weekly Digest", "*Weekly Digest*\nline two")
+            "Weekly Digest", notify.to_email_html("*Weekly Digest*\nline two"),
+            ["a@example.com"], plaintext_body="*Weekly Digest*\nline two")
 
-    @patch("warehouse.notify._send_email")
+    @patch("warehouse.notify.send_email")
     def test_email_failure_does_not_raise_or_block_other_platforms(self, send_email: Mock) -> None:
         os.environ["WEEKLY_DIGEST_EMAIL_TO"] = "a@example.com"
-        send_email.side_effect = RuntimeError("SMTP not configured")
+        send_email.return_value = False  # send_email() reports failure via return, not raise
         notify.send("hello", "weekly_digest")  # must not raise
+
+    def test_blank_email_to_is_treated_as_unconfigured(self) -> None:
+        # A whitespace/comma-only value (no real address) must be skipped
+        # the same as an unset env var, not attempted with zero recipients.
+        os.environ["WEEKLY_DIGEST_EMAIL_TO"] = " , ,"
+        with patch("warehouse.notify.send_email") as send_email:
+            notify.send("hello", "weekly_digest")
+        send_email.assert_not_called()
 
     @patch("warehouse.notify.requests.post")
     def test_posts_json_text_to_each_configured_webhook(self, post: Mock) -> None:

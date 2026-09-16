@@ -398,8 +398,16 @@ def sync_week(conn: sqlite3.Connection, monday: date, stamp: str) -> tuple[int, 
     weekly = _weekly_rows(data, start, stamp)
     daily = _daily_rows(data, stamp)
     with conn:
-        conn.executemany("INSERT OR REPLACE INTO amazon_traffic_weekly VALUES (?,?,?,?,?,?,?,?,?)", weekly)
-        conn.executemany("INSERT OR REPLACE INTO amazon_traffic_daily VALUES (?,?,?,?,?,?,?)", daily)
+        conn.executemany(
+            "INSERT OR REPLACE INTO amazon_traffic_weekly "
+            "(week_start, asin, parent_asin, sessions, page_views, buy_box_pct, "
+            " units_ordered, ordered_sales, synced_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            weekly)
+        conn.executemany(
+            "INSERT OR REPLACE INTO amazon_traffic_daily "
+            "(date, sessions, page_views, units_ordered, ordered_sales, "
+            " total_orders, synced_at) VALUES (?,?,?,?,?,?,?)",
+            daily)
         _record_coverage(conn, "week", start, cov, stamp)
     flag = "" if cov["is_complete"] else f"  !! INCOMPLETE: {describe(cov)}"
     print(f"    traffic week {start}: {len(weekly)} asins, {len(daily)} days{flag}", flush=True)
@@ -433,9 +441,15 @@ def sync_month(conn: sqlite3.Connection, ym: str, stamp: str) -> tuple[int, bool
 
     with conn:
         conn.execute("DELETE FROM amazon_traffic_monthly WHERE month = ?", (ym,))
-        conn.executemany("INSERT OR REPLACE INTO amazon_traffic_monthly VALUES (?,?,?,?,?,?,?,?,?)", monthly)
+        conn.executemany(
+            "INSERT OR REPLACE INTO amazon_traffic_monthly "
+            "(month, asin, parent_asin, sessions, page_views, buy_box_pct, "
+            " units_ordered, ordered_sales, synced_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            monthly)
         conn.execute(
-            "INSERT OR REPLACE INTO amazon_traffic_monthly_account VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO amazon_traffic_monthly_account "
+            "(month, sessions, page_views, units_ordered, ordered_sales, "
+            " total_orders, synced_at) VALUES (?,?,?,?,?,?,?)",
             acct_row,
         )
         _record_coverage(conn, "month", ym, cov, stamp)
