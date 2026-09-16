@@ -241,7 +241,7 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_google_ads_connector.py` | `search_impression_share` and its lost-share siblings stay `NULL` only on non-auction campaign types, keep a real `0.0` on Search/Shopping, and a Google-side `0.0/0.0/0.0` placeholder response is detected and nulled rather than stored as a fabricated zero |
-| `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, that a missing/unconfigured/failing target is skipped rather than raised, and `send_email()`'s retry-then-report-failure behavior for a standalone HTML report send |
+| `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, that a missing/unconfigured/failing target is skipped rather than raised, that `send(dest=...)`'s email target calls `send_email()` (so it shares the same retry behavior rather than a separate weaker path), `_smtp_config()` reading `SMTP_*` from the environment at call time, and `send_email()`'s own retry-then-report-failure behavior for a standalone HTML report send |
 
 Every standalone script under [Connectors, by platform](#connectors-by-platform) above has
 its own `tests/test_<script>.py` — schema creation, row-shaping, and its own API's particular
