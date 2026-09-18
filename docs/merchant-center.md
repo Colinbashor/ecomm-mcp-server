@@ -72,13 +72,25 @@ replaces it. Every normal `bestsellers` sync therefore also runs
 missing ones with an exact `report_date = '...'` filter — at zero extra API
 cost when there's no gap to heal. A date Google hasn't published yet is
 recorded as such (not left unrecorded, and not re-asked on every single run
-forever — it ages out of the heal window eventually). For a manual, targeted
-backfill of one known date, use `--report-date` directly. See "HEALING A
-MISSED report_date" in the module docstring for the one hard rule this all
-depends on: never batch more than one `report_date` into a single query — the
-API silently accepts `report_date IN (...)` but applies the top-N `LIMIT`
-across the *combined* result set, quietly halving each date's row count with
-no error.
+forever — it ages out of the heal window eventually: by default WEEKLY dates
+up to 8 weeks back, MONTHLY dates up to 3 months back, and a date isn't even
+considered "due" — worth asking for at all — until it's at least 14 days old,
+since Google publishes these reports well in arrears; see
+`BEST_SELLER_HEAL_WEEKS`/`BEST_SELLER_HEAL_MONTHS`/`BEST_SELLER_DUE_DAYS` in
+`merchant_center_sync.py` if your account's actual publish lag needs
+different values). For a manual, targeted backfill of one known date, use
+`--report-date` directly. See "HEALING A MISSED report_date" in the module
+docstring for the one hard rule this all depends on: never batch more than
+one `report_date` into a single query — the API silently accepts
+`report_date IN (...)` but applies the top-N `LIMIT` across the *combined*
+result set, quietly halving each date's row count with no error.
+
+`gmc_best_seller_coverage`'s key is `(report_country_code, report_granularity,
+report_date)` — **not** per category. If you add a new `--category` after
+this database already holds rows for some *other* category on a given date,
+the heal pass sees that date as already held (because *some* category has it)
+and will not automatically backfill the new category's history for it — use
+`--report-date` manually to backfill the new category's missing dates.
 
 `gmc_product_performance`/`gmc_account_performance` deliberately carry
 clicks/impressions/conversions only, no revenue column — see the module

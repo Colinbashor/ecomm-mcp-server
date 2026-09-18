@@ -92,13 +92,20 @@ your OS's scheduler (Task Scheduler, cron, launchd) to run before your main
 sync job.
 
 Rotation runs *before* the copy attempt (down to `WAREHOUSE_BACKUP_KEEP`),
-not after — so a run never needs headroom for `KEEP+1` copies at once — and
-a stale `.partial` left by an earlier interrupted run is swept first, since
-the rotation glob doesn't match it. Before copying, the script checks free
-disk space against the source database's size with a margin and, if that's
-tight, drops to `KEEP-1` rather than fail outright — one fewer backup beats
-a full disk, which can stop every other writer on the machine. Every skip or
-failure is logged to `sync_log` (platform `warehouse_backup`) so it's
+not only after — so a run never *needs* more than `KEEP+1` copies of headroom
+at once — and a stale `.partial` left by an earlier interrupted run is swept
+first, since the rotation glob doesn't match it. Before copying, the script
+checks free disk space against the source database's size with a margin and,
+if that's tight, drops to `KEEP-1` rather than fail outright — one fewer
+backup beats a full disk, which can stop every other writer on the machine.
+If free space is still short even after dropping to `KEEP-1` — including the
+case where `WAREHOUSE_BACKUP_KEEP` is already `1` and there's no lower rung to
+drop to — the run is skipped outright with nothing copied. Once a backup
+completes and verifies, rotation runs a *second* time, bringing the count
+back down from the temporary `KEEP+1` (today's new copy plus the existing
+`KEEP`) to `KEEP` — the pre-copy rotation only bounds how much headroom a run
+can ever need, it doesn't keep the directory at `KEEP` throughout. Every skip
+or failure is logged to `sync_log` (platform `warehouse_backup`) so it's
 visible wherever else you already watch that table, not just in this
 script's own console output.
 

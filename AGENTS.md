@@ -1,7 +1,7 @@
 # AGENTS.md — orientation for AI coding agents
 
 You are working on a **local e-commerce data warehouse**: a set of connectors
-that pull marketing and commerce data from ~12 platforms into one SQLite file,
+that pull marketing and commerce data from ~16 platforms into one SQLite file,
 plus an MCP server that exposes it read-only so an assistant can answer
 questions about the business in plain English.
 
@@ -26,7 +26,7 @@ warehouse/
   schema.sql           the shared core tables
   connectors/          the 6 that write shared `orders` / `ad_metrics`
   brand_analytics.py   shared Amazon report runner
-  notify.py            optional Slack / Google Chat webhooks
+  notify.py            optional Slack / Google Chat / email notifications
 server.py              MCP server (6 read-only tools)
 docs/<platform>.md     per-platform setup + traps  <- READ BEFORE EDITING
 tests/                 hermetic; no network, no database file

@@ -63,15 +63,28 @@ python factory_status_import.py imports/production/03.15.2026 --snapshot-date 20
 python factory_status_backfill.py "path/to/Production Archive"
 python factory_status_backfill.py "path/to/Production Archive" --dry-run
 python factory_status_backfill.py "path/to/Production Archive" --since 2025-01-01 --limit 10
+python factory_status_backfill.py "path/to/Production Archive" --since 2025-01-01 --until 2025-06-30
 ```
 
 `snapshot_date` (the period this folder represents) is parsed from the
-folder name by default — either a fully-numeric date (`03.15.2026`) or a
-bare month name + day with the year taken from the grandparent folder
-(`March 15` inside a `2024` folder); pass `--snapshot-date` to override it
-directly. `factory_status_backfill.py` tolerates both conventions
-coexisting across different years of one archive, which is common if the
-naming scheme changed at some point.
+folder name. The two scripts support different conventions, and this is not
+symmetric:
+
+- `factory_status_import.py` run directly only recognizes a fully-numeric
+  folder name (`03.15.2026`) via `snapshot_date_from_folder()`. Point it at a
+  folder named some other way (e.g. `March 15`) without `--snapshot-date` and
+  it silently falls back to **today's date**, not the folder's actual period
+  — always pass `--snapshot-date` explicitly for anything but a numeric
+  folder name.
+- `factory_status_backfill.py` additionally recognizes a bare month name +
+  day with the year taken from the grandparent (year) folder (`March 15`
+  inside a `2024` folder), via its own `parse_snapshot_date()` — this logic
+  lives only in the backfill script, not in `factory_status_import.py`. It
+  tolerates both conventions coexisting across different years of one
+  archive, which is common if the naming scheme changed at some point.
+
+`--snapshot-date` on `factory_status_import.py` always overrides whatever
+would otherwise be parsed (or defaulted to today).
 
 A bad/corrupted file never aborts the whole import — it's recorded in the
 returned stats (and printed to stderr) and everything else still loads.

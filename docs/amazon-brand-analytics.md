@@ -106,6 +106,7 @@ market-research purposes.
 python amazon_ba_backfill.py --asins-file asins.txt              # walk back to the retention floor
 python amazon_ba_backfill.py --asins-file asins.txt --weeks 12   # bounded run
 python amazon_ba_backfill.py --asins-file asins.txt --start 2025-09-07
+python amazon_ba_backfill.py --asins-file asins.txt --refresh    # re-pull weeks already stored
 python amazon_ba_backfill.py --status                            # what's stored; no API calls
 ```
 
