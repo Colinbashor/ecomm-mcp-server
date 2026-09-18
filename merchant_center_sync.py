@@ -158,6 +158,11 @@ forever. ONE report_date PER QUERY, NEVER `report_date IN (...)`: the API accept
 across every date in the clause, not per date — two dates queried together can each
 come back with roughly half the rows a single-date query would return, with no
 error, which is a much worse failure mode than an outright rejection.
+COVERAGE IS NOT PER CATEGORY: `gmc_best_seller_coverage`'s key is
+(report_country_code, report_granularity, report_date) only. Adding a new
+--category after some other category already has rows for a given date means
+the heal pass sees that date as already held and will not backfill the new
+category's history for it — use --report-date manually for that.
 
 COMPETITIVE VISIBILITY VARIES BY traffic_source. The `ALL` / `ADS` / `ORGANIC`
 values return genuinely different competitor rank orderings for the same
