@@ -1,9 +1,9 @@
 # Amazon Seller (Selling Partner API)
 
-Retail order ground truth (core), plus seven standalone scripts covering FBA
+Retail order ground truth (core), plus eight standalone scripts covering FBA
 inventory, AWD (bulk-storage) inventory, returns, rank tracking, fees, SKU
-economics, and sales/traffic — and a manual CSV importer for Voice of the
-Customer, which has no API.
+economics, sales/traffic, and listing-quality diagnostics — and a manual CSV
+importer for Voice of the Customer, which has no API.
 
 This is a separate credential set (`SPAPI_*`) from [Amazon Advertising](amazon-ads.md).
 For Brand Analytics (search query performance, market basket, etc.), see
@@ -22,6 +22,7 @@ requires brand registry.
 | `amazon_fees_sync.py` | standalone | SP-API fee reports: previews, storage, reimbursements, promotions, fulfilled shipments/MCF |
 | `amazon_economics_sync.py` | standalone | Data Kiosk SKU economics — actual fees + net proceeds, vs. the fee-preview estimate |
 | `amazon_traffic_sync.py` | standalone | per-ASIN Sales & Traffic: sessions, page views, Buy Box %, units/sales, weekly and monthly grain |
+| `amazon_listing_quality_sync.py` | standalone | per-SKU content-quality issues (Listings Items API) — the same checks behind Seller Central's Listing Quality Dashboard |
 | `voc_import.py` | standalone, manual CSV | per-ASIN/SKU Voice of the Customer health |
 
 ## Setup
@@ -40,7 +41,10 @@ Seller **self-authorization** — no OAuth consent screen:
    | `SPAPI_REGION` | default `NA` |
    | `DATAKIOSK_TIMEOUT_MIN` | optional, how long `amazon_economics_sync.py` waits for a Data Kiosk query (default `150` — these can run 1–2h for a full week) |
 
-All seven extras reuse these same variables — nothing new to configure.
+Six of the eight extras reuse these same variables — nothing new to
+configure. `amazon_listing_quality_sync.py` additionally needs
+`SPAPI_SELLER_ID` (Amazon's "Merchant Token" — see its module docstring for
+how to find it; no documented SP-API call returns it directly).
 `voc_import.py` needs **no credentials at all**: download the export from
 Seller Central (Performance → Voice of the Customer), drop it in a local
 folder, and import it.
@@ -59,6 +63,8 @@ python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --w
 python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
 python amazon_traffic_sync.py --repair               # re-pull only weeks recorded incomplete
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
+python amazon_listing_quality_sync.py --skus SKU1,SKU2
+python amazon_listing_quality_sync.py --skus-file skus.txt
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
 python voc_import.py --dir imports/voc               # import every *.csv in a folder
@@ -77,6 +83,7 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 - `amazon_economics`
 - `amazon_traffic_weekly`, `amazon_traffic_monthly`, `amazon_traffic_daily`,
   `amazon_traffic_monthly_account`, `amazon_traffic_coverage`
+- `amazon_listing_quality`, `amazon_listing_quality_issues`
 - `amazon_voc`
 
 ## Notes
@@ -160,10 +167,25 @@ Multi-Channel Fulfillment (MCF) shipments back to the Shopify order they
 fulfilled — useful for tracing an order that shipped from FBA inventory but
 sold on your own site.
 
+`amazon_listing_quality_sync.py` has no catalog table to source an
+active-SKU list from — pass `--skus`/`--skus-file` explicitly, same pattern
+as `amazon_rank_sync.py`'s `--asins`/`--asins-file` (and the same weak
+fallback to `amazon_fulfilled_shipments` if you pass neither). It's keyed by
+**seller SKU**, not ASIN: an FBA and a non-FBA (MFN) offer of the same
+product are separate SKUs that can carry different issues, so if you join
+this to ASIN-grain sales/traffic data, pick one representative SKU per ASIN
+first (e.g. worst severity, then most issues) or you'll double-count that
+ASIN's demand. Issue code `101265` ("switch this SKU to FBA") is excluded
+from `issue_count`/`max_severity` — it's a merchandising nudge, not a
+content defect — but it's kept in `amazon_listing_quality_issues` so nothing
+observed is silently dropped. There's no bulk report for this data, so it's
+a synchronous per-SKU call; the endpoint rate-limits at 5 req/sec, which this
+script paces itself under.
+
 ## Tests
 
 `tests/test_amazon_inventory_sync.py`, `tests/test_amazon_awd_sync.py`,
 `tests/test_amazon_awd.py`, `tests/test_amazon_returns_sync.py`,
 `tests/test_amazon_rank_sync.py`, `tests/test_amazon_fees_sync.py`,
 `tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`,
-`tests/test_voc_import.py`
+`tests/test_amazon_listing_quality_sync.py`, `tests/test_voc_import.py`

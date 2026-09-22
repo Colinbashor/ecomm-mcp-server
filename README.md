@@ -92,15 +92,15 @@ writes, and its test coverage.
 | Platform | Doc | Core connector | Standalone extras |
 |---|---|---|---|
 | Google Ads | [docs/google-ads.md](docs/google-ads.md) | campaign spend/clicks/conversions | search terms, keywords, Shopping/PMax demand, campaign structure; **write-capable** `google_ads_mutate.py` for pausing/creating/editing live campaigns |
-| Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages, new-vs-returning |
+| Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages (per-URL and bucketed), Meta paid/organic traffic split, new-vs-returning |
 | Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
 | Google Search Console | [docs/search-console.md](docs/search-console.md) | — | organic search clicks/impressions/position by query and landing page |
 | Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | ad/creative/video-level detail |
 | Amazon Advertising | [docs/amazon-ads.md](docs/amazon-ads.md) | campaign spend/clicks/conversions | per-ASIN, keyword/target, search-term performance |
-| Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, AWD (bulk-storage) inventory, returns, rank, fees, economics, traffic, Voice of the Customer |
+| Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, AWD (bulk-storage) inventory, returns, rank, fees, economics, traffic, Voice of the Customer, listing-quality diagnostics |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase, monthly search terms by category |
 | Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
-| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data |
+| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data, listing-quality diagnostics |
 | Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | campaign/flow performance, audience growth, attributed revenue |
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
