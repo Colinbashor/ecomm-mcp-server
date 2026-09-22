@@ -192,7 +192,8 @@ class SchemaAndRowShapeTests(unittest.TestCase):
         tables = {r[0] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"ga_metrics", "ga_products", "ga_landing_pages",
-                         "ga_campaign_ntb"} <= tables)
+                         "ga_landing_buckets", "ga_landing_bucket_meta",
+                         "ga_collection_meta", "ga_campaign_ntb"} <= tables)
 
     def test_ensure_schema_migrates_first_time_purchasers_onto_an_older_table(self) -> None:
         # Simulate a warehouse.db created before first_time_purchasers existed.
@@ -280,6 +281,77 @@ class SchemaAndRowShapeTests(unittest.TestCase):
             "purchases, revenue FROM ga_landing_pages"
         ).fetchone()
         self.assertEqual(row, ("/products/foo", 50, 40, 2.0, 3, 89.97))
+
+    def test_sync_landing_buckets_derives_other_from_the_grand_total(self) -> None:
+        # Call order: grand total (dimension_filter=None), then one call per
+        # LANDING_BUCKETS entry in order (PDP, Collection, Content, Home).
+        # Content gets an empty page (no traffic that day) to prove a
+        # bucket-less day is skipped rather than erroring.
+        grand = _Resp([_Row(["20260101"], ["100", "90", "8", "9", "500.0"])])
+        pdp = _Resp([_Row(["20260101"], ["40", "35", "3", "4", "200.0"])])
+        collection = _Resp([_Row(["20260101"], ["30", "25", "2", "3", "150.0"])])
+        content = _Resp([])
+        home = _Resp([_Row(["20260101"], ["10", "8", "1", "1", "50.0"])])
+        client = _FakeClient([grand, pdp, collection, content, home])
+
+        n = ga4_sync.sync_landing_buckets(client, self.conn, "999", "2026-01-01", "2026-01-01",
+                                           "conversions", "2026-01-01T00:00:00+00:00")
+        self.assertEqual(n, 4)  # PDP, Collection, Home, Other (Content skipped: no row)
+
+        rows = dict(self.conn.execute(
+            "SELECT bucket, sessions FROM ga_landing_buckets WHERE date='2026-01-01'"
+        ).fetchall())
+        self.assertEqual(rows["Product page (PDP)"], 40)
+        self.assertEqual(rows["Collection page"], 30)
+        self.assertEqual(rows["Home page"], 10)
+        self.assertNotIn("Content page", rows)
+        self.assertEqual(rows["Other / uncategorised"], 100 - 40 - 30 - 10)  # = 20
+
+    def test_sync_landing_bucket_meta_splits_reconcile_to_the_bucket_total(self) -> None:
+        # Patch LANDING_BUCKETS down to one entry so the call sequence (bucket
+        # total, meta_paid, meta_organic) stays simple to script.
+        total = _Resp([_Row(["20260101"], ["100", "80", "5", "6", "300.0"])])
+        paid = _Resp([_Row(["20260101"], ["30", "25", "2", "2", "100.0"])])
+        organic = _Resp([_Row(["20260101"], ["20", "15", "1", "1", "50.0"])])
+        client = _FakeClient([total, paid, organic])
+
+        with patch.object(ga4_sync, "LANDING_BUCKETS", (("Test Bucket", "begins", "/test/"),)):
+            n = ga4_sync.sync_landing_bucket_meta(
+                client, self.conn, "999", "2026-01-01", "2026-01-01",
+                "conversions", "2026-01-01T00:00:00+00:00")
+        self.assertEqual(n, 3)  # meta_paid, meta_organic, other
+
+        rows = dict(self.conn.execute(
+            "SELECT meta_class, sessions FROM ga_landing_bucket_meta "
+            "WHERE bucket='Test Bucket' AND date='2026-01-01'"
+        ).fetchall())
+        self.assertEqual(rows["meta_paid"], 30)
+        self.assertEqual(rows["meta_organic"], 20)
+        self.assertEqual(rows["other"], 100 - 30 - 20)  # = 50, sums back to the bucket total
+
+    def test_sync_collection_meta_scopes_to_collections_and_splits_by_meta_class(self) -> None:
+        total = _Resp([_Row(["20260101", "/collections/new"], ["60", "50", "3", "4", "200.0"])])
+        paid = _Resp([_Row(["20260101", "/collections/new"], ["15", "12", "1", "1", "60.0"])])
+        organic = _Resp([_Row(["20260101", "/collections/new"], ["10", "8", "1", "1", "40.0"])])
+        client = _FakeClient([total, paid, organic])
+
+        n = ga4_sync.sync_collection_meta(client, self.conn, "999", "2026-01-01", "2026-01-01",
+                                           "conversions", "2026-01-01T00:00:00+00:00")
+        self.assertEqual(n, 3)
+
+        rows = dict(self.conn.execute(
+            "SELECT meta_class, sessions FROM ga_collection_meta "
+            "WHERE landing_page='/collections/new' AND date='2026-01-01'"
+        ).fetchall())
+        self.assertEqual(rows["meta_paid"], 15)
+        self.assertEqual(rows["meta_organic"], 10)
+        self.assertEqual(rows["other"], 60 - 15 - 10)  # = 35
+
+        # The base filter scopes to /collections/ — assert every request's
+        # dimension_filter carries that constraint somewhere in its tree
+        # rather than trusting the fake client to enforce it server-side.
+        first_filter = client.calls[0].dimension_filter
+        self.assertEqual(first_filter.filter.string_filter.value, "/collections/")
 
     def test_purge_dates_removes_rows_ga4_stopped_returning(self) -> None:
         # Simulate a prior sync's orphan row (e.g. GA4's '(other)' bucket that

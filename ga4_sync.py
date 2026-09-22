@@ -5,21 +5,43 @@ Standalone script: creates its own tables in warehouse.db via ensure_schema(),
 so nothing else in the repo needs to change to query them (the MCP server's
 generic run_sql / list_tables tools work against any table automatically).
 
-Four reports per run:
-  ga_metrics       — daily full-funnel totals by default channel group
-                     (sessions, users, conversions, revenue, ...), plus a
-                     cookie-scoped first_time_purchasers count per channel
-                     (see "FIRST-TIME PURCHASERS ARE COOKIE-SCOPED" below).
-  ga_products      — daily item-level views/add-to-cart/purchases/revenue.
-                     Pulled in DAILY chunks (see "THE 100K-ROW CAP" below).
-  ga_landing_pages — daily landing-page sessions/conversions/revenue, limited
-                     to pages with meaningful traffic that day.
-  ga_campaign_ntb  — daily new-vs-returning split PER GOOGLE ADS CAMPAIGN (see
-                     "NEW-TO-BRAND BY CAMPAIGN" below). Answers "is this
-                     campaign acquiring new customers or just re-selling to
-                     existing ones?" — a question the channel-level metrics
-                     report can't reach, since it only has channel, not
-                     campaign, granularity.
+Seven reports per run:
+  ga_metrics             — daily full-funnel totals by default channel group
+                            (sessions, users, conversions, revenue, ...), plus
+                            a cookie-scoped first_time_purchasers count per
+                            channel (see "FIRST-TIME PURCHASERS ARE
+                            COOKIE-SCOPED" below).
+  ga_products             — daily item-level views/add-to-cart/purchases/
+                            revenue. Pulled in DAILY chunks (see "THE
+                            100K-ROW CAP" below).
+  ga_landing_pages        — daily landing-page sessions/conversions/revenue,
+                            limited to pages with meaningful traffic that day.
+  ga_landing_buckets      — the same landing-page traffic collapsed into a
+                            few coarse page TYPES (product/collection/
+                            content/home/other) instead of one row per URL —
+                            useful when per-URL detail is noisier than you
+                            need but "which page type converts" still
+                            matters. See "LANDING-PAGE BUCKETS" below.
+  ga_landing_bucket_meta  — the same page-type buckets, further split into
+                            Meta (Facebook/Instagram) paid vs. organic vs.
+                            everything else, so you can ask "does Meta
+                            traffic convert better on a product page or a
+                            collection page." See "THE META TRAFFIC SPLIT"
+                            below.
+  ga_collection_meta      — one level more granular than
+                            ga_landing_bucket_meta's single "Collection page"
+                            bucket: per-collection-URL performance x the same
+                            Meta paid/organic/other split, for when the
+                            aggregate collection number hides a real split
+                            between your broad/catch-all collections and your
+                            narrower, more specifically-targeted ones.
+  ga_campaign_ntb         — daily new-vs-returning split PER GOOGLE ADS
+                            CAMPAIGN (see "NEW-TO-BRAND BY CAMPAIGN" below).
+                            Answers "is this campaign acquiring new customers
+                            or just re-selling to existing ones?" — a
+                            question the channel-level metrics report can't
+                            reach, since it only has channel, not campaign,
+                            granularity.
 
 SETUP (once):
   1. Install the client library into your venv:
@@ -103,6 +125,41 @@ separate mobile-app property under the same account), and pointing at the
 wrong one is a very easy, very quiet mistake: it doesn't error, it just
 returns tiny real numbers for a different property entirely.
 
+LANDING-PAGE BUCKETS. `ga_landing_pages` is per-URL, which is exactly right
+for "which specific page" questions but too granular for "which page TYPE"
+ones — every product page is its own row. `ga_landing_buckets` answers the
+coarser question instead: each bucket in `LANDING_BUCKETS` (a (label, match
+kind, value) tuple you edit for your own site's URL structure) is its own
+independent, date-only filtered request, so GA4 returns an EXACT total per
+bucket rather than a GROUP BY that would let the long tail of low-traffic
+URLs collapse into GA4's own "(other)" rollup. A derived "Other /
+uncategorised" row (whole-property total minus every named bucket) keeps the
+buckets reconciling to the same-day site total by construction — it's never
+itself requested.
+
+THE META TRAFFIC SPLIT. `ga_landing_bucket_meta` and `ga_collection_meta`
+both split their traffic into `meta_paid` / `meta_organic` / `other` using
+two constants: `META_SOURCES`, an ALLOWLIST of exact `sessionSource` values
+GA4 reports for Facebook/Instagram traffic (deliberately not a substring
+match — a naive "ig"/"meta" check false-positives on unrelated sources that
+happen to contain those letters), and `PAID_MEDIUM_MARKERS`, a
+case-insensitive CONTAINS check against `sessionMedium` for anything looking
+like a paid placement. Both are necessarily heuristic: advertiser UTM
+tagging is inconsistent in practice, on Meta's side and often on your own
+team's side too, so treat this split as directional rather than reconciled
+to what Meta Ads Manager itself reports for spend/revenue — extend
+`META_SOURCES`/`PAID_MEDIUM_MARKERS` if you see a `sessionSource`/
+`sessionMedium` casing GA4 reports for your property that isn't caught here.
+Both tables use the same zero-cardinality-per-slice trick as
+`ga_landing_buckets`: the bucket/URL matcher and the Meta source/medium
+filters are all FILTERS on the request, not GROUP-BY dimensions, so each
+(bucket-or-page, meta_class) slice is an exact number, and the three
+meta_class rows for a given bucket/page/day always sum to that same
+bucket/page/day's un-split total. `ga_collection_meta` additionally scopes
+to `/collections/`-prefixed URLs only, so its per-URL cardinality stays
+bounded to however many collection pages your storefront actually has
+instead of the whole site.
+
 NEW-TO-BRAND BY CAMPAIGN. GA4's `sessionGoogleAdsCampaignName` dimension
 returns the campaign name byte-for-byte identical to whatever your Google Ads
 connector calls it (verify this once for your own account — it's a documented
@@ -173,6 +230,30 @@ LANDING_PAGE_MIN_SESSIONS = 4
 # ga_campaign_ntb — see "NEW-TO-BRAND BY CAMPAIGN" in the module docstring.
 NOT_SET_CAMPAIGN = "(not set)"
 
+# (bucket label, landingPage match kind, value) for ga_landing_buckets /
+# ga_landing_bucket_meta. Order only matters for readability — each bucket is
+# an independent filtered request. Edit this for your own site's URL
+# structure; "Other / uncategorised" is always derived, never one of these.
+# See "LANDING-PAGE BUCKETS" in the module docstring.
+LANDING_BUCKETS = (
+    ("Product page (PDP)", "begins", "/products/"),
+    ("Collection page",    "begins", "/collections/"),
+    ("Content page",       "begins", "/pages/"),
+    ("Home page",          "exact",  "/"),
+)
+
+# Exact sessionSource values (cased as GA4 reports them) that are genuinely
+# Meta (Facebook + Instagram) traffic — an ALLOWLIST, not a substring match.
+# See "THE META TRAFFIC SPLIT" in the module docstring.
+META_SOURCES = (
+    "facebook", "Facebook", "facebook.com", "m.facebook.com", "l.facebook.com",
+    "lm.facebook.com", "facebook-SiteLink", "Facebook_Mobile_Feed",
+    "Facebook_Desktop_Feed", "instagram", "Instagram", "instagram.com",
+    "l.instagram.com", "ig", "IG", "IGShopping",
+)
+# sessionMedium CONTAINS any of these (case-insensitive) -> paid; else organic.
+PAID_MEDIUM_MARKERS = ("paid", "cpc", "ppc")
+
 DDL = """
 CREATE TABLE IF NOT EXISTS ga_metrics (
     property_id      TEXT NOT NULL,
@@ -240,6 +321,68 @@ CREATE TABLE IF NOT EXISTS ga_campaign_ntb (
 );
 CREATE INDEX IF NOT EXISTS idx_ga_ntb_date ON ga_campaign_ntb(date);
 CREATE INDEX IF NOT EXISTS idx_ga_ntb_campaign ON ga_campaign_ntb(campaign_name);
+
+-- Landing-page performance collapsed into a few coarse page TYPES rather
+-- than one row per URL — see "LANDING-PAGE BUCKETS" in the module docstring.
+-- Each bucket comes from its own filtered, date-only request (an exact
+-- number per slice), and "Other / uncategorised" is derived (whole-property
+-- total minus every named bucket), so the buckets always reconcile to the
+-- same-day site total.
+CREATE TABLE IF NOT EXISTS ga_landing_buckets (
+    property_id      TEXT NOT NULL,
+    date             TEXT NOT NULL,
+    bucket           TEXT NOT NULL,
+    sessions         INTEGER DEFAULT 0,
+    engaged_sessions INTEGER DEFAULT 0,
+    conversions      REAL    DEFAULT 0,
+    purchases        INTEGER DEFAULT 0,
+    revenue          REAL    DEFAULT 0,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (property_id, date, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_ga_landing_buckets_date ON ga_landing_buckets(date);
+
+-- The same landing-page buckets, further split by Meta paid/organic/other —
+-- see "THE META TRAFFIC SPLIT" in the module docstring. Same
+-- zero-cardinality-per-slice trick: the bucket matcher and the Meta
+-- source/medium split are FILTERS on the request, not GROUP-BY dimensions,
+-- so each (bucket, meta_class) slice is an exact number, and the three
+-- meta_class rows for a bucket/day always sum to that bucket/day's row in
+-- ga_landing_buckets.
+CREATE TABLE IF NOT EXISTS ga_landing_bucket_meta (
+    property_id      TEXT NOT NULL,
+    date             TEXT NOT NULL,
+    bucket           TEXT NOT NULL,
+    meta_class       TEXT NOT NULL,   -- meta_paid | meta_organic | other
+    sessions         INTEGER DEFAULT 0,
+    engaged_sessions INTEGER DEFAULT 0,
+    conversions      REAL    DEFAULT 0,
+    purchases        INTEGER DEFAULT 0,
+    revenue          REAL    DEFAULT 0,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (property_id, date, bucket, meta_class)
+);
+CREATE INDEX IF NOT EXISTS idx_ga_landing_bucket_meta_date ON ga_landing_bucket_meta(date);
+
+-- Per-COLLECTION-URL performance x the same Meta paid/organic/other split —
+-- one level more granular than ga_landing_bucket_meta's single "Collection
+-- page" bucket. See "THE META TRAFFIC SPLIT" in the module docstring.
+-- Scoped to /collections/ URLs only, so landingPage cardinality stays
+-- bounded to your own collection count instead of the whole site.
+CREATE TABLE IF NOT EXISTS ga_collection_meta (
+    property_id      TEXT NOT NULL,
+    date             TEXT NOT NULL,
+    landing_page     TEXT NOT NULL,
+    meta_class       TEXT NOT NULL,   -- meta_paid | meta_organic | other
+    sessions         INTEGER DEFAULT 0,
+    engaged_sessions INTEGER DEFAULT 0,
+    conversions      REAL    DEFAULT 0,
+    purchases        INTEGER DEFAULT 0,
+    revenue          REAL    DEFAULT 0,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (property_id, date, landing_page, meta_class)
+);
+CREATE INDEX IF NOT EXISTS idx_ga_collection_meta_date ON ga_collection_meta(date);
 """
 
 # Columns added after a table may already exist from an older version of this
@@ -249,8 +392,14 @@ MIGRATE_COLUMNS = ("first_time_purchasers INTEGER DEFAULT 0",)
 
 # Grain names accepted by --only. "products" is the expensive one (daily
 # chunks); "metrics" and "landing_pages" are one request per month of range;
-# "campaign_ntb" is cheap (low cardinality: campaigns x 3 visitor types x days).
-GRAINS = ("metrics", "products", "landing_pages", "campaign_ntb")
+# "campaign_ntb" is cheap (low cardinality: campaigns x 3 visitor types x
+# days); "landing_buckets" is a handful of extra requests (one per bucket,
+# always low cardinality); "landing_bucket_meta" triples that (each bucket x
+# 3 meta_class splits) but is still cheap; "collection_meta" is the priciest
+# of the five extras (per-collection-URL x meta_class) but stays bounded by
+# your own collection count, not total site traffic.
+GRAINS = ("metrics", "products", "landing_pages", "landing_buckets",
+          "landing_bucket_meta", "collection_meta", "campaign_ntb")
 
 # GA4 caps a single report response at 100k rows; _run() pages past it with
 # offset/limit rather than trusting one request.
@@ -311,6 +460,53 @@ def _not_dimension(dimension: str, value: str) -> FilterExpression:
         string_filter=Filter.StringFilter(
             value=value, match_type=Filter.StringFilter.MatchType.EXACT),
     )))
+
+
+def _begins_with(dimension: str, value: str) -> FilterExpression:
+    """dimension BEGINS_WITH value."""
+    return FilterExpression(filter=Filter(
+        field_name=dimension,
+        string_filter=Filter.StringFilter(
+            value=value, match_type=Filter.StringFilter.MatchType.BEGINS_WITH),
+    ))
+
+
+def _exact_dimension(dimension: str, value: str) -> FilterExpression:
+    """dimension == value."""
+    return FilterExpression(filter=Filter(
+        field_name=dimension,
+        string_filter=Filter.StringFilter(
+            value=value, match_type=Filter.StringFilter.MatchType.EXACT),
+    ))
+
+
+def _and_filter(*exprs: FilterExpression) -> FilterExpression:
+    return FilterExpression(and_group=FilterExpressionList(expressions=list(exprs)))
+
+
+def _not_filter(expr: FilterExpression) -> FilterExpression:
+    return FilterExpression(not_expression=expr)
+
+
+def _meta_source_filter() -> FilterExpression:
+    """sessionSource IN META_SOURCES — see "THE META TRAFFIC SPLIT" in the
+    module docstring."""
+    return FilterExpression(filter=Filter(
+        field_name="sessionSource",
+        in_list_filter=Filter.InListFilter(values=list(META_SOURCES)),
+    ))
+
+
+def _paid_medium_filter() -> FilterExpression:
+    """sessionMedium CONTAINS any PAID_MEDIUM_MARKERS token, case-insensitive."""
+    return FilterExpression(or_group=FilterExpressionList(expressions=[
+        FilterExpression(filter=Filter(
+            field_name="sessionMedium",
+            string_filter=Filter.StringFilter(
+                value=marker, match_type=Filter.StringFilter.MatchType.CONTAINS,
+                case_sensitive=False),
+        )) for marker in PAID_MEDIUM_MARKERS
+    ]))
 
 
 def _with_retry(fn, what: str):
@@ -529,6 +725,153 @@ def sync_landing_pages(client, conn, prop: str, start: str, end: str, stamp: str
     return len(rows)
 
 
+def sync_landing_buckets(client, conn, prop: str, start: str, end: str,
+                          conversion_metric: str, stamp: str) -> int:
+    """Landing-page performance collapsed into LANDING_BUCKETS' coarse page
+    types — see "LANDING-PAGE BUCKETS" in the module docstring."""
+    metrics = ["sessions", "engagedSessions", conversion_metric, "transactions", "totalRevenue"]
+
+    def _totals(dim_filter):
+        """One request, dimensioned by date only -> exact numbers."""
+        out = {}
+        for r in _run(client, prop, start, end, ["date"], metrics, dimension_filter=dim_filter):
+            m = [v.value for v in r.metric_values]
+            out[_iso(r.dimension_values[0].value)] = (
+                int(float(m[0] or 0)), int(float(m[1] or 0)), float(m[2] or 0),
+                int(float(m[3] or 0)), float(m[4] or 0))
+        return out
+
+    grand = _totals(None)
+    per_bucket = {}
+    for label, kind, value in LANDING_BUCKETS:
+        f = (_begins_with("landingPage", value) if kind == "begins"
+             else _exact_dimension("landingPage", value))
+        per_bucket[label] = _totals(f)
+
+    rows = []
+    for day, tot in grand.items():
+        named = [0, 0, 0.0, 0, 0.0]
+        for label, by_day in per_bucket.items():
+            vals = by_day.get(day)
+            if not vals:
+                continue
+            for i in range(5):
+                named[i] += vals[i]
+            rows.append((prop, day, label, *vals, stamp))
+        # Derived, so the buckets always reconcile to the grand total.
+        rows.append((prop, day, "Other / uncategorised",
+                     max(0, tot[0] - named[0]), max(0, tot[1] - named[1]),
+                     max(0.0, tot[2] - named[2]), max(0, tot[3] - named[3]),
+                     max(0.0, tot[4] - named[4]), stamp))
+    _purge_dates(conn, "ga_landing_buckets", prop, rows)
+    conn.executemany(
+        """INSERT OR REPLACE INTO ga_landing_buckets
+           (property_id, date, bucket, sessions, engaged_sessions,
+            conversions, purchases, revenue, synced_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    return len(rows)
+
+
+def sync_landing_bucket_meta(client, conn, prop: str, start: str, end: str,
+                              conversion_metric: str, stamp: str) -> int:
+    """LANDING_BUCKETS x Meta paid/organic/other — see "THE META TRAFFIC
+    SPLIT" in the module docstring."""
+    metrics = ["sessions", "engagedSessions", conversion_metric, "transactions", "totalRevenue"]
+
+    def _totals(dim_filter):
+        out = {}
+        for r in _run(client, prop, start, end, ["date"], metrics, dimension_filter=dim_filter):
+            m = [v.value for v in r.metric_values]
+            out[_iso(r.dimension_values[0].value)] = (
+                int(float(m[0] or 0)), int(float(m[1] or 0)), float(m[2] or 0),
+                int(float(m[3] or 0)), float(m[4] or 0))
+        return out
+
+    meta_source = _meta_source_filter()
+    paid_medium = _paid_medium_filter()
+
+    rows = []
+    for label, kind, value in LANDING_BUCKETS:
+        bucket_f = (_begins_with("landingPage", value) if kind == "begins"
+                    else _exact_dimension("landingPage", value))
+        bucket_total = _totals(bucket_f)
+        paid = _totals(_and_filter(bucket_f, meta_source, paid_medium))
+        organic = _totals(_and_filter(bucket_f, meta_source, _not_filter(paid_medium)))
+
+        for day, tot in bucket_total.items():
+            p = paid.get(day, (0, 0, 0.0, 0, 0.0))
+            o = organic.get(day, (0, 0, 0.0, 0, 0.0))
+            rows.append((prop, day, label, "meta_paid", *p, stamp))
+            rows.append((prop, day, label, "meta_organic", *o, stamp))
+            other = tuple(
+                (max(0, tot[i] - p[i] - o[i]) if i in (0, 1, 3)
+                 else max(0.0, tot[i] - p[i] - o[i]))
+                for i in range(5)
+            )
+            rows.append((prop, day, label, "other", *other, stamp))
+    _purge_dates(conn, "ga_landing_bucket_meta", prop, rows)
+    conn.executemany(
+        """INSERT OR REPLACE INTO ga_landing_bucket_meta
+           (property_id, date, bucket, meta_class, sessions, engaged_sessions,
+            conversions, purchases, revenue, synced_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    return len(rows)
+
+
+def sync_collection_meta(client, conn, prop: str, start: str, end: str,
+                          conversion_metric: str, stamp: str) -> int:
+    """Per-collection-URL performance x Meta paid/organic/other — see "THE
+    META TRAFFIC SPLIT" in the module docstring. Scoped to /collections/ URLs
+    only, so landingPage cardinality stays bounded to your own collection
+    count rather than the whole site."""
+    metrics = ["sessions", "engagedSessions", conversion_metric, "transactions", "totalRevenue"]
+    collections_f = _begins_with("landingPage", "/collections/")
+    meta_source = _meta_source_filter()
+    paid_medium = _paid_medium_filter()
+
+    def _by_page(dim_filter):
+        out = {}
+        for r in _run(client, prop, start, end, ["date", "landingPage"], metrics,
+                      dimension_filter=dim_filter):
+            m = [v.value for v in r.metric_values]
+            key = (_iso(r.dimension_values[0].value), r.dimension_values[1].value)
+            out[key] = (
+                int(float(m[0] or 0)), int(float(m[1] or 0)), float(m[2] or 0),
+                int(float(m[3] or 0)), float(m[4] or 0))
+        return out
+
+    total_map = _by_page(collections_f)
+    paid_map = _by_page(_and_filter(collections_f, meta_source, paid_medium))
+    organic_map = _by_page(_and_filter(collections_f, meta_source, _not_filter(paid_medium)))
+    zero = (0, 0, 0.0, 0, 0.0)
+
+    rows = []
+    for (day, page), tot in total_map.items():
+        p = paid_map.get((day, page), zero)
+        o = organic_map.get((day, page), zero)
+        rows.append((prop, day, page, "meta_paid", *p, stamp))
+        rows.append((prop, day, page, "meta_organic", *o, stamp))
+        other = tuple(
+            (max(0, tot[i] - p[i] - o[i]) if i in (0, 1, 3)
+             else max(0.0, tot[i] - p[i] - o[i]))
+            for i in range(5)
+        )
+        rows.append((prop, day, page, "other", *other, stamp))
+    _purge_dates(conn, "ga_collection_meta", prop, rows)
+    conn.executemany(
+        """INSERT OR REPLACE INTO ga_collection_meta
+           (property_id, date, landing_page, meta_class, sessions, engaged_sessions,
+            conversions, purchases, revenue, synced_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    return len(rows)
+
+
 def run(start: str, end: str, only: frozenset[str] | None = None) -> int:
     prop = os.environ["GA4_PROPERTY_ID"]
     client = _client()
@@ -552,6 +895,18 @@ def run(start: str, end: str, only: frozenset[str] | None = None) -> int:
             for lo, hi in _month_chunks(start, end):
                 with conn:
                     total += sync_landing_pages(client, conn, prop, lo, hi, stamp)
+        if "landing_buckets" in grains:
+            for lo, hi in _month_chunks(start, end):
+                with conn:
+                    total += sync_landing_buckets(client, conn, prop, lo, hi, conversion_metric, stamp)
+        if "landing_bucket_meta" in grains:
+            for lo, hi in _month_chunks(start, end):
+                with conn:
+                    total += sync_landing_bucket_meta(client, conn, prop, lo, hi, conversion_metric, stamp)
+        if "collection_meta" in grains:
+            for lo, hi in _month_chunks(start, end):
+                with conn:
+                    total += sync_collection_meta(client, conn, prop, lo, hi, conversion_metric, stamp)
         if "campaign_ntb" in grains:
             for lo, hi in _month_chunks(start, end):
                 with conn:

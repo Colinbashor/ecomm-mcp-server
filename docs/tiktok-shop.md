@@ -1,8 +1,8 @@
 # TikTok Shop
 
-Order ground truth (core), plus five standalone scripts for video
-performance, LIVE-shopping, creator identity, sales-source attribution, and
-settlement/fee data.
+Order ground truth (core), plus six standalone scripts for video
+performance, LIVE-shopping, creator identity, sales-source attribution,
+settlement/fee data, and listing-quality diagnostics.
 
 ## Scripts
 
@@ -14,6 +14,7 @@ settlement/fee data.
 | `tiktok_creators_sync.py` | standalone | handle ↔ display-name ↔ user-id creator/affiliate identity bridge |
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
 | `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
+| `tiktok_listing_quality_sync.py` | standalone | per-product content-quality tier + issues (Listings Diagnosis API) |
 
 ## Setup
 
@@ -36,8 +37,11 @@ settlement/fee data.
    | `TIKTOK_LIVE_OWN_ACCOUNT_TYPE` | which `tiktok_shop_lives.account_type` counts as your own broadcasts vs. affiliate/creator or paid-marketing lives (default `OFFICIAL_ACCOUNTS`) |
    | `TIKTOK_SHOP_TIMEZONE` | IANA timezone for bucketing LIVE broadcasts into calendar days (default `UTC`) |
 
-All five extras reuse the core `TIKTOK_*` credentials — nothing new to
-configure.
+All six extras reuse the core `TIKTOK_*` credentials — nothing new to
+configure, except `tiktok_listing_quality_sync.py`, which additionally needs
+the `seller.product.optimize` scope granted on your Partner Center app
+(separate from the product-read scopes the other scripts use — check
+Partner Center > your app > Scopes before a first run).
 
 ## Usage
 
@@ -68,6 +72,9 @@ python tiktok_finance_sync.py                 # settlements, last 30 days
 python tiktok_finance_sync.py --backfill      # 365-day window
 python tiktok_finance_sync.py --no-components # statements only, fast
 python tiktok_finance_sync.py --no-orders     # skip retaining per-order fee rows (statements + components only)
+
+python tiktok_listing_quality_sync.py --product-ids 1234567890,2345678901
+python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
 ```
 
 ## Tables
@@ -78,6 +85,7 @@ python tiktok_finance_sync.py --no-orders     # skip retaining per-order fee row
 - `tiktok_creators`
 - `tiktok_shop_performance`
 - `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
+- `tiktok_listing_quality`, `tiktok_listing_quality_issues`
 
 ## Notes
 
@@ -141,8 +149,16 @@ thing twice: the statements endpoint 400s with "SortField is a required
 field" if `sort_field` is omitted, which reads exactly like a missing-scope
 error but usually isn't — see the module docstring.
 
+`tiktok_listing_quality_sync.py` has no catalog table to source an
+active-product-id list from — pass `--product-ids`/`--product-ids-file`
+explicitly. The diagnosis endpoint takes up to 200 ids per call, and one bad
+id (e.g. a deleted product) fails the whole batch — this script halves a
+failing batch recursively down to singles so one bad id doesn't discard the
+other ~199 products' results, and logs `degraded` (never `ok`) if any id
+still failed after halving all the way down.
+
 ## Tests
 
 `tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
-`tests/test_tiktok_finance_sync.py`
+`tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`
