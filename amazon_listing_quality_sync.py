@@ -1,7 +1,7 @@
 r"""
 Amazon SP-API listing quality (Listings Items issues) -> warehouse.
 
-Endpoint: GET /listings/2021-08-01/items/{sellerId}/{sku}?includedData=issues,summaries
+Endpoint: GET /listings/2021-08-01/items/{sellerId}/{sku}?includedData=issues,summaries,attributes
 
 Scope needed: NONE beyond the existing SPAPI_* LWA credentials amazon_orders.py
 already uses.
@@ -13,6 +13,20 @@ for that side), but the `issues` array on each listing is driven by the same
 kind of objective, fixable checks — missing/incomplete attributes, image
 problems, size-chart defects, catalog-data conflicts — each carrying a
 severity (ERROR/WARNING/INFO).
+
+BACKEND SEARCH TERMS COME ALONG FOR FREE. Adding `attributes` to the same
+`includedData` list costs no extra call and no extra scope, and it surfaces
+the `generic_keyword` attribute — this is the actual hidden "Search Terms"
+field from Seller Central's edit-listing page, not a guess or a derived
+value. It's worth capturing here because it's invisible everywhere else:
+it never appears on the storefront, and Amazon gives sellers no report or
+search-terms API that lists what's currently saved per SKU — the only way
+to see it is one listing at a time in the UI, or here. `item_type_keyword`
+(Amazon's own category classifier for the listing, not free text) is
+captured alongside it since it's the same attribute call. Both are commonly
+NULL/empty for a given SKU — that's a real content gap worth surfacing, not
+a parsing bug — and a keyword you want ranked on but can't fit in the
+visible title/bullets is exactly what this backend field is for.
 
 !! SELLER ID GOTCHA !!
 The Listings Items API path needs {sellerId} (Amazon calls it the "Merchant
@@ -68,6 +82,12 @@ Snapshot semantics, same as tiktok_listing_quality_sync.py: latest diagnosis
 only. `amazon_listing_quality_issues` rows for a SKU are deleted and
 re-inserted each time that SKU is diagnosed, not accumulated.
 
+`--resume` skips any seller SKU already present in `amazon_listing_quality`,
+to finish an interrupted full pass without redoing already-synced work.
+Deliberately NOT the default: a normal run always re-diagnoses every SKU on
+the list, since a listing's issues (and its backend search terms) can change
+between runs and a stale row should refresh.
+
 AUTH: same SPAPI_* LWA credentials as amazon_orders.py, plus SPAPI_SELLER_ID
 (see the gotcha above) — no new app registration.
 
@@ -75,6 +95,7 @@ USAGE:
   python amazon_listing_quality_sync.py --skus SKU1,SKU2
   python amazon_listing_quality_sync.py --skus-file skus.txt
   python amazon_listing_quality_sync.py --skus-file skus.txt --limit 100   # smoke test
+  python amazon_listing_quality_sync.py --skus-file skus.txt --resume      # finish an interrupted pass
 """
 from __future__ import annotations
 
@@ -107,15 +128,17 @@ SEVERITY_RANK = {"ERROR": 2, "WARNING": 1, "INFO": 0}
 
 DDL = """
 CREATE TABLE IF NOT EXISTS amazon_listing_quality (
-    seller_sku      TEXT PRIMARY KEY,
-    asin            TEXT,
-    item_name       TEXT,
-    product_type    TEXT,
-    is_discoverable INTEGER,   -- 0/1, from summaries[0].status
-    is_buyable      INTEGER,   -- 0/1
-    issue_count     INTEGER,   -- excludes NON_DEFECT_CODES
-    max_severity    TEXT,      -- 'ERROR' | 'WARNING' | 'INFO' | NULL (clean)
-    synced_at       TEXT NOT NULL
+    seller_sku        TEXT PRIMARY KEY,
+    asin              TEXT,
+    item_name         TEXT,
+    product_type      TEXT,
+    is_discoverable   INTEGER,   -- 0/1, from summaries[0].status
+    is_buyable        INTEGER,   -- 0/1
+    issue_count       INTEGER,   -- excludes NON_DEFECT_CODES
+    max_severity      TEXT,      -- 'ERROR' | 'WARNING' | 'INFO' | NULL (clean)
+    generic_keyword   TEXT,      -- the real backend "Search Terms" field; NULL = empty
+    item_type_keyword TEXT,      -- Amazon's own category classifier, not free-text
+    synced_at         TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS amazon_listing_quality_issues (
     seller_sku      TEXT NOT NULL,
@@ -131,6 +154,11 @@ CREATE TABLE IF NOT EXISTS amazon_listing_quality_issues (
 );
 """
 
+# Columns added after a table may already exist from an older version of this
+# script — applied on the fly so an existing warehouse.db doesn't need to be
+# dropped to pick up a new column.
+MIGRATE_COLUMNS = ("generic_keyword TEXT", "item_type_keyword TEXT")
+
 
 def require_env() -> None:
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
@@ -144,7 +172,14 @@ def require_env() -> None:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create this connector's tables if they don't exist yet, and add any
+    columns introduced after a table may already have been created (see
+    MIGRATE_COLUMNS) — safe to call every run."""
     conn.executescript(DDL)
+    existing = {c[1] for c in conn.execute("PRAGMA table_info(amazon_listing_quality)")}
+    for col_def in MIGRATE_COLUMNS:
+        if col_def.split()[0] not in existing:
+            conn.execute(f"ALTER TABLE amazon_listing_quality ADD COLUMN {col_def}")
 
 
 def fallback_skus(conn: sqlite3.Connection) -> list[str]:
@@ -169,14 +204,15 @@ def _force_token_refresh() -> None:
 
 
 def _get_listing(host: str, seller_id: str, sku: str, marketplace_id: str) -> tuple[int, dict]:
-    """One GET for a single SKU's issues+summaries. Refreshes the LWA token
-    once on 401/403, backs off on 429. Returns (status_code, json_body)."""
+    """One GET for a single SKU's issues+summaries+attributes. Refreshes the
+    LWA token once on 401/403, backs off on 429. Returns (status_code, json_body)."""
     path = PATH_TMPL.format(seller_id=seller_id, sku=requests.utils.quote(sku, safe=""))
     for attempt in range(6):
         try:
             resp = requests.get(
                 f"{host}{path}",
-                params={"marketplaceIds": marketplace_id, "includedData": "issues,summaries"},
+                params={"marketplaceIds": marketplace_id,
+                        "includedData": "issues,summaries,attributes"},
                 headers={"x-amz-access-token": _access_token(), "Accept": "application/json"},
                 timeout=30,
             )
@@ -194,11 +230,22 @@ def _get_listing(host: str, seller_id: str, sku: str, marketplace_id: str) -> tu
     raise RuntimeError(f"SP-API listings GET for {sku!r} kept failing after retries.")
 
 
-def run(conn: sqlite3.Connection, skus: list[str]) -> tuple[int, int, list[tuple[str, str]]]:
+def run(conn: sqlite3.Connection, skus: list[str],
+        resume: bool = False) -> tuple[int, int, list[tuple[str, str]]]:
     region = os.environ.get("SPAPI_REGION", "NA").upper()
     host = HOSTS[region]
     marketplace_id = os.environ["SPAPI_MARKETPLACE_ID"]
     seller_id = os.environ["SPAPI_SELLER_ID"]
+
+    if resume:
+        # Skip SKUs a prior (possibly interrupted) run already wrote. There's
+        # no per-run id, so "already present at all" is the resume signal --
+        # fine for finishing an interrupted full pass; see the module
+        # docstring for why this isn't the default.
+        already = {r[0] for r in conn.execute(
+            "SELECT seller_sku FROM amazon_listing_quality").fetchall()}
+        skus = [s for s in skus if s not in already]
+        print(f"    --resume: {len(already)} already synced, {len(skus)} remaining", flush=True)
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     failed: list[tuple[str, str]] = []
@@ -218,6 +265,7 @@ def run(conn: sqlite3.Connection, skus: list[str]) -> tuple[int, int, list[tuple
 
         summ = (data.get("summaries") or [{}])[0]
         issues = data.get("issues") or []
+        attrs = data.get("attributes") or {}
         status_list = summ.get("status") or []
         defect_issues = [iss for iss in issues if iss.get("code") not in NON_DEFECT_CODES]
         max_sev = None
@@ -225,15 +273,21 @@ def run(conn: sqlite3.Connection, skus: list[str]) -> tuple[int, int, list[tuple
             max_sev = max((iss.get("severity") for iss in defect_issues),
                            key=lambda s: SEVERITY_RANK.get(s, 0))
 
+        # Both are lists-of-{"value": ...} per the Listings Items attribute
+        # shape; take the first (sellers set at most one of each in practice).
+        generic_keyword = ((attrs.get("generic_keyword") or [{}])[0] or {}).get("value")
+        item_type_keyword = ((attrs.get("item_type_keyword") or [{}])[0] or {}).get("value")
+
         with conn:
             conn.execute(
                 """INSERT OR REPLACE INTO amazon_listing_quality
                    (seller_sku, asin, item_name, product_type, is_discoverable,
-                    is_buyable, issue_count, max_severity, synced_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    is_buyable, issue_count, max_severity, generic_keyword,
+                    item_type_keyword, synced_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (sku, summ.get("asin"), summ.get("itemName"), summ.get("productType"),
                  int("DISCOVERABLE" in status_list), int("BUYABLE" in status_list),
-                 len(defect_issues), max_sev, stamp),
+                 len(defect_issues), max_sev, generic_keyword, item_type_keyword, stamp),
             )
             conn.execute("DELETE FROM amazon_listing_quality_issues WHERE seller_sku = ?", (sku,))
             if issues:
@@ -261,6 +315,9 @@ def main() -> int:
     p.add_argument("--skus-file", help="path to a file with one seller SKU per line")
     p.add_argument("--limit", type=int, default=None,
                    help="only diagnose the first N SKUs (smoke test)")
+    p.add_argument("--resume", action="store_true",
+                   help="skip SKUs already present in amazon_listing_quality "
+                        "(finish an interrupted run)")
     args = p.parse_args()
 
     require_env()
@@ -287,7 +344,7 @@ def main() -> int:
 
     started = warehouse_db.now()
     try:
-        requested, written, failed = run(conn, skus)
+        requested, written, failed = run(conn, skus, resume=args.resume)
     except Exception as e:  # noqa: BLE001
         conn.close()
         warehouse_db.log_sync(PLATFORM, started, 0, "error", str(e))

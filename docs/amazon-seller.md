@@ -65,6 +65,7 @@ python amazon_traffic_sync.py --repair               # re-pull only weeks record
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
 python amazon_listing_quality_sync.py --skus SKU1,SKU2
 python amazon_listing_quality_sync.py --skus-file skus.txt
+python amazon_listing_quality_sync.py --skus-file skus.txt --resume   # finish an interrupted pass
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
 python voc_import.py --dir imports/voc               # import every *.csv in a folder
@@ -180,7 +181,16 @@ from `issue_count`/`max_severity` — it's a merchandising nudge, not a
 content defect — but it's kept in `amazon_listing_quality_issues` so nothing
 observed is silently dropped. There's no bulk report for this data, so it's
 a synchronous per-SKU call; the endpoint rate-limits at 5 req/sec, which this
-script paces itself under.
+script paces itself under. Pass `--resume` to finish an interrupted full
+pass without redoing SKUs already written this run — it isn't the default,
+since a normal run always re-diagnoses every SKU (issues, and the search
+terms below, can change between runs).
+
+The same GET also captures `generic_keyword` — the real, otherwise-invisible
+backend "Search Terms" field from Seller Central's edit-listing page (no
+separate API or report exposes it) — plus `item_type_keyword` (Amazon's own
+category classifier), at no extra API cost. A NULL here means the field is
+genuinely empty on that listing, a real content gap worth surfacing.
 
 ## Tests
 
