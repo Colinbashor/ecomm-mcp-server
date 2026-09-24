@@ -36,8 +36,8 @@ For Amazon **retail orders / SP-API** (a separate credential set), see
    | Variable | Notes |
    |---|---|
    | `AMAZON_ADS_CLIENT_ID` / `AMAZON_ADS_CLIENT_SECRET` | from the LWA app |
-   | `AMAZON_ADS_REGION` | default `NA` |
-   | `AMAZON_ADS_REDIRECT_URI` | must byte-match an Allowed Return URL on the security profile — trailing slash matters |
+   | `AMAZON_ADS_REGION` | `NA`, `EU`, or `FE`, uppercase (default `NA`; the connectors look it up case-sensitively) — picks the Ads API host for both the auth helper and the report pulls |
+   | `AMAZON_ADS_REDIRECT_URI` | default `https://localhost`; must byte-match an Allowed Return URL on the security profile — trailing slash matters |
    | `AMAZON_ADS_REPORT_TIMEOUT_MIN` | optional, how long to wait for an async report before giving up (default `60`) |
 
 `amazon_ads_detail_sync.py` reuses these same variables — nothing new to

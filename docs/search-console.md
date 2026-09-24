@@ -50,12 +50,40 @@ python search_console_sync.py --start 2026-01-01 --end 2026-01-31
 python search_console_sync.py --backfill             # retention floor -> yesterday
 python search_console_sync.py --backfill --refresh   # ignore stored coverage, re-pull all
 python search_console_sync.py --only queries --only pages
-python search_console_sync.py --only query_pages    # opt-in, see Notes
+python search_console_sync.py --only query_pages    # just the query x page bridge, see Notes
+python search_console_sync.py --only daily --only queries --only pages   # everything except query_pages
+python search_console_sync.py --site sc-domain:other.example  # override SEARCH_CONSOLE_SITE for one run
+python search_console_sync.py --data-state all      # include partial, still-settling days (not recommended)
 ```
 
-`--only` accepts `daily`, `queries`, `pages`, `query_pages` — repeatable. Run
-`--probe` first on a new property: it lists every site the service account
-can see and confirms which one is configured, without writing anything.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--days N` | `5` | rolling window of N days **ending yesterday**; the overlap deliberately re-pulls recent days as Google finalizes them |
+| `--start` / `--end` | — / yesterday | explicit `YYYY-MM-DD` window (`--start` overrides `--days`) |
+| `--backfill` | off | start at the retention floor (~510 days, ~16 months back) instead |
+| `--only GRAIN` | all four grains | repeatable; one of `daily`, `queries`, `pages`, `query_pages` |
+| `--refresh` | off | ignore stored coverage and re-fetch every day in the window (default is to resume, skipping days already settled) |
+| `--data-state` | `final` | `final` or `all`; `all` returns partial, never-corrected recent days (trap 5) |
+| `--site` | `SEARCH_CONSOLE_SITE` | property to pull, for a one-off run against a different property |
+| `--probe` | off | reachability + property check; writes nothing |
+
+> **Heads-up — `query_pages` currently runs by default.** The module
+> docstring (trap 8) and the grain's design describe `query_pages` as
+> opt-in, but `main()` falls back to the full `GRAINS` tuple — which
+> includes `query_pages` — whenever `--only` is omitted, so a plain
+> `python search_console_sync.py` pulls it too. If you want the lighter
+> daily job the docstring intends, pass the three other grains explicitly
+> (`--only daily --only queries --only pages`, shown above).
+
+If neither `SEARCH_CONSOLE_CREDENTIALS_FILE` nor `SEARCH_CONSOLE_SITE` is set
+(or the key file doesn't exist), the script prints which one is missing and
+exits cleanly without touching the database — safe to leave in a scheduled
+job before the property is configured. A `--start` below the retention floor
+prints a note but is harmless: out-of-range days return zero rows.
+
+Run `--probe` first on a new property: it lists every site the service
+account can see, confirms which one is configured, and prints the last 7
+settled days of site totals, without writing anything.
 
 ## Tables
 
@@ -69,12 +97,20 @@ can see and confirms which one is configured, without writing anything.
   **Impressions here double-count and must never be summed to a site
   figure** — see the module docstring.
 - `search_console_query_pages` — clicks/impressions/CTR/position per query
-  **and** landing page per day (opt-in, not pulled by default). The only
+  **and** landing page per day (designed as opt-in, but see the heads-up
+  under Usage — a run without `--only` currently includes it). The only
   grain that bridges a search term to a specific page, useful when your own
   product/page titles don't share vocabulary with what people actually
   search. Bigger and slower than the two grains above, and its impressions
   double-count in **both** directions (across a query's pages, and across a
   page's queries) — see the module docstring's trap (8).
+- `search_console_coverage` — bookkeeping, one row per date x site x
+  detail grain (`queries`/`pages`/`query_pages`): `rows_stored`,
+  `data_state`, `was_settled` (1 = the day was already past Google's
+  finalization lag when fetched), `fetched_at`. This is what makes a plain
+  re-run resume: a day only counts as done when it was pulled `final` **and**
+  settled. Not analytics data — don't join against it except to answer "did
+  we pull this day yet."
 
 ## Notes
 
