@@ -101,7 +101,7 @@ writes, and its test coverage.
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase, monthly search terms by category |
 | Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
 | TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data, listing-quality diagnostics |
-| Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | campaign/flow performance, audience growth, attributed revenue |
+| Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | email campaign + per-channel flow performance, segment growth, daily attributed revenue |
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
 | Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics; **write-capable** `reacher_sample_limits.py` for capping/clearing per-product sample auto-approval |
