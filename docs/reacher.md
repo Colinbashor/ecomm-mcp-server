@@ -55,8 +55,23 @@ python reacher_sync.py --skip video_creative # skip the slowest grain
 python reacher_sync.py --dry-run             # probe, write nothing
 ```
 
-Run `python reacher_sync.py --help` for the full flag list (window overrides,
-`--creator-min-gmv`, `--backfill-start`, `--pages`).
+All flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--backfill` | off | Pulls the deepest history available for every grain. Weekly grains start at `--backfill-start`, and the `--sample-days`/`--creator-days` recency windows are dropped, so the full population is fetched. |
+| `--backfill-start YYYY-MM-DD` | 2 years back | Earliest week for weekly grains under `--backfill`. Reacher returns empty windows before your real data floor, so you don't need the exact date. |
+| `--days N` | metrics: 30; GMV Max: 90 | Overrides the daily-metrics window. It also narrows the `gmv_max`/`gmv_max_products` window, which otherwise always pulls the full 90-day cap and can never exceed it. |
+| `--weeks N` | `2` | Weeks of weekly-grain history on an incremental run: the current partial week plus last week's restatements. |
+| `--creator-min-gmv X` | `0.01` | Minimum GMV for a `reacher_creator_weekly` row. Use `0` to keep zero-earning creator-weeks too. Because of this filter, row counts there are **not** "active creators"; get that from `reacher_metrics_daily`. |
+| `--sample-days N` | `90` | Refreshes only samples updated in the last N days. Ignored with `--backfill`. |
+| `--creator-days N` | `30` | Refreshes the creator snapshot only for creators touched in the last N days. Ignored with `--backfill`. |
+| `--only GRAIN` / `--skip GRAIN` | all | Repeatable. Grains: `metrics`, `shop_gmv`, `gmv_max`, `gmv_max_products`, `creators`, `creator_weekly`, `creator_products`, `product_weekly`, `samples`, `sample_requests_weekly`, `automation_products`, `sample_products`, `video_creative`, `shop_health`, `automations`, `outreach_weekly`. |
+| `--pages N` | `0` (no cap) | Caps pages per paginated grain. Useful for a quick probe. |
+| `--dry-run` | off | Fetches and reports without writing rows. Tables are still created. |
+
+With `REACHER_API_KEY` unset, the script prints a skip line and exits
+cleanly.
 
 **Run the GMV Max grain (or the whole script) on a real schedule if you use
 GMV Max ads at all.** `shop-gmv` and `gmv-max/*` both hard-cap at 90 days of
