@@ -12,27 +12,33 @@ current-state campaign/asset/conversion-action configuration.
 | `warehouse/connectors/google_ads.py` | core, via `run_sync.py --only google` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `google_ads_detail_sync.py` | standalone | search terms, keywords + Quality Score, paid-vs-organic overlap, conversion-action attribution, device split, Shopping/PMax product demand, PMax search themes |
 | `google_ads_structure_sync.py` | standalone | current-state snapshots: campaigns, asset groups + assets, listing-group filters, conversion-action setup |
-| `google_ads_mutate.py` | standalone, **write-capable** | pause/remove a campaign or ad group, change bidding strategy or TIS bid ceiling, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
+| `google_ads_mutate.py` | standalone, **write-capable** | pause or remove a campaign, remove an ad group, change bidding strategy or TIS bid ceiling, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
 
 The structure connector in particular is aimed at "this campaign looks funded
 but isn't serving" — a question spend/impression metrics alone usually can't
 answer.
 
 `google_ads_mutate.py` is the one script in this repo that changes anything
-in your live ad account. Every mutate call defaults to `validate_only=True`
-(full server-side validation, zero changes committed) — only `--execute`
-actually applies a change. See its module docstring before using it.
+in your live ad account. Every subcommand except `end-experiment` sends
+`validate_only=True` (full server-side validation, zero changes committed)
+unless you pass `--execute`. `end-experiment` has no validate mode: without
+`--execute` it only prints what it would do and makes no API call. See the
+module docstring before using the script.
 
 ## Setup
 
 1. Create an OAuth **Desktop app** client in Google Cloud.
-2. Run the interactive auth helper — it opens a browser and saves the refresh
-   token for you:
+2. Put `GOOGLE_ADS_CLIENT_ID` and `GOOGLE_ADS_CLIENT_SECRET` in `.env`. The
+   auth helper exits immediately if either is missing.
+3. Run the interactive auth helper. It opens a browser, requests the single
+   `https://www.googleapis.com/auth/adwords` scope, and writes
+   `GOOGLE_ADS_REFRESH_TOKEN` into `.env` for you. It writes only that one
+   variable.
 
    ```bash
    python google_auth.py
    ```
-3. Fill in the `Google Ads` block in `.env`:
+4. Fill in the rest of the `Google Ads` block in `.env`:
 
    | Variable | Notes |
    |---|---|
@@ -48,16 +54,17 @@ same variables — nothing new to configure.
 ## Usage
 
 ```bash
-python run_sync.py --only google         # core campaign metrics, last 7 days
-python google_ads_detail_sync.py          # search terms, keywords, product demand; default 3-day lookback
+python run_sync.py --only google         # core campaign metrics, start = today − 7 through today (inclusive)
+python google_ads_detail_sync.py          # search terms, keywords, product demand; start = today − 3 (--days 3)
 python google_ads_detail_sync.py --days 30
 python google_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
 python google_ads_detail_sync.py --only google_pmax_search_themes --start 2026-01-01 --end 2026-01-31
 python google_ads_structure_sync.py       # current-state config snapshot, as of today
 python google_ads_structure_sync.py --date 2026-01-15   # or --only campaigns,asset_groups
 
-# google_ads_mutate.py — every subcommand below defaults to validate_only=True
-# (server-side validation, zero changes committed); add --execute to apply it
+# google_ads_mutate.py — every subcommand below except end-experiment defaults to
+# validate_only=True (server-side validation, zero changes committed); add --execute
+# to apply it. end-experiment without --execute makes no API call at all.
 python google_ads_mutate.py pause-campaign --campaign-id 18373650912
 python google_ads_mutate.py pause-campaign --campaign-id 18373650912 --execute
 python google_ads_mutate.py remove-campaigns --campaign-id 18373650912 --campaign-id 20593969582 --execute
@@ -146,28 +153,59 @@ validation result, then re-run with `--execute` once it validates clean.
 done. It also creates no ad: a Search campaign can't serve without one, and
 requiring a human to add ad copy (via the UI, or `copy-rsa` from an existing
 ad group) is both a safety interlock and honest about who owns ad content.
-`create-search-campaign` and `set-campaign-geo`/`set-campaign-language` exist
-because the API has no default for either targeting dimension — an unset
-geo or language target means "target literally everywhere," not "inherit a
-sensible default." `add-keywords`' `--match-type` defaults to `BROAD`
+`create-search-campaign` sets **no** geo or language targeting.
+`set-campaign-geo`/`set-campaign-language` exist because an unset geo or
+language target means "target literally everywhere / every language," not
+"inherit a sensible default." Run both before `enable-campaign`.
+`copy-rsa` copies the first `ENABLED` responsive search ad it finds in the
+source ad group (one ad only), and the copy is created `ENABLED`. It won't
+serve until the campaign itself is enabled. `add-keywords`' `--match-type` defaults to `BROAD`
 (preserving its original hardcoded behavior); `add-campaign-negative-keywords`
 defaults to `EXACT` instead, deliberately, since a negative keyword
 defaulting to broad match would exclude a much wider set of queries than
 likely intended.
 
-`update-budget` prints every campaign referencing the budget (and its
-`reference_count`) before mutating, since a shared budget change affects
-every campaign on it, not just the one you had in mind.
+`update-budget` prints the budget's current and new daily amount,
+`explicitly_shared`, and `reference_count` before mutating. It also prints a
+`!! SHARED BUDGET` warning when more than one campaign uses the budget,
+since a change affects every campaign on it, not just the one you had in
+mind. It does **not** list those campaigns by name, so query `campaign`
+with `campaign.campaign_budget` if you need to know which ones they are.
+
+Both Shopping tier commands (`build-shopping-tier-subdivision`,
+`add-shopping-tier-include`) set `cpc_bid_micros` on every `UNIT` leaf they
+create, via `--cpc-bid-micros` (default `10000` = $0.01). Standard Shopping
+requires a bid on each leaf even under automated bidding such as tROAS,
+which ignores it.
+
+Several flags can be repeated: `--campaign-id` on `remove-campaigns`,
+`--user-list-id` on the audience/user-list commands, `--geo-target-constant`,
+`--language-constant`, and `--include`. On
+`flip-campaign-user-list-to-negative`, `--old-criterion-id` and
+`--user-list-id` are paired by position.
 
 `end-experiment` has no `validate_only` mode at all — the API call itself
 isn't dry-runnable, so `--execute` is the *only* thing standing between a
 bare invocation and actually ending a real experiment. Confirm the
 experiment id/status with a GAQL read first.
 
-Both scripts write each grain independently and mark the run `"degraded"`
-(not `"ok"`) in `sync_log` if one grain fails while others succeed — check
-`last_sync_status` for `"degraded"` rather than assuming a run either fully
-succeeded or fully failed.
+**How the detail and structure scripts report partial failure.** Both
+fetch and commit each grain separately, so one broken grain doesn't lose the
+others. Their `sync_log` platforms are `google_detail` and
+`google_structure`:
+
+| Script | Unit of failure | `sync_log` status |
+|---|---|---|
+| `google_ads_detail_sync.py` | each grain × ≤30-day window | `degraded` if some windows failed but rows were written; `error` if windows failed **and** the run wrote 0 rows in total |
+| `google_ads_structure_sync.py` | each grain | `degraded` on any grain failure, **even if every grain failed** |
+
+Both exit with code 1 on any failure. Check `last_sync_status` for
+`degraded` rather than assuming a run either fully succeeded or fully
+failed.
+
+Structure `--only` grain names are `campaigns`, `asset_groups`, `assets`
+(which writes `google_asset_group_assets`), `listing_filters`, and
+`conversion_actions`.
 
 ## Tables
 
@@ -187,7 +225,16 @@ cross-table rollup:
   window-aggregated rather than date-keyed, so `google_ads_detail_sync.py`
   only fetches it when named explicitly via `--only` together with an
   aligned `--start`/`--end` window — running the script bare skips it
-  silently.
+  silently. Like every detail grain, the window is split into ≤30-day
+  chunks, so a 90-day `--start`/`--end` is stored as **three consecutive
+  windows**, not one aggregate. Only `ENABLED` Performance Max campaigns are
+  queried. Never `SUM` across overlapping windows.
+- **Structure snapshots skip removed objects.** `google_campaigns` excludes
+  `REMOVED` campaigns, and `google_keywords` (detail) excludes `REMOVED`
+  criteria. A Quality Score of 0 is stored as `NULL`.
+  `google_asset_group_listing_filters` snapshots **Performance Max** listing
+  groups only. Standard Shopping listing-group trees (the ones
+  `build-shopping-tier-subdivision` edits) aren't snapshotted.
 - **`google_paid_organic` has no money columns.** `cost_micros`,
   `conversions`, and `conversions_value` all error against this view; it's
   clicks/impressions only, for paid-vs-organic overlap.
@@ -205,13 +252,15 @@ cross-table rollup:
 - **Never sum `google_conversion_actions_daily.conversions` with
   `ad_metrics`** — the two attribute the same conversions differently, and
   adding them double-counts.
-- **`all_conversions` (wherever it appears) is diagnostic-only** — it
-  includes view-through and cross-device attribution well outside your
-  actual conversion actions. Don't report it as a business metric; use the
-  named conversion-action columns instead.
-- **`search_impression_share` and its two lost-share columns are `NULL`,
-  never `0`, on campaign types that run no search auction at all** (Performance
-  Max, Display, Video) — Google returns a meaningless `0` for those, and
+- **`all_conversions` (wherever it appears) is diagnostic-only.** It's
+  dominated by page-view and engagement micro-actions: a single campaign-day
+  can post hundreds of `all_conversions` while `conversions` stays 0. Report
+  `conversions`/`conversions_value` instead, and use
+  `google_conversion_actions_daily` to see which actions feed them.
+- **`search_impression_share`, its two lost-share columns, and
+  `search_click_share` are `NULL`, never `0`, on any channel type other than
+  `SEARCH`/`SHOPPING`** (Performance Max, Display, Video, and so on, which
+  run no search auction) — Google returns a meaningless `0` for those, and
   `warehouse/connectors/google_ads.py` maps it to `NULL` so it can't be
   averaged in as a real zero. On Search/Shopping campaigns, which DO run a
   search auction, a real `0.0` is stored as `0.0`, not `NULL` — don't
@@ -271,9 +320,9 @@ cross-table rollup:
   preserved untouched.
 - **Flipping an existing `CampaignCriterion`'s `negative` flag in place
   fails with `IMMUTABLE_FIELD`.** Google treats a campaign+`user_list` pair
-  as the criterion's identity, so a plain update that only changes
-  `negative` on an already-existing positive criterion is rejected as an
-  illegal update-via-create. `flip-campaign-user-list-to-negative` works
+  as the criterion's identity, so creating a negative criterion for a
+  `user_list` already attached to the campaign as a positive one is rejected
+  as an illegal update-via-create. `flip-campaign-user-list-to-negative` works
   around this the same way `replace-filter` handles listing-group filters:
   remove the old criterion and create a fresh negative one, in ONE atomic
   `mutate` batch.
