@@ -8,8 +8,9 @@ co-purchased products), and Repeat Purchase Behavior.
 (standalone)
 
 These reports queue for 15–25+ minutes on Amazon's side;
-`warehouse/brand_analytics.py` is the shared create/poll/download runner both
-scripts build on.
+`warehouse/brand_analytics.py` is the shared create/poll/download runner all
+three scripts build on (the backfill indirectly, by calling
+`amazon_ba_sync.py`'s Top Search Terms grain).
 
 ## Setup
 
@@ -20,19 +21,36 @@ Optional: create `brand_watchlist.yaml` in the project root to flag search
 terms containing your own or a competitor's brand name (used by
 `amazon_ba_sync.py`'s Top Search Terms report) — see that file for the format.
 The same file has a separate, also-optional `term_topics` section for
-**topic capture**: unlike every other Top Search Terms match rule, this one
-keeps a term because of what it *is* (a regex match), not because it's
-already tied to your own ASINs or brand names — the only way to surface
-market demand for a product area you don't currently sell at all, along with
-the competitor ASINs currently winning it.
+**topic capture**: unlike the `ours`/`brand` match rules, this one keeps a
+term because of what it *is* (a regex match), not because it involves your
+own ASINs or brand names. The `rank` rule also keeps terms that have nothing
+to do with you, but only the market-wide head (rank ≤ `rank_flag_max`,
+default 2500). Topic capture is the only Top Search Terms rule that can
+surface a *niche* product area you don't currently sell at all, along with
+the competitor ASINs currently winning it. Both `rank_flag_max` and
+`topic_max_rows_per_week` (default 20,000, counted per unique term rather
+than per row, so a term's full top-3 rows stay together) are set in the
+same YAML file.
+
+If PyYAML isn't installed, `brand_watchlist.yaml` is **silently ignored**:
+no brand or topic matching, and the rank cutoff falls back to the default.
 
 ## Usage
 
-Both scripts need to know which ASINs are yours (to flag a query/term/pair as
-involving your own catalog). Pass them with `--asins` (comma-separated) or
-`--asins-file` (one ASIN per line); if you omit both, they fall back to
-`amazon_rank_sync.fallback_asins()` — a weak proxy, not a real substitute, so
-pass your ASINs explicitly for anything beyond a first smoke test.
+All three scripts take your ASINs via `--asins` (comma-separated) or
+`--asins-file` (one ASIN per line), but they use them differently:
+
+- `amazon_sqp_sync.py` uses the list as **the set of ASINs to request**, in
+  the order given, so put your most important ASINs first. It exits with an
+  error if the list comes out empty.
+- `amazon_ba_sync.py` and `amazon_ba_backfill.py` use it to **flag** a
+  term or pair as involving your own catalog (`match_reason = 'ours'`).
+
+If you omit both flags, they fall back to
+`amazon_rank_sync.fallback_asins()`. That returns distinct **seller SKUs**
+from `amazon_fulfilled_shipments`, not ASINs, so SQP requests will mostly
+miss and `ours` matching will effectively find nothing. Treat it as a
+smoke-test convenience only and pass real ASINs for any actual run.
 
 ```bash
 python amazon_sqp_sync.py --asins-file asins.txt   # Search Query Performance
@@ -41,15 +59,39 @@ python amazon_ba_sync.py --asins-file asins.txt    # Search Catalog Performance,
 python amazon_ba_sync.py --month 2026-06           # Repeat Purchase Behavior (no ASINs needed)
 ```
 
-Useful flags on both: `--week YYYY-MM-DD` (a specific BA week, default: last
-completed Sun–Sat), `--weeks N` (backfill N weeks), `--fallback-weeks N` (if a
-week comes back empty, step back further — guards against the Monday
-availability lag on a weekly cron). `amazon_ba_sync.py` also takes `--only
-search_catalog,search_terms,market_basket` to run a subset of grains, and
-`--last-month`/`--month YYYY-MM` for Repeat Purchase. `amazon_sqp_sync.py`
-also takes `--max-asins N` (cap per week; 0 = all), `--refresh` (re-request
-ASINs already recorded in `amazon_sqp_coverage`), and `--max-minutes N` (wall-
-clock budget so a scheduled run can't be blocked indefinitely).
+Flags on both `amazon_sqp_sync.py` and `amazon_ba_sync.py`:
+
+| Flag | Meaning |
+|---|---|
+| `--week YYYY-MM-DD` | The **Sunday** that starts the BA week (default: last completed Sun–Sat). Any other weekday is rejected. |
+| `--weeks N` | Walk back N BA weeks from `--week` (default 1). |
+| `--fallback-weeks N` | Step back up to N earlier weeks when the requested week yields nothing (default 0). See the caveat below. |
+
+`--fallback-weeks` behaves differently in the two scripts:
+
+- **`amazon_sqp_sync.py`** steps back when the week is detected as
+  unpublished, or when it ran cleanly but returned zero rows. This is the
+  real guard against the Monday availability lag on a weekly cron.
+- **`amazon_ba_sync.py`** steps back **only when a report finishes with zero
+  rows**. A too-recent week usually comes back `FATAL` instead, which is
+  logged as an error for that grain and *not* retried on an earlier week. For
+  a Monday cron, schedule the run late enough that the prior week is
+  published, or re-run it later.
+
+`amazon_ba_sync.py` only:
+
+| Flag | Meaning |
+|---|---|
+| `--only search_catalog,search_terms,market_basket` | Run a subset of the weekly grains (default: all three). The module docstring recommends running `search_terms` **alone**, because it is market-wide and large. |
+| `--month YYYY-MM` / `--last-month` | Run **only** Repeat Purchase for that month and exit. Weekly grains are skipped in this mode, and `--month` wins if both are given. |
+
+`amazon_sqp_sync.py` only:
+
+| Flag | Meaning |
+|---|---|
+| `--max-asins N` | Cap on ASINs requested per week. **Default 120**; `0` = all. |
+| `--refresh` | Re-request ASINs already recorded in `amazon_sqp_coverage`. |
+| `--max-minutes N` | Wall-clock budget so a scheduled run can't block indefinitely (0 = unlimited). |
 
 ## Tables
 
@@ -83,7 +125,14 @@ python amazon_search_terms_monthly.py --probe                              # rea
 python amazon_search_terms_monthly.py --asins-file asins.txt --last-month
 python amazon_search_terms_monthly.py --asins-file asins.txt --month 2026-07
 python amazon_search_terms_monthly.py --asins-file asins.txt --backfill     # walk back to the retention floor
+python amazon_search_terms_monthly.py --asins-file asins.txt --month 2026-07 --months 3  # July + 3 earlier months
+python amazon_search_terms_monthly.py --asins-file asins.txt --month 2026-07 --doc-id <reportDocumentId>  # re-bucket an existing report
 ```
+
+Other flags: `--max-months N` (safety stop for `--backfill`, default 36) and
+`--refresh` (re-run months already marked complete). `--doc-id` re-buckets an
+already-generated report document for a single month instead of requesting a
+new one.
 
 **Table:** `amazon_search_term_monthly` (month × category × search_term),
 plus `amazon_asin_category` (a permanent ASIN → browse-node cache) and
@@ -98,14 +147,15 @@ docstring's "coverage over presence" rule).
 `amazon_ba_backfill.py` (standalone) walks the Top Search Terms grain
 backward week by week, resuming automatically on a re-run (a week already
 stored is skipped). It's a separate script from `amazon_ba_sync.py --weeks N`
-because this one grain is both the most expensive to re-request and, if
+because this one grain is both the most expensive of `amazon_ba_sync.py`'s
+four reports to re-request and, if
 you're using topic capture, the only one worth deep-backfilling for
 market-research purposes.
 
 ```bash
-python amazon_ba_backfill.py --asins-file asins.txt              # walk back to the retention floor
+python amazon_ba_backfill.py --asins-file asins.txt              # walk back until 3 empty weeks in a row, or 60 weeks
 python amazon_ba_backfill.py --asins-file asins.txt --weeks 12   # bounded run
-python amazon_ba_backfill.py --asins-file asins.txt --start 2025-09-07
+python amazon_ba_backfill.py --asins-file asins.txt --start 2025-09-07  # must be a Sunday
 python amazon_ba_backfill.py --asins-file asins.txt --refresh    # re-pull weeks already stored
 python amazon_ba_backfill.py --status                            # what's stored; no API calls
 ```
@@ -114,8 +164,9 @@ Amazon doesn't publish how far back this report actually answers for your
 account, and it isn't guaranteed to signal "past retention" consistently —
 some out-of-range weeks come back `FATAL` with the same generic message an
 unpublished, too-recent week produces, rather than the cleaner `CANCELLED`.
-This script stops after a run of consecutive weeks that all yield zero rows,
-whatever the specific reason, rather than waiting for a signal that isn't
+This script stops after **3 consecutive weeks** that all yield zero rows
+(`MAX_CONSECUTIVE_MISSES`), whatever the specific reason, or after `--weeks`
+weeks (default 60), whichever comes first. It stops on empty weeks rather than waiting for a signal that isn't
 guaranteed to arrive. See the module docstring and
 `warehouse/brand_analytics.py`'s docstring for the full explanation, and pace
 any concurrent probing of multiple candidate weeks conservatively — the
@@ -127,8 +178,14 @@ burst limit in practice.
 The shared runner exposes two ways to consume a report's records:
 
 - `fetch_ba_records(doc_id)` — downloads and `json.loads()`s the whole
-  document. Fine for the reports above, which top out in the low thousands of
-  rows.
+  document. Fine for catalog-scoped reports (Search Catalog, Market Basket,
+  Repeat Purchase, SQP), which top out in the low thousands of rows. Note
+  that `amazon_ba_sync.py`'s Top Search Terms grain, and therefore
+  `amazon_ba_backfill.py`, currently goes through `run_ba_report`, which uses
+  this function. It loads the full market-wide document into memory before
+  filtering, so expect a large memory spike on that grain.
+  `amazon_search_terms_monthly.py` is the in-repo example of the streaming
+  path below.
 - `stream_ba_records(doc_id)` — walks the gzip response stream and yields one
   record at a time, so memory stays flat no matter how large the document is.
   Some Brand Analytics reports (Top Search Terms in particular) are
