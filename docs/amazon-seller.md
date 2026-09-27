@@ -40,11 +40,21 @@ Seller **self-authorization** — no OAuth consent screen:
    | `SPAPI_MARKETPLACE_ID` | required — only `amazon_economics_sync.py` falls back to `ATVPDKIKX0DER` (US) if unset; every other script raises a `KeyError` without it, so set it explicitly |
    | `SPAPI_REGION` | default `NA` |
    | `DATAKIOSK_TIMEOUT_MIN` | optional, how long `amazon_economics_sync.py` waits for a Data Kiosk query (default `150` — these can run 1–2h for a full week) |
+   | `SPAPI_SELLER_ID` | only `amazon_listing_quality_sync.py` — Amazon's "Merchant Token", required in the Listings Items URL path (see below) |
 
 Six of the eight extras reuse these same variables — nothing new to
 configure. `amazon_listing_quality_sync.py` additionally needs
-`SPAPI_SELLER_ID` (Amazon's "Merchant Token" — see its module docstring for
-how to find it; no documented SP-API call returns it directly).
+`SPAPI_SELLER_ID` (Amazon's "Merchant Token"), and it refuses to start
+without it. No documented SP-API call returns this value for the account
+you're authorized as. One *undocumented* way to recover it: call
+`GET /sellers/v1/marketplaceParticipations` and look for an "Amazon.com
+Invoicing Shadow Marketplace" entry whose `storeName` looks like
+`Invoicing_<accountId>_<sellerId>`. The seller ID is the second
+underscore-delimited segment. Amazon doesn't guarantee this behavior, so
+test the value before relying on it: a real SKU should return 200 with
+issues, and a made-up SKU should return "SKU not found" for that same
+account, not an auth error. Once confirmed, save it in `.env`. If you ever
+re-authorize under a different seller account, find it again.
 `voc_import.py` needs **no credentials at all**: download the export from
 Seller Central (Performance → Voice of the Customer), drop it in a local
 folder, and import it.
@@ -65,7 +75,8 @@ python amazon_traffic_sync.py --repair               # re-pull only weeks record
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
 python amazon_listing_quality_sync.py --skus SKU1,SKU2
 python amazon_listing_quality_sync.py --skus-file skus.txt
-python amazon_listing_quality_sync.py --skus-file skus.txt --resume   # finish an interrupted pass
+python amazon_listing_quality_sync.py --skus-file skus.txt --limit 100   # smoke test: first 100 SKUs only
+python amazon_listing_quality_sync.py --skus-file skus.txt --resume      # finish an interrupted pass (see Notes)
 python voc_import.py path/to/export.csv --dry-run   # preview before writing
 python voc_import.py path/to/export.csv
 python voc_import.py --dir imports/voc               # import every *.csv in a folder
@@ -84,7 +95,16 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 - `amazon_economics`
 - `amazon_traffic_weekly`, `amazon_traffic_monthly`, `amazon_traffic_daily`,
   `amazon_traffic_monthly_account`, `amazon_traffic_coverage`
-- `amazon_listing_quality`, `amazon_listing_quality_issues`
+- `amazon_listing_quality` — one row per seller SKU (PK `seller_sku`): `asin`,
+  `item_name`, `product_type`, `is_discoverable` / `is_buyable` (0/1, from
+  the listing summary's status), `issue_count` and `max_severity`
+  (`ERROR`/`WARNING`/`INFO`; NULL means no defects; both leave out
+  non-defect code `101265`), `generic_keyword` (backend Search Terms),
+  `item_type_keyword`, `synced_at`
+- `amazon_listing_quality_issues` — one row per issue (PK `seller_sku`,
+  `issue_seq`, where `issue_seq` is 0-based because the same code can appear
+  twice on one SKU): `code`, `severity`, `message`, and `attribute_names` /
+  `categories` (comma-separated)
 - `amazon_voc`
 
 ## Notes
@@ -182,9 +202,29 @@ content defect — but it's kept in `amazon_listing_quality_issues` so nothing
 observed is silently dropped. There's no bulk report for this data, so it's
 a synchronous per-SKU call; the endpoint rate-limits at 5 req/sec, which this
 script paces itself under. Pass `--resume` to finish an interrupted full
-pass without redoing SKUs already written this run — it isn't the default,
-since a normal run always re-diagnoses every SKU (issues, and the search
-terms below, can change between runs).
+pass without redoing SKUs already written. It isn't the default, because a
+normal run should re-diagnose every SKU (issues, and the search terms below,
+can change between runs). **Watch out:** `--resume` doesn't know which run
+wrote a row. It skips *every* SKU that already has a row in
+`amazon_listing_quality`, from any earlier run. So once one full pass has
+finished, `--resume` skips everything on your list. Only use it right after
+an interrupted run. The script prints how many SKUs it skipped and how many
+remain.
+
+Each diagnosed SKU is a snapshot of the latest result. Its rows in
+`amazon_listing_quality_issues` are deleted and rewritten every time, so a
+fixed issue drops out. A SKU you remove from your list is never deleted,
+though; its old row stays with an older `synced_at`. Filter on `synced_at`
+if you only want the current pass.
+
+A SKU that returns 404 (delisted since you built your list), or any other
+non-200 response, counts as failed. The run then logs `degraded` in
+`sync_log` (platform `amazon_listing_quality`) and prints the first 10
+failures. If no SKU was written, it logs `error` and exits 1. If there are
+no target SKUs at all (no flags and nothing in the fallback table), it logs
+`error` and exits with a message. On an older `warehouse.db`, the two
+search-term columns are added automatically with `ALTER TABLE` on the next
+run; you don't need to drop anything.
 
 The same GET also captures `generic_keyword` — the real, otherwise-invisible
 backend "Search Terms" field from Seller Central's edit-listing page (no
