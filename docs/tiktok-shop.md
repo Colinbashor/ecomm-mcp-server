@@ -75,6 +75,7 @@ python tiktok_finance_sync.py --no-orders     # skip retaining per-order fee row
 
 python tiktok_listing_quality_sync.py --product-ids 1234567890,2345678901
 python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
+python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit 400   # smoke test: first 400 ids
 ```
 
 ## Tables
@@ -85,7 +86,15 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
 - `tiktok_creators`
 - `tiktok_shop_performance`
 - `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
-- `tiktok_listing_quality`, `tiktok_listing_quality_issues`
+- `tiktok_listing_quality` — one row per product (PK `product_id`):
+  `current_tier` (`POOR`/`FAIR`/`GOOD`), `remaining_recommendations`,
+  `synced_at`
+- `tiktok_listing_quality_issues` — one row per issue (PK `product_id`,
+  `field`, `code`): `field` (`TITLE`/`DESCRIPTION`/`IMAGE`/`ATTRIBUTE`/
+  `SIZE_CHART`), `how_to_solve`, `quality_tier` (the tier the product
+  **reaches if you fix this issue**, not its current tier), and
+  `suggestion_json` (TikTok's raw `suggestion` object for that field, if it
+  sent one)
 
 ## Notes
 
@@ -156,6 +165,23 @@ id (e.g. a deleted product) fails the whole batch — this script halves a
 failing batch recursively down to singles so one bad id doesn't discard the
 other ~199 products' results, and logs `degraded` (never `ok`) if any id
 still failed after halving all the way down.
+
+This is TikTok's own listing-*quality* tier, based on content checks (title,
+description, images, attributes, size chart). It is **not** the customer
+star rating. Each diagnosed product is a snapshot of the latest result: its
+rows in `tiktok_listing_quality_issues` are deleted and rewritten on every
+diagnosis, so a fixed issue drops out. A product that fails even on its own
+keeps whatever rows an earlier run wrote, so check `synced_at` before you
+trust a row as current. If the `seller.product.optimize` scope is missing,
+every call fails with permission denied. The halving logic can't tell a
+missing scope from a bad id, so it keeps splitting every batch down to
+single ids, which is about 2× as many requests as you have ids, before
+giving up. Use `--limit` for a first run so a missing scope fails fast. When
+nothing gets written, the run logs `error` in `sync_log` (platform
+`tiktok_listing_quality`) and exits 1.
+Running without `--product-ids`/`--product-ids-file` exits right away with a
+message and writes nothing to `sync_log`. Unlike the Amazon counterpart,
+there is no fallback id list.
 
 ## Tests
 
