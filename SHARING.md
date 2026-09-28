@@ -20,8 +20,10 @@ python server.py --http --host 0.0.0.0 --port 8787
 ```
 
 This requires `WAREHOUSE_MCP_TOKEN` in `.env` (any long random string —
-`python -c "import secrets; print(secrets.token_urlsafe(32))"` works). Every
-request must send it as `Authorization: Bearer <token>`.
+`python -c "import secrets; print(secrets.token_urlsafe(32))"` works); without
+it the server exits at startup. Every request must send it as
+`Authorization: Bearer <token>`, or it gets `401 {"error":"authentication required"}`.
+The endpoint is `/mcp` on the chosen port (default `8787`).
 
 **`--host 0.0.0.0` is required and is not the default.** Plain `--http` binds
 `127.0.0.1`, reachable only from the machine it runs on. Sharing with teammates
@@ -49,17 +51,37 @@ python make_cert.py
 ```
 
 This writes `certs/warehouse-mcp.crt` (safe to share with teammates — no
-secret material) and `certs/warehouse-mcp.key` (never share this one).
-`server.py --http` automatically serves HTTPS once both files exist. Re-run
-`make_cert.py` if the machine's LAN IP changes, or when adding extra names
-(`python make_cert.py extra.hostname 10.1.2.3`). The certificate's
-Organization field is cosmetic (clients trust it by SAN + Trusted Root
-install, not by this string) but defaults to "ecommerce-warehouse MCP" —
-set `CERT_ORG_NAME` in `.env` before running it to put your own team or
-company name there instead.
+secret material) and `certs/warehouse-mcp.key` (never share this one); both
+are gitignored, and re-running overwrites them. `server.py --http` checks for
+the pair **at startup** and serves HTTPS if both exist, so restart the server
+after generating or regenerating them.
+
+What the certificate contains: a self-signed RSA-2048 / SHA-256 cert valid
+for 10 years, with Subject Alternative Names for this machine's hostname (as
+given and lower-cased), `<hostname>.local`, `localhost`, the machine's FQDN
+(only if its first label is the hostname — the same guard `HostGuard` uses),
+every non-loopback, non-link-local LAN IPv4 it can find, and `127.0.0.1` —
+i.e. exactly the name shapes the server's Host check accepts. Clients validate
+against those SANs, not the Common Name, so the name teammates put in the URL
+must be one of them. Re-run `make_cert.py` if the machine's LAN IP changes, or
+to add extra names: each extra argument is added as an IP SAN if it parses as
+an IP, otherwise as a DNS SAN (`python make_cert.py extra.hostname 10.1.2.3`).
+
+The certificate's Organization field is cosmetic (clients trust it by SAN +
+Trusted Root install, not by this string) but defaults to
+"ecommerce-warehouse MCP". To put your own team or company name there, set
+`CERT_ORG_NAME` **in the shell environment** when you run it
+(`CERT_ORG_NAME="Acme Data" python make_cert.py`) — unlike `server.py`,
+`make_cert.py` does not load `.env`, so a value only in `.env` is ignored.
 
 On Windows, `serve_mcp.bat` keeps the server running across reboots and
-restarts it if it crashes — point a Task Scheduler "At startup" trigger at it.
+restarts it if it crashes — point a Task Scheduler "At startup" trigger at it
+(set to run whether or not anyone is logged on). It runs
+`.venv\Scripts\python.exe server.py --http --host 0.0.0.0` from the script's
+own folder on the default port, appends all output to `mcp_server_log.txt`,
+and after any exit waits ~10 seconds and relaunches. Edit the `--host` there
+to a specific interface IP if the wildcard is too broad, and add any other
+flags (`--port`, `--allow-legacy-token-path`) on that same line.
 
 ## 2. Lock down which hostnames may connect
 
@@ -73,15 +95,38 @@ networks. By default it accepts:
 - whatever IP address a request *actually arrived on* (so a moved network
   needs no restart, and a retired address stops working automatically)
 
+Matching is exact — names are lower-cased and a single trailing dot and any
+`:port` are ignored, but there is no prefix, suffix, or wildcard rule (a `*`
+entry is dropped with a warning). A `Host` that fails gets **HTTP 421**; an
+`Origin` header that fails gets **HTTP 403** (a missing `Origin` is fine —
+`mcp-remote` sends none). Both responses carry a JSON body with the `reason`
+and a hint, and the rejection is logged (deduplicated) to the server log.
+These checks run only after the bearer token is accepted, so an
+unauthenticated caller only ever sees `401`.
+
 To accept an additional name (a Cloudflare Tunnel hostname, a hosts-file
-alias, a static DNS name teammates use), add it to `allowed_hosts.txt` next to
-`server.py` (one per line, `#` comments allowed) or the
-`WAREHOUSE_MCP_ALLOWED_HOSTS` env var (comma-separated). Both are re-read
-automatically within ~10 seconds of a rejected request — no restart needed,
-and removing a name revokes it just as fast.
+alias, a static DNS name teammates use), add it to any of:
+
+- `allowed_hosts.txt` next to `server.py` — one entry per line, `#` comments
+  allowed. **This is the live-edit path:** the server stats the file on every
+  request, so an edit applies to the very next request with no restart, and
+  removing a line revokes that name just as fast.
+- `WAREHOUSE_MCP_ALLOWED_HOSTS` — comma- or semicolon-separated. `server.py`
+  loads `.env` into its environment at startup, so change it and restart.
+- `--allow-host <value>` on the command line (repeatable; fixed for the life
+  of the process).
+
+An entry can be a bare name or IP, or a full `http://` / `https://` origin to
+allow as an `Origin` header value. Separately, if a request is rejected, the
+server re-resolves its own hostname/FQDN (at most once every 10 seconds) and
+re-checks once, so a machine rename also heals without a restart.
 
 Use `python server.py --check-host <value>` to test what a given Host header
-would resolve to before a teammate hits it live.
+would resolve to before a teammate hits it live. It prints the normalized
+name, the verdict and reason, and the current name policy, and exits `0` on
+accept, `1` on reject. An IP literal always reports `no-local-addr` there:
+IPs are accepted only when they are the address a live connection arrived on,
+which a dry check can't know.
 
 `--allow-any-host` skips this check entirely — useful for a quick local debug
 session, not for anything reachable by a teammate. It logs a warning on
@@ -132,7 +177,8 @@ Notes:
   sees them.
 - An **HTTP 421** response means the server rejected the hostname in the URL:
   add it to `allowed_hosts.txt` on the host machine (no restart required) and
-  have them retry.
+  have them retry. An **HTTP 401** means the token is missing or wrong (or was
+  rotated); an **HTTP 403** means a browser-style `Origin` header was rejected.
 
 Fully quit Claude Desktop (not just close the window) and reopen it. You
 should then see the warehouse tools under the hammer icon: `spend_summary`,
@@ -163,7 +209,9 @@ Once every teammate's config has moved to the header style, remove the flag
 indefinitely keeps the weaker scheme available with no offsetting benefit.
 
 While the flag is set:
-- Both URL styles authenticate identically; either one being valid is enough.
+- Both URL styles authenticate identically; either one being valid is enough,
+  and the Host/Origin checks still apply to both. The server prints
+  `Legacy token-path compatibility is ENABLED temporarily` at startup.
 - The server scrubs the token out of the path before anything logs it (Uvicorn's
   access log included), so even the legacy style doesn't leave the secret sitting
   in plain text in a log file.
