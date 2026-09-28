@@ -15,7 +15,11 @@ run_sync.py  ──>  warehouse.db  ──>  server.py  ──>  MCP client
 (connectors)      (SQLite)          (read-only)
 ```
 
-`run_sync.py` is the only thing that writes. `server.py` only ever reads.
+The sync side writes: `run_sync.py` for the core `ad_metrics` / `orders` tables, and each
+standalone `<platform>_sync.py` script for its own tables. `server.py` only ever reads —
+every query goes through a `mode=ro` SQLite connection. (On startup it does call
+`db.init_db()`, which creates any missing core tables and switches the file to WAL mode,
+so pointing it at a fresh path yields an empty-but-valid warehouse rather than an error.)
 
 ## Requirements
 
@@ -42,7 +46,11 @@ python run_sync.py --sample
 ```
 
 This loads synthetic rows so you can verify the schema and exercise the MCP tools before
-wiring up a single real API.
+wiring up a single real API: 14 days (ending today) of random `ad_metrics` rows for
+`google`, `meta` and `amazon` (three demo campaigns each, `account_id` `DEMO`), a handful of
+random `tiktok` `orders` per day, and one `sync_log` row with platform `sample`. Rows are
+upserted on their primary keys, so re-running it overwrites the same keys with new random
+values rather than piling up duplicates. `--sample` ignores every other flag.
 
 ## Syncing real data
 
@@ -57,9 +65,34 @@ python run_sync.py --start 2026-01-01 --end 2026-01-31
 python run_sync.py --only google,meta       # just these platforms
 ```
 
-Platforms whose environment variables are absent are skipped automatically. Valid `--only`
-names: `google`, `meta`, `amazon` (Ads), `amazon_orders` (SP-API retail orders), `shopify`,
-`tiktok`.
+| Flag | Meaning | Default |
+|---|---|---|
+| `--days N` | Window length when `--start` is omitted: start = end − N days | `7` |
+| `--start YYYY-MM-DD` | First day of the window | end − `--days` |
+| `--end YYYY-MM-DD` | Last day of the window | today |
+| `--only a,b` | Comma-separated subset of connectors (whitespace around names is ignored) | all six |
+| `--sample` | Load synthetic demo data instead of syncing (see above) | off |
+
+Valid `--only` names — six connectors across the five core platforms: `google`, `meta`,
+`amazon` (Ads), `amazon_orders` (SP-API retail orders), `shopify`, `tiktok`. An unknown name
+aborts the run before anything is synced.
+
+How a run behaves:
+
+- **Skip, don't fail, on missing credentials.** A connector is attempted only when its gating
+  env var is set (and non-empty) — `GOOGLE_ADS_DEVELOPER_TOKEN`, `META_ACCESS_TOKEN`,
+  `AMAZON_ADS_REFRESH_TOKEN`, `SPAPI_REFRESH_TOKEN`, `SHOPIFY_CLIENT_SECRET` *or*
+  `SHOPIFY_ADMIN_TOKEN`, `TIKTOK_ACCESS_TOKEN` respectively. Otherwise it prints `SKIPPED`
+  and writes nothing, not even a `sync_log` row.
+- **Upsert.** Ads connectors write `ad_metrics` (primary key
+  `platform, account_id, campaign_id, date`); order connectors write `orders` (primary key
+  `platform, order_id, sku`). Both use `INSERT OR REPLACE`, so re-syncing an overlapping
+  window refreshes those rows in place.
+- **One failure doesn't stop the rest.** Each connector's exception is caught, logged to
+  `sync_log` with status `error` and the exception text as `message`, and the loop moves on.
+  Successes log status `ok` with the row count.
+- **Exit code.** If any connector failed, the process exits non-zero with
+  `Connector failures: <names>` — so a scheduler can alert on it.
 
 `.env.example` documents where to get every credential. Three platforms need a one-time
 interactive OAuth consent before you have a refresh token — a helper script drives that flow
@@ -140,12 +173,27 @@ untrusted wifi. The server logs a warning when you widen it, and a second one if
 you widen it without TLS — the bearer token travels in a header, so on a
 cleartext bind anyone on the segment can read and replay it.
 
-In HTTP mode, set `WAREHOUSE_MCP_TOKEN` — clients must then send it as a bearer token.
-Host/Origin validation is on by default; `--allow-host` is repeatable, and the same list
-can also come from `WAREHOUSE_MCP_ALLOWED_HOSTS` (comma- or semicolon-separated) or from
-an `allowed_hosts.txt` file (one entry per line) beside `server.py` — all three are
-re-read on every policy refresh, so adding a name needs no restart. Use
-`--check-host <value>` to print the accept/reject verdict for a Host and exit.
+In HTTP mode `WAREHOUSE_MCP_TOKEN` is **required** — the server exits at startup without it —
+and every request must send `Authorization: Bearer <token>` (compared in constant time);
+anything else gets a `401`. The MCP endpoint is `/mcp`, served stateless (no per-client
+session to lose across restarts). If `certs/warehouse-mcp.crt` and `certs/warehouse-mcp.key`
+both exist at startup (see `make_cert.py` in [SHARING.md](SHARING.md)) it serves HTTPS,
+otherwise plain HTTP; the startup line prints which.
+
+Host/Origin validation is on by default and runs *after* authentication, so anonymous
+probes only ever see `401`. A rejected `Host` gets `421`, a rejected `Origin` `403`, each
+with a JSON body naming the reason. `--allow-host` is repeatable, and the same list can
+also come from `WAREHOUSE_MCP_ALLOWED_HOSTS` (comma- or semicolon-separated) or from an
+`allowed_hosts.txt` file (one entry per line, `#` comments allowed) beside `server.py`.
+Entries may be bare host names/IPs or full `http(s)://` origins; there is no wildcard, and
+`*` or junk entries are dropped with a warning. `allowed_hosts.txt` is the live-edit path:
+a changed file is picked up on the very next request, additions and removals alike, with no
+restart. (The env var is read from the process environment, which `server.py` populates
+from `.env` at startup, so treat changes to it as needing a restart.) Use
+`--check-host <value>` to print the accept/reject verdict for a Host value and the current
+name policy, then exit `0` (accept) or `1` (reject/malformed) — an IP literal always shows
+as `no-local-addr` there, because IPs are judged against the address a live connection
+arrives on.
 `--allow-any-host` disables Host/Origin validation entirely — a debug escape hatch, not
 something to leave on; the server re-warns in the log every 6 hours while it's set.
 `--allow-legacy-token-path` is a temporary migration switch: it makes the server also
@@ -162,19 +210,20 @@ server running across reboots with `serve_mcp.bat` (Windows), and the
 
 ## MCP tools
 
-`server.py` exposes six read-only tools — the same six over stdio or `--http`,
-though `run_sql`'s column redaction only kicks in over HTTP (see below). All
-annotate `readOnlyHint=True`/`destructiveHint=False`/`idempotentHint=True`, so
-clients don't prompt for write-style approval.
+`server.py` exposes six read-only tools (MCP server name `ecommerce-warehouse`) — the
+same six over stdio or `--http`, though `run_sql`'s column redaction only kicks in over
+HTTP (see below). All annotate `readOnlyHint=True`/`destructiveHint=False`/
+`idempotentHint=True`/`openWorldHint=False`, so clients don't prompt for write-style
+approval. Every tool returns a JSON string (a list of row objects, except `list_tables`).
 
-| Tool | Signature | Returns |
-|---|---|---|
-| `list_tables` | `(table_pattern: str \| None = None, include_columns: bool = True)` | table/view names, optionally with column lists |
-| `run_sql` | `(query: str)` | up to 1000 rows as JSON |
-| `spend_summary` | `(start_date, end_date)` | spend/revenue/clicks/impressions/conversions/ROAS per platform |
-| `top_campaigns` | `(start_date, end_date, limit: int = 15)` | top campaigns by spend across platforms |
-| `sales_summary` | `(start_date, end_date)` | order count, units, and sales per platform |
-| `last_sync_status` | `()` | most recent sync run per platform, for checking data freshness |
+| Tool | Title | Signature | Returns |
+|---|---|---|---|
+| `list_tables` | List warehouse tables | `(table_pattern: str \| None = None, include_columns: bool = True)` | `{name: [columns]}`, or a name list when `include_columns=false` |
+| `run_sql` | Run read-only SQL | `(query: str)` | up to 1000 rows as JSON |
+| `spend_summary` | Ad spend by platform | `(start_date: str, end_date: str)` | per platform from `ad_metrics`: `spend`, `revenue`, `clicks`, `impressions`, `conversions`, `roas` (= revenue / spend, `NULL` at zero spend), ordered by spend |
+| `top_campaigns` | Top campaigns by spend | `(start_date: str, end_date: str, limit: int = 15)` | `platform`, `campaign_name`, `spend`, `revenue`, `clicks`, grouped by platform + `campaign_id`, highest spend first |
+| `sales_summary` | Sales by platform | `(start_date: str, end_date: str)` | per platform from `orders`: `orders` (distinct `order_id`), `units` (sum of `quantity`), `sales` (sum of `total`), filtered on `order_date` |
+| `last_sync_status` | Data freshness by platform | `()` | latest `sync_log` row per platform: `platform`, `last_run` (its `finished_at`), `status`, `rows_written`, `message` |
 
 - **`list_tables`** — the schema explorer. Narrow it with `table_pattern`
   (substring match, case-insensitive — `"shopify"` finds every `shopify_*`
@@ -190,9 +239,10 @@ clients don't prompt for write-style approval.
   nothing returns a hint to call `list_tables()` bare rather than an error or
   an empty list.
 - **`run_sql`** — ad-hoc analysis. Only `SELECT`/`WITH` are accepted (checked
-  up front, and enforced again by SQLite itself since the connection is
-  opened `mode=ro`); anything else returns an error string instead of
-  executing. Results are capped at 1000 rows — a truncation notice is
+  up front after trimming whitespace and a trailing `;`, and enforced again by
+  SQLite itself since the connection is opened `mode=ro`); anything else
+  returns an error string instead of executing, and a failing query returns
+  `SQL error: <sqlite message>` rather than raising. Results are capped at 1000 rows — a truncation notice is
   appended if you hit it, so add a `LIMIT` or pre-aggregate. Each call also
   carries a wall-clock budget (`RUN_SQL_TIMEOUT_SEC` in `server.py`, 45s by
   default): a query that runs past it is cancelled with a clear error rather
@@ -206,7 +256,10 @@ clients don't prompt for write-style approval.
 - **`spend_summary`**, **`top_campaigns`**, **`sales_summary`** — the
   canonical rollups over `ad_metrics` and `orders`, the two tables
   `run_sync.py`'s connectors share a uniform shape for. Dates are inclusive
-  `YYYY-MM-DD` strings. Anything these three don't answer, reach for
+  `YYYY-MM-DD` strings (compared as text with `BETWEEN`, so pass exactly that
+format). The amounts are plain `SUM`s with no currency conversion — see
+the data rules in [AGENTS.md](AGENTS.md) before comparing ad-platform
+revenue across rows. Anything these three don't answer, reach for
   `run_sql` — `list_tables` shows what else is available, including every
   table a platform page under [Connectors, by platform](#connectors-by-platform) adds.
 - **`last_sync_status`** — one row per platform from `sync_log`: last run
@@ -237,15 +290,21 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 |---|---|
 | `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, legacy-token-path log scrubbing, the `--http` loopback-by-default bind and its warnings, and a source grep guarding against a hardcoded wildcard bind |
 | `tests/test_list_tables.py` | `list_tables` surfaces SQL views alongside tables, in both column-listing and name-only mode, and `table_pattern` matches views too |
-| `tests/test_run_sync.py` | One connector failing doesn't abort the rest of a sync run |
+| `tests/test_run_sync.py` | A connector that raises is returned in `run()`'s failure list (which drives the non-zero exit) and logged to `sync_log` as `error` |
 | `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_google_ads_connector.py` | `search_impression_share` and its lost-share siblings stay `NULL` only on non-auction campaign types, keep a real `0.0` on Search/Shopping, and a Google-side `0.0/0.0/0.0` placeholder response is detected and nulled rather than stored as a fabricated zero |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, that a missing/unconfigured/failing target is skipped rather than raised, that `send(dest=...)`'s email target calls `send_email()` (so it shares the same retry behavior rather than a separate weaker path), `_smtp_config()` reading `SMTP_*` from the environment at call time, and `send_email()`'s own retry-then-report-failure behavior for a standalone HTML report send |
 
-Every standalone script under [Connectors, by platform](#connectors-by-platform) above has
-its own `tests/test_<script>.py` — schema creation, row-shaping, and its own API's particular
-gotchas, all hermetic (mocked HTTP, no network). Each platform's doc page links its own tests.
+Every standalone sync/import script under [Connectors, by platform](#connectors-by-platform)
+above has its own `tests/test_<script>.py` — schema creation, row-shaping, and its own API's
+particular gotchas, all hermetic (mocked HTTP, no network). Each platform's doc page links its
+own tests. A few files don't follow the one-script naming: `tests/test_brand_analytics.py`
+covers the shared `warehouse/brand_analytics.py` report runner, and
+`tests/test_meta_ads_landing_page_views.py` covers the `landing_page_views` column in the core
+Meta connector. The one-time OAuth helpers (`google_auth.py`, `amazon_auth.py`,
+`tiktok_auth.py`) and `make_cert.py` have no tests; `klaviyo_auth.py` does
+(`tests/test_klaviyo_auth.py`).
 
 ## Configuration
 
@@ -259,7 +318,7 @@ tied to any one platform:
 | `WAREHOUSE_DB` | Path to the SQLite file | `warehouse.db` beside the code |
 | `WAREHOUSE_MCP_TOKEN` | Bearer token required in `--http` mode | unset |
 | `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma- or semicolon-separated Host/Origin allowlist for `--http` (see also `allowed_hosts.txt`) | unset |
-| `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates | `ecommerce-warehouse MCP` |
+| `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates. `make_cert.py` does **not** load `.env`, so set this in the shell environment when you run it | `ecommerce-warehouse MCP` |
 
 Set `WAREHOUSE_DB` the same way for both `run_sync.py` and `server.py`. If they disagree,
 the sync fills one database while the server reads an empty one.

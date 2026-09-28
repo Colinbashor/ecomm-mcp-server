@@ -27,8 +27,13 @@ warehouse/
   connectors/          the 6 that write shared `orders` / `ad_metrics`
   brand_analytics.py   shared Amazon report runner
   notify.py            optional Slack / Google Chat / email notifications
-server.py              MCP server (6 read-only tools)
+server.py              MCP server (6 read-only tools; stdio, or --http)
+make_cert.py           self-signed TLS cert for --http (writes certs/)
+serve_mcp.bat          Windows keep-alive loop for the team --http server
+SHARING.md             team/HTTP setup: token, HostGuard, certs, mcp-remote
+*_auth.py              one-time OAuth helpers (google, amazon, tiktok, klaviyo)
 docs/<platform>.md     per-platform setup + traps  <- READ BEFORE EDITING
+docs/operations.md     notify.py + backup_db.py (non-connector utilities)
 tests/                 hermetic; no network, no database file
 ```
 
@@ -52,9 +57,17 @@ python -m pytest -q           # hermetic, seconds, no credentials needed
 python server.py              # stdio MCP server
 ```
 
-Most syncs support `--dry-run` or `--probe`. **Use them first.** A probe costs
+Where a script offers `--dry-run` or `--probe`, **use it first.** A probe costs
 one request and usually tells you a scope is missing, which is the real problem
-far more often than the error message suggests.
+far more often than the error message suggests. Not every script has one — as
+of this writing `--dry-run`/`--probe` exist on `algolia_sync.py`,
+`amazon_awd_sync.py`, `amazon_search_terms_monthly.py`,
+`factory_status_backfill.py`, `factory_status_import.py`, `reacher_sync.py`,
+`search_console_sync.py`, `shopify_customers_sync.py`,
+`tiktok_analytics_sync.py`, `tiktok_creators_sync.py` and `voc_import.py`;
+check the script's argparse (or its `docs/<platform>.md` Usage section) for
+the rest. `run_sync.py` has neither — use `--sample` to exercise the pipeline
+without credentials, or `--only <one>` with a short window.
 
 ---
 
@@ -178,8 +191,21 @@ explicitly in the commit message**:
   louder still without TLS, because the bearer token is replayable by anyone who
   can read it. A test greps for a hardcoded wildcard bind; keep it passing.
 - `HostGuard` validates Host/Origin itself rather than using the SDK's static
-  list, so a changing network address needs no restart. Never add a
+  list (the SDK's DNS-rebinding check is explicitly disabled in favour of it),
+  so a changing network address needs no restart. Never add a
   prefix/suffix hostname rule: `<yourhost>.evil.com` is registrable by anyone.
+- Order inside `BearerTokenMiddleware`: bearer token first (constant-time
+  compare, `401`), then Host (`421`) / Origin (`403`). Keep auth first so
+  anonymous probes can't enumerate valid host names by status code. Non-HTTP
+  ASGI scopes other than `lifespan` are refused (websockets closed with 1008).
+- The happy path of `HostGuard` does no DNS or socket work; re-resolution only
+  happens off the event loop after a rejection (10s cooldown, single-flight) or
+  when `allowed_hosts.txt` changes. Tests pin this — keep them passing.
+- `_REMOTE_DENIED_COLUMNS` ships empty. It is the per-deployment PII list for
+  remote `run_sql`; populate it for your schema, don't assume it protects
+  anything by default.
+- `run_sql` has a wall-clock budget (`RUN_SQL_TIMEOUT_SEC`, 45s) enforced by a
+  SQLite progress handler, and a 1000-row cap.
 
 Static bearer auth is **not** OAuth 2.1. It suits loopback, a tunnel, or a small
 trusted LAN. Managed or hosted connectors that expect OAuth will not work with
@@ -197,8 +223,11 @@ Follow an existing standalone sync; they share a shape.
    genuinely the same grain as what is already there.
 3. Create tables and apply migrations idempotently on every run, so a fresh
    clone and an existing database both work.
-4. Log to `sync_log` with `ok` / `degraded` and a message naming what was
-   actually covered — especially for a partial run.
+4. Log to `sync_log` (`db.log_sync(platform, started_at, rows_written,
+   status, message)`) with `ok` / `degraded` / `error` and a message naming
+   what was actually covered — especially for a partial run. `run_sync.py`
+   itself only ever logs `ok` or `error`; `last_sync_status` surfaces the
+   latest row per platform, so this is what a human sees first.
 5. Support `--dry-run` (or `--probe`), a date window, and resume.
 6. Write `docs/<platform>.md`: auth steps, retention floor, pagination style,
    rate limits, and every trap you hit. **This is a deliverable, not an
