@@ -133,7 +133,7 @@ writes, and its test coverage.
 | Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, AWD (bulk-storage) inventory, returns, rank, fees, economics, traffic, Voice of the Customer, listing-quality diagnostics |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase, monthly search terms by category |
 | Shopify | [docs/shopify.md](docs/shopify.md) | orders | customer dimension (tags, consent, metafields) |
-| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data, listing-quality diagnostics |
+| TikTok Shop | [docs/tiktok-shop.md](docs/tiktok-shop.md) | orders (with per-line seller/platform discounts) | videos, LIVE-shopping, creator identity, sales-source split, settlement/fee data + net-sales view, listing-quality diagnostics |
 | Klaviyo | [docs/klaviyo.md](docs/klaviyo.md) | — | email campaign + per-channel flow performance, segment growth, daily attributed revenue |
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns, inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |

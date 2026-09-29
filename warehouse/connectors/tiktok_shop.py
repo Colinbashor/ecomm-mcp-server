@@ -10,6 +10,17 @@ same page — so paginating through thousands of orders never breaks.
 
 Docs: https://partner.tiktokshop.com/docv2  (Orders > Get Order List)
 Returns rows shaped for db.upsert_orders().
+
+DISCOUNTS. Each row carries `seller_discount` (merchant-funded coupon /
+flash-sale) and `platform_discount` (a voucher TikTok itself funds), summed
+across the unit-lines of the same sku like `total` and `original_total`.
+`total` (the line `sale_price`) nets out BOTH, but TikTok reimburses the
+platform-funded piece, so `total` alone understates what the seller actually
+sold. Net sales = `total + platform_discount`. The order API carries this at
+order time; the settlement feed (tiktok_finance_sync.py) only has it once an
+order clears the payout cycle. Rows synced before these columns existed hold
+NULL (not captured), which is deliberately distinct from a measured 0 -- re-pull
+order history to populate them.
 """
 from __future__ import annotations
 
@@ -146,6 +157,8 @@ def sync(start_date: str, end_date: str) -> list[dict]:
                     row["quantity"] += 1
                     row["total"] += float(item.get("sale_price", 0) or 0)
                     row["original_total"] += float(item.get("original_price", 0) or 0)
+                    row["seller_discount"] += float(item.get("seller_discount", 0) or 0)
+                    row["platform_discount"] += float(item.get("platform_discount", 0) or 0)
                 else:
                     by_sku[sku] = {
                         "platform": PLATFORM,
@@ -158,6 +171,12 @@ def sync(start_date: str, end_date: str) -> list[dict]:
                         "total": float(item.get("sale_price", 0) or 0),
                         "currency": item.get("currency") or currency,
                         "original_total": float(item.get("original_price", 0) or 0),
+                        # sale_price = original_price - seller_discount - platform_discount,
+                        # to the cent. seller_discount is merchant-funded; platform_discount
+                        # is TikTok-funded and paid back to the seller at settlement, so
+                        # net sales = total + platform_discount (see db.py MIGRATIONS).
+                        "seller_discount": float(item.get("seller_discount", 0) or 0),
+                        "platform_discount": float(item.get("platform_discount", 0) or 0),
                         "is_sample": is_sample,
                         "creator": creator,
                         "creator_id": creator_id,

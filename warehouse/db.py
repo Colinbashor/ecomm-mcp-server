@@ -76,6 +76,15 @@ MIGRATIONS = {
                                 # once a handle<->user_id map exists — video feed has
                                 # only the handle, so these don't bridge yet)
         "source TEXT",          # shopify source_name (e.g. web, tiktok, amazon-us, pos, ...)
+        # tiktok line_items seller_discount / platform_discount.
+        # sale_price = original_price - seller_discount - platform_discount to
+        # the cent, so `total` nets out BOTH; platform_discount is platform-funded
+        # and paid back to the seller, i.e. net sales = total + platform_discount.
+        # Available at order time -- the settlement feed only has it once an
+        # order clears the payout cycle. NULL = not captured (older sync, or a
+        # platform that has no such concept), never 0.
+        "seller_discount REAL",
+        "platform_discount REAL",
     ],
 }
 
@@ -163,12 +172,15 @@ def upsert_orders(rows: list[dict]) -> int:
             """
             INSERT OR REPLACE INTO orders
               (platform, order_id, order_date, status, sku, product_name,
-               quantity, total, currency, synced_at, original_total, is_sample, creator, creator_id, source)
+               quantity, total, currency, synced_at, original_total, is_sample, creator, creator_id, source,
+               seller_discount, platform_discount)
             VALUES
               (:platform, :order_id, :order_date, :status, :sku, :product_name,
-               :quantity, :total, :currency, :synced_at, :original_total, :is_sample, :creator, :creator_id, :source)
+               :quantity, :total, :currency, :synced_at, :original_total, :is_sample, :creator, :creator_id, :source,
+               :seller_discount, :platform_discount)
             """,
             [{"original_total": None, "is_sample": None, "creator": None, "creator_id": None, "source": None,
+              "seller_discount": None, "platform_discount": None,
               **r, "synced_at": stamp} for r in rows],
         )
     conn.close()

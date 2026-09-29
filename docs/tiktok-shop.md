@@ -86,6 +86,9 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit
 - `tiktok_creators`
 - `tiktok_shop_performance`
 - `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
+- `tiktok_weekly_product` (VIEW, rebuilt by `tiktok_finance_sync.py`) — weekly
+  (Mon–Sun) per-sku TikTok sales with the platform-funded discount added back;
+  see the net-sales note below
 - `tiktok_listing_quality` — one row per product (PK `product_id`):
   `current_tier` (`POOR`/`FAIR`/`GOOD`), `remaining_recommendations`,
   `synced_at`
@@ -157,6 +160,21 @@ only an account-wide rate. Also worth knowing before you debug the same
 thing twice: the statements endpoint 400s with "SortField is a required
 field" if `sort_field` is omitted, which reads exactly like a missing-scope
 error but usually isn't — see the module docstring.
+
+**TikTok `orders.total` is not net sales.** Each TikTok line's `sale_price`
+(stored as `total`) nets out two discounts: `seller_discount` (your own coupon
+or flash sale) and `platform_discount` (a voucher TikTok funds and pays you
+back at settlement), so `sale_price = original_price - seller_discount -
+platform_discount`. The orders connector stores both per line in the
+`orders.seller_discount` / `orders.platform_discount` columns (summed across
+unit-lines of the same sku; NULL on other platforms and on rows synced before
+the columns existed — re-pull TikTok order history to populate them). Net
+sales = `total + platform_discount`. The `tiktok_weekly_product` view applies
+that per line, falls back to the settlement feed's order-level
+`platform_discount_amount` split pro rata across the order's lines for rows
+without the line-level figure, and otherwise leaves `total` unmodified —
+never assuming zero. Its `pd_known_sales` column shows how much of `net_sales`
+was actually measured, so a coverage gap can't masquerade as a demand change.
 
 `tiktok_listing_quality_sync.py` has no catalog table to source an
 active-product-id list from — pass `--product-ids`/`--product-ids-file`
