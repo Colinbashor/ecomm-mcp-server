@@ -51,6 +51,35 @@ from `warehouse/connectors/tiktok_shop.py` (see that file's docstring for the
 full OAuth setup). No new credentials are needed -- if TikTok orders sync
 already works, this does too.
 
+NET SALES VIEW: `tiktok_weekly_product`
+  `orders.total` for TikTok is the shopper-paid price, which nets out BOTH a
+  seller-funded discount (your own markdown) and a platform-funded discount (a
+  voucher TikTok funds and reimburses to you at settlement). Summing `total`
+  as "net sales" therefore understates what you actually sold by the
+  platform-funded piece. This connector rebuilds a view, on every run, that
+  corrects it per order line, using the best source available:
+
+    1. `orders.platform_discount` -- captured per line from the order API by
+       warehouse/connectors/tiktok_shop.py. Exact, and available the day the
+       order is placed. Wins whenever it is non-NULL (a measured 0 counts).
+    2. Settlement pro rata -- `tiktok_settlement_orders.platform_discount_amount`
+       is ORDER-level (no sku column), so it is SUMmed per order_id (an order
+       can appear on several statements; MAX would undercount) and allocated
+       across the order's lines by each line's share of the order total. Exact
+       for single-sku orders, proportional otherwise. Used only for rows synced
+       before the line-level column existed.
+    3. Raw `total`, unmodified. An order with neither source has NOT been
+       measured -- it is never treated as "zero platform discount".
+
+  Columns: week_start (Monday; Mon-Sun weeks), sku, product_name, units,
+  gross_sales, discounts (seller-funded only), net_sales, sample_units,
+  sample_orders, platform_discount, shopper_paid (= raw total), and
+  pd_known_sales (the part of net_sales whose platform discount was actually
+  measured -- compare it to net_sales to see how much of a week is still on
+  the raw-total fallback). Sample orders are excluded from the sales columns
+  and counted separately. It is a live VIEW, not a snapshot: it self-corrects
+  as more orders settle or history is re-pulled, with no extra step.
+
 USAGE
   python tiktok_finance_sync.py                 # incremental, last 30 days
   python tiktok_finance_sync.py --days 180       # wider window
@@ -191,9 +220,76 @@ CREATE INDEX IF NOT EXISTS idx_tso_order ON tiktok_settlement_orders(order_id);
 CREATE INDEX IF NOT EXISTS idx_tso_time  ON tiktok_settlement_orders(order_create_time);
 """
 
+# Weekly per-sku TikTok sales with the platform-funded discount added back.
+# See "NET SALES VIEW" in the module docstring for the precedence rules.
+# Sign conventions differ by source and both are handled here: the settlement
+# feed reports platform_discount_amount as NEGATIVE (a deduction), the order
+# API's line-level platform_discount as POSITIVE. Dropped and recreated on
+# every run so a fresh database or a definition change never leaves a stale
+# view behind. Downstream readers should select columns by NAME -- new
+# columns are appended at the end.
+VIEW_DDL = """
+DROP VIEW IF EXISTS tiktok_weekly_product;
+CREATE VIEW tiktok_weekly_product AS
+WITH settle AS (
+    SELECT order_id, SUM(platform_discount_amount) AS platform_discount_amount
+    FROM tiktok_settlement_orders
+    GROUP BY order_id
+),
+order_totals AS (
+    SELECT order_id, SUM(CASE WHEN is_sample = 1 THEN 0 ELSE total END) AS order_total
+    FROM orders
+    WHERE platform = 'tiktok' AND status != 'CANCELLED'
+    GROUP BY order_id
+),
+lines AS (
+    SELECT o.*,
+           CASE
+               WHEN o.is_sample = 1 THEN o.total
+               WHEN o.platform_discount IS NOT NULL THEN o.total + o.platform_discount
+               WHEN s.platform_discount_amount IS NULL THEN o.total
+               WHEN ot.order_total IS NULL OR ot.order_total = 0 THEN o.total
+               ELSE o.total - s.platform_discount_amount * (o.total / ot.order_total)
+           END AS net_total,
+           CASE
+               WHEN o.platform_discount IS NOT NULL THEN 1
+               WHEN s.platform_discount_amount IS NOT NULL
+                    AND ot.order_total IS NOT NULL AND ot.order_total <> 0 THEN 1
+               ELSE 0
+           END AS pd_known
+    FROM orders o
+    LEFT JOIN settle s ON s.order_id = o.order_id
+    LEFT JOIN order_totals ot ON ot.order_id = o.order_id
+    WHERE o.platform = 'tiktok' AND o.status != 'CANCELLED'
+)
+SELECT date(order_date, 'weekday 0', '-6 days') AS week_start,
+       sku,
+       MAX(product_name) AS product_name,
+       SUM(CASE WHEN is_sample = 1 THEN 0 ELSE quantity END) AS units,
+       ROUND(SUM(CASE WHEN is_sample = 1 THEN 0 ELSE original_total END), 2) AS gross_sales,
+       ROUND(SUM(CASE WHEN is_sample = 1 THEN 0 ELSE original_total - net_total END), 2) AS discounts,
+       ROUND(SUM(CASE WHEN is_sample = 1 THEN 0 ELSE net_total END), 2) AS net_sales,
+       SUM(CASE WHEN is_sample = 1 THEN quantity ELSE 0 END) AS sample_units,
+       COUNT(DISTINCT CASE WHEN is_sample = 1 THEN order_id END) AS sample_orders,
+       ROUND(SUM(CASE WHEN is_sample = 1 THEN 0 ELSE net_total - total END), 2) AS platform_discount,
+       ROUND(SUM(CASE WHEN is_sample = 1 THEN 0 ELSE total END), 2) AS shopper_paid,
+       ROUND(SUM(CASE WHEN is_sample = 1 OR pd_known = 0 THEN 0 ELSE net_total END), 2) AS pd_known_sales
+FROM lines
+GROUP BY week_start, sku;
+"""
+
 
 def ensure_schema(conn) -> None:
     conn.executescript(DDL)
+
+
+def ensure_view(conn) -> None:
+    """(Re)build tiktok_weekly_product. Kept separate from ensure_schema()
+    because it reads the shared `orders` table (created by db.init_db()), not
+    only this connector's own tables. SQLite resolves a view's tables lazily,
+    so creating it never fails -- querying it needs `orders` with the
+    platform_discount column, i.e. db.init_db() must have run."""
+    conn.executescript(VIEW_DDL)
 
 
 def check_required_env() -> None:
@@ -306,6 +402,7 @@ def sync(days: int, *, with_components: bool = True, with_orders: bool = True) -
     `days` and write them. Returns a summary dict for logging/printing."""
     conn = db.connect()
     ensure_schema(conn)
+    ensure_view(conn)
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     statements = fetch_statements(days)
