@@ -224,6 +224,13 @@ While the flag is set:
 - The server is **read-only** — `run_sql` only permits `SELECT`/`WITH`, and
   the underlying connection is opened `mode=ro`, so nothing a client sends can
   write to the warehouse.
+- **Leave `WAREHOUSE_MCP_ENABLE_WRITES` unset on a shared server** unless you
+  mean it. Setting it to `1` registers Google Sheets / Apps Script write tools
+  (see the README's "Optional write tools") for **every** client of that
+  process — anyone with the bearer token could then edit the Sheets the
+  configured Google user can edit and redeploy its public Apps Script web
+  apps. The flag is read once at startup and logged loudly either way; if only
+  you need the write tools, run them from a separate local stdio instance.
 - `run_sql` also carries a wall-clock budget (`RUN_SQL_TIMEOUT_SEC` in
   `server.py`, 45s by default) — one unindexed scan or accidental cross join
   can't tie up a server that several people share. A query that hits the

@@ -3,7 +3,9 @@ MCP server for the e-commerce warehouse.
 
 This is what Claude Desktop talks to. It exposes a handful of safe,
 read-only tools over your local SQLite warehouse so you can ask things like
-"what did we spend on each platform last week?" in plain English.
+"what did we spend on each platform last week?" in plain English. An OPTIONAL,
+opt-in set of Google Sheets / Apps Script write tools is registered only when
+WAREHOUSE_MCP_ENABLE_WRITES=1 (see register_write_tools below).
 
 Two ways to run it:
   python server.py           # stdio — Claude Desktop launches this locally
@@ -932,6 +934,60 @@ def register_tools(server: FastMCP) -> None:
         server.tool(title=title, annotations=_READ_ONLY)(func)
 
 
+# Opt-in flag gating the write tools below. Read once, at startup, not per
+# call. The same server binary runs as a local stdio connector AND as a shared
+# --http endpoint for coworkers (see SHARING.md); a tool set that can mutate a
+# live Google Sheet and deploy a public Apps Script web app has no business
+# appearing just because the process is running. Only the exact value "1"
+# enables it — "true", "yes" and friends deliberately do not.
+WAREHOUSE_MCP_ENABLE_WRITES_ENV = "WAREHOUSE_MCP_ENABLE_WRITES"
+
+# The opposite of _READ_ONLY. destructiveHint=True because a new Apps Script
+# deployment changes a public /exec URL and Sheet writes overwrite cells, so a
+# well-behaved client prompts before every call. None of these tools touch the
+# warehouse database — run_sql stays read-only at the SQLite level regardless.
+_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+
+def _write_tools():
+    """(func, title) pairs for the write tool set. Imported lazily so a server
+    run without writes enabled never imports google_sheets_script (and so
+    never needs its auth env vars or google-auth installed)."""
+    import google_sheets_script as gs
+
+    return (
+        (gs.sheets_add_tabs, "Add tabs to a Google Sheet"),
+        (gs.sheets_rename_tab, "Rename a Google Sheet tab"),
+        (gs.sheets_write_values, "Write values into a Google Sheet range"),
+        (gs.sheets_set_checkboxes, "Turn a Google Sheet range into checkboxes"),
+        (gs.script_create_project, "Create an Apps Script project bound to a Sheet"),
+        (gs.script_push_content, "Push Apps Script project files (diff-first, confirm to commit)"),
+        (gs.script_deploy, "Deploy an Apps Script web app (updates the existing deployment by default)"),
+    )
+
+
+def register_write_tools(server: FastMCP) -> bool:
+    """Attach the Sheets/Apps Script write tools iff WAREHOUSE_MCP_ENABLE_WRITES=1.
+
+    Returns whether they were registered, and logs the decision either way
+    (info when skipped, warning when registered) so an operator can always
+    tell from the log which surface a running server exposes."""
+    if os.environ.get(WAREHOUSE_MCP_ENABLE_WRITES_ENV) != "1":
+        host_log.info("write tools NOT registered (%s is not '1')", WAREHOUSE_MCP_ENABLE_WRITES_ENV)
+        return False
+    for func, title in _write_tools():
+        server.tool(title=title, annotations=_WRITE)(func)
+    host_log.warning("write tools REGISTERED (%s=1): this server can now mutate a live "
+                     "Google Sheet and deploy a public Apps Script web app",
+                     WAREHOUSE_MCP_ENABLE_WRITES_ENV)
+    return True
+
+
 def build_server(
     *,
     host: str = "127.0.0.1",
@@ -951,6 +1007,7 @@ def build_server(
         transport_security=transport_security,
     )
     register_tools(server)
+    register_write_tools(server)
     return server
 
 
