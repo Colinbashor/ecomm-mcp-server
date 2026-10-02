@@ -161,7 +161,8 @@ def _batch_update(spreadsheet_id: str, requests_: list[dict]) -> dict:
 
 
 def sheets_add_tabs(spreadsheet_id: str, tabs: list[dict]) -> dict:
-    """Add one or more tabs, each optionally with a bold header row.
+    """Add one or more tabs, each optionally with a header row (written to
+    row 1 as plain RAW values -- no formatting is applied).
 
     tabs: [{"title": "Settings", "headers": ["key", "value", "notes"]}, ...]
 

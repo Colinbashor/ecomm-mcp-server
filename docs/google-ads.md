@@ -144,16 +144,16 @@ python google_ads_mutate.py set-keyword-urls --ad-group-id 118472772345 --file u
 # raise or lower a (possibly shared) budget's daily amount
 python google_ads_mutate.py update-budget --budget-id 22334455 --daily-amount 75 --execute
 
-# update the target on a campaign that runs genuine TARGET_ROAS (NOT set-bidding — see Notes)
+# update the target on a campaign that runs genuine TARGET_ROAS (NOT set-bidding — see the prose below)
 python google_ads_mutate.py update-target-roas --campaign-id 20593969582 --target-roas 3.5 --execute
 
 # demote a duplicate/double-counting conversion action to secondary
 python google_ads_mutate.py set-conversion-action-secondary --conversion-action-id 123456789 --execute
 
 # append UTMs to several campaigns' landing URLs in ONE atomic request
-python google_ads_mutate.py set-final-url-suffix --campaign-id 20593969582 --campaign-id 22001500480     --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}" --execute
+python google_ads_mutate.py set-final-url-suffix --campaign-id 20593969582 --campaign-id 22001500480 \n    --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}" --execute
 
-# documented dead end — Google rejects an empty template (TOO_SHORT); see Notes
+# documented dead end — Google rejects an empty template (TOO_SHORT); see the prose below
 python google_ads_mutate.py clear-campaign-tracking-template --campaign-id 20593969582
 ```
 
@@ -197,7 +197,7 @@ Several flags can be repeated: `--campaign-id` on `remove-campaigns`, `set-final
 `flip-campaign-user-list-to-negative`, `--old-criterion-id` and
 `--user-list-id` are paired by position.
 
-**Writing a default value: the auto field-mask trap.** Most update
+**Writing a default value: the auto field-mask trap.** Many update
 subcommands build their `update_mask` with
 `google.api_core.protobuf_helpers.field_mask(None, obj._pb)`, which only sees
 NON-default values. A proto3 bool set to `False` or a string set to `""` is

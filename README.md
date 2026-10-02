@@ -140,6 +140,7 @@ writes, and its test coverage.
 | Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics; **write-capable** `reacher_sample_limits.py` for capping/clearing per-product sample auto-approval |
 | Algolia (on-site search/browse) | [docs/algolia.md](docs/algolia.md) | — | collection-grid placement, search/browse engagement |
 | Factory production tracking | [docs/factory-production.md](docs/factory-production.md) | — | manual-drop vendor spreadsheets, header-matched into one table |
+| Google Sheets / Apps Script (opt-in MCP **write** tools, not a connector) | [docs/google-sheets.md](docs/google-sheets.md) | — | add tabs, write values, checkboxes; create/push/deploy a bound Apps Script web app — registered only with `WAREHOUSE_MCP_ENABLE_WRITES=1` |
 
 Two more standalone utilities aren't connectors at all — no credentials, no
 data pulled from anywhere: pushing a "sync finished" notification to
@@ -296,7 +297,9 @@ project, and switch the Apps Script API on for that user at
 <https://script.google.com/home/usersettings>. The OAuth scopes are
 `spreadsheets`, `script.projects`, `script.deployments` and `drive.file`
 (deliberately not full Drive). The same operations are available as a CLI:
-`python google_sheets_script.py --help`.
+`python google_sheets_script.py --help`. Full reference — each tool's
+parameters and return shape, the A1-range rules, the push → deploy order, and
+the gotchas — is in [docs/google-sheets.md](docs/google-sheets.md).
 
 > **Do not enable this on a shared `--http` server casually.** The flag is
 > server-wide, not per client: every teammate holding the bearer token gets
