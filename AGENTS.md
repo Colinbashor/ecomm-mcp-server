@@ -27,11 +27,13 @@ warehouse/
   connectors/          the 6 that write shared `orders` / `ad_metrics`
   brand_analytics.py   shared Amazon report runner
   notify.py            optional Slack / Google Chat / email notifications
-server.py              MCP server (6 read-only tools; stdio, or --http)
+server.py              MCP server (6 read-only tools + opt-in Sheets write set; stdio, or --http)
+*_mutate.py            WRITE-capable ad-account scripts (google, meta); dry-run unless --execute
+google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
 make_cert.py           self-signed TLS cert for --http (writes certs/)
 serve_mcp.bat          Windows keep-alive loop for the team --http server
 SHARING.md             team/HTTP setup: token, HostGuard, certs, mcp-remote
-*_auth.py              one-time OAuth helpers (google, amazon, tiktok, klaviyo)
+*_auth.py              one-time OAuth helpers (google, google_sheets, amazon, tiktok, klaviyo)
 docs/<platform>.md     per-platform setup + traps  <- READ BEFORE EDITING
 docs/operations.md     notify.py + backup_db.py (non-connector utilities)
 tests/                 hermetic; no network, no database file
@@ -178,7 +180,12 @@ costs what fetching 1 costs, so page at the maximum the API allows.
 ## The MCP server
 
 Six read-only tools: `list_tables`, `run_sql`, `spend_summary`,
-`sales_summary`, `top_campaigns`, `last_sync_status`.
+`sales_summary`, `top_campaigns`, `last_sync_status`. Plus seven OPT-IN Google
+Sheets / Apps Script write tools (`register_write_tools`), registered only
+when `WAREHOUSE_MCP_ENABLE_WRITES` is exactly `1` at startup — keep that gate
+exact-match, keep `google_sheets_script` imported lazily inside it, and keep
+the write tools annotated `destructiveHint=True`
+(`tests/test_server_write_tools.py` pins all three).
 
 Security properties, all deliberate — **do not weaken these without saying so
 explicitly in the commit message**:

@@ -128,7 +128,7 @@ writes, and its test coverage.
 | Google Analytics 4 | [docs/ga4.md](docs/ga4.md) | — | funnel metrics, product performance, landing pages (per-URL and bucketed), Meta paid/organic traffic split, new-vs-returning |
 | Google Merchant Center | [docs/merchant-center.md](docs/merchant-center.md) | — | feed performance, price competitiveness, best-sellers, visibility |
 | Google Search Console | [docs/search-console.md](docs/search-console.md) | — | organic search clicks/impressions/position by query and landing page |
-| Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | ad/creative/video-level detail |
+| Meta Ads | [docs/meta-ads.md](docs/meta-ads.md) | campaign spend/clicks/conversions | ad/creative/video-level detail; **write-capable** `meta_ads_mutate.py` for pausing/resuming campaigns, ad sets and ads, ad-set budgets and ad-set copies |
 | Amazon Advertising | [docs/amazon-ads.md](docs/amazon-ads.md) | campaign spend/clicks/conversions | per-ASIN, keyword/target, search-term performance |
 | Amazon Seller (SP-API) | [docs/amazon-seller.md](docs/amazon-seller.md) | retail orders | inventory, AWD (bulk-storage) inventory, returns, rank, fees, economics, traffic, Voice of the Customer, listing-quality diagnostics |
 | Amazon Brand Analytics | [docs/amazon-brand-analytics.md](docs/amazon-brand-analytics.md) | — | search query performance, market basket, repeat purchase, monthly search terms by category |
@@ -210,7 +210,7 @@ server running across reboots with `serve_mcp.bat` (Windows), and the
 
 ## MCP tools
 
-`server.py` exposes six read-only tools (MCP server name `ecommerce-warehouse`) — the
+`server.py` exposes six read-only tools (plus an opt-in write set, [below](#optional-write-tools-google-sheets--apps-script)) (MCP server name `ecommerce-warehouse`) — the
 same six over stdio or `--http`, though `run_sql`'s column redaction only kicks in over
 HTTP (see below). All annotate `readOnlyHint=True`/`destructiveHint=False`/
 `idempotentHint=True`/`openWorldHint=False`, so clients don't prompt for write-style
@@ -266,6 +266,44 @@ revenue across rows. Anything these three don't answer, reach for
   time, status, rows written, and any error message. The first thing to
   check if a summary tool looks stale or empty.
 
+### Optional write tools (Google Sheets / Apps Script)
+
+Off by default. With `WAREHOUSE_MCP_ENABLE_WRITES=1` in the environment at
+startup (only the exact value `1` counts), `server.py` also registers seven
+tools that let an assistant build a small internal tool on a Google Sheet —
+tabs, seed values, checkboxes, and a bound Apps Script web app — without
+anyone pasting code into the script editor. They come from
+`google_sheets_script.py`, which is imported only when the flag is on, and
+the startup log says which way the decision went.
+
+| Tool | Does | Safety net |
+|---|---|---|
+| `sheets_add_tabs` | add tabs, each with an optional header row | idempotent: an existing tab is left untouched |
+| `sheets_rename_tab` | rename a tab | errors if the old title doesn't exist |
+| `sheets_write_values` | write a block of values (`RAW`, never parsed as formulas) | commits directly |
+| `sheets_set_checkboxes` | turn a range into checkboxes | commits directly |
+| `script_create_project` | create an Apps Script project bound to a Sheet | — |
+| `script_push_content` | push `.gs` / `.html` / manifest files | returns a diff and writes nothing unless `confirm=true`; keeps remote files it wasn't given (e.g. the manifest) |
+| `script_deploy` | publish a web app version | always lists deployments first and **updates the existing one in place** (same `/exec` URL); a new deployment (new URL) needs `allow_new_deployment=true` |
+
+All seven carry `readOnlyHint=False` / `destructiveHint=True`, so a
+well-behaved client asks before each call. They never touch the warehouse
+database: `run_sql` stays read-only at the SQLite level either way. Setup:
+put `GOOGLE_SHEETS_CLIENT_ID` / `GOOGLE_SHEETS_CLIENT_SECRET` in `.env`, run
+`python google_sheets_auth.py` once (needs `google-auth-oauthlib`, same as
+`google_auth.py`), enable the Sheets and Apps Script APIs in the Cloud
+project, and switch the Apps Script API on for that user at
+<https://script.google.com/home/usersettings>. The OAuth scopes are
+`spreadsheets`, `script.projects`, `script.deployments` and `drive.file`
+(deliberately not full Drive). The same operations are available as a CLI:
+`python google_sheets_script.py --help`.
+
+> **Do not enable this on a shared `--http` server casually.** The flag is
+> server-wide, not per client: every teammate holding the bearer token gets
+> the ability to edit any Sheet the `GOOGLE_SHEETS_*` user can edit and to
+> redeploy its public web apps. Run a separate stdio-only instance with the
+> flag set if only you need it. See [SHARING.md](SHARING.md#notes).
+
 ## Claude Desktop
 
 Copy `claude_desktop_config.example.json` into your Claude Desktop config and replace
@@ -289,6 +327,8 @@ Hermetic — no network access, no `warehouse.db` required — and runs in a cou
 | File | Covers |
 |---|---|
 | `tests/test_server_security.py` | `HostGuard`'s Host/Origin accept/reject rules, live policy refresh, the remote SQL column authorizer, the `run_sql` wall-clock timeout, legacy-token-path log scrubbing, the `--http` loopback-by-default bind and its warnings, and a source grep guarding against a hardcoded wildcard bind |
+| `tests/test_server_write_tools.py` | The Sheets/Apps Script write tools are absent unless `WAREHOUSE_MCP_ENABLE_WRITES` is exactly `1`, carry `readOnlyHint=False`/`destructiveHint=True` when registered, and never alter the read-only tool set |
+| `tests/test_google_sheets_script.py` | `script_push_content` writes nothing without `confirm` and preserves remote files it wasn't given; `script_deploy` always lists deployments first, updates in place by default, and creates a new deployment only with `allow_new_deployment`; tab add/rename and checkbox grid ranges |
 | `tests/test_list_tables.py` | `list_tables` surfaces SQL views alongside tables, in both column-listing and name-only mode, and `table_pattern` matches views too |
 | `tests/test_run_sync.py` | A connector that raises is returned in `run()`'s failure list (which drives the non-zero exit) and logged to `sync_log` as `error` |
 | `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
@@ -302,8 +342,8 @@ particular gotchas, all hermetic (mocked HTTP, no network). Each platform's doc 
 own tests. A few files don't follow the one-script naming: `tests/test_brand_analytics.py`
 covers the shared `warehouse/brand_analytics.py` report runner, and
 `tests/test_meta_ads_landing_page_views.py` covers the `landing_page_views` column in the core
-Meta connector. The one-time OAuth helpers (`google_auth.py`, `amazon_auth.py`,
-`tiktok_auth.py`) and `make_cert.py` have no tests; `klaviyo_auth.py` does
+Meta connector. The one-time OAuth helpers (`google_auth.py`, `google_sheets_auth.py`,
+`amazon_auth.py`, `tiktok_auth.py`) and `make_cert.py` have no tests; `klaviyo_auth.py` does
 (`tests/test_klaviyo_auth.py`).
 
 ## Configuration
@@ -318,6 +358,7 @@ tied to any one platform:
 | `WAREHOUSE_DB` | Path to the SQLite file | `warehouse.db` beside the code |
 | `WAREHOUSE_MCP_TOKEN` | Bearer token required in `--http` mode | unset |
 | `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma- or semicolon-separated Host/Origin allowlist for `--http` (see also `allowed_hosts.txt`) | unset |
+| `WAREHOUSE_MCP_ENABLE_WRITES` | Exactly `1` registers the optional Google Sheets / Apps Script write tools (see [Optional write tools](#optional-write-tools-google-sheets--apps-script)); read once at startup | unset (off) |
 | `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates. `make_cert.py` does **not** load `.env`, so set this in the shell environment when you run it | `ecommerce-warehouse MCP` |
 
 Set `WAREHOUSE_DB` the same way for both `run_sync.py` and `server.py`. If they disagree,
