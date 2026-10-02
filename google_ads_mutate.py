@@ -14,8 +14,19 @@ for a *standard* Shopping campaign's `AdGroupCriterion.listing_group` tree —
 a related but genuinely different object/service/enum from PMax's), add or
 remove keywords, add or remove `user_list` (RLSA) audience criteria on a
 campaign (including converting an existing positive criterion into a
-negative/exclusion one), edit an `Audience` resource's segment membership, or
+negative/exclusion one), edit an `Audience` resource's segment membership,
+demote a conversion action to secondary, append a `final_url_suffix` to
+campaigns' landing URLs, update a genuine TARGET_ROAS campaign's target, or
 end a Campaign Experiment.
+
+THE AUTO FIELD-MASK TRAP (read before adding a subcommand): most updates here
+build their `update_mask` with `field_mask(None, obj._pb)`, which diffs the
+object against an empty one and so only picks up NON-DEFAULT values. A proto3
+bool set to `False`, a number set to `0`, or a string set to `""` is
+indistinguishable from "never touched" on the wire — the auto mask comes back
+EMPTY, and the mutate returns success while changing nothing. Any update that
+writes a default/zero value (or that must touch exactly one arm of a oneof)
+appends its mask path explicitly: `op.update_mask.paths.append("<field>")`.
 
 EVERY SUBCOMMAND HAS ITS OWN DOCSTRING on its function explaining what it
 does and any API quirk it works around — read that before using an unfamiliar
@@ -208,6 +219,39 @@ def set_bidding(args):
         resp = _mutate(client, campaign_service, "MutateCampaignsRequest",
                        _customer_id(), [campaign_op], args.execute)
         _report_result(resp, args.execute, "update bidding strategy")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def update_target_roas(args):
+    """Update the target VALUE on a campaign already running the TARGET_ROAS
+    bidding strategy (`campaign.target_roas.target_roas`).
+
+    Distinct from `set_bidding`, which only ever writes
+    `campaign.maximize_conversion_value.target_roas` — a DIFFERENT arm of the
+    `campaign_bidding_strategy` oneof. Protobuf oneof arms are mutually
+    exclusive, so running `set_bidding --target-roas` against a genuine
+    TARGET_ROAS campaign (common for standard Shopping) would silently SWITCH
+    its strategy type to Maximize Conversion Value instead of just updating
+    its target. Check `campaign.bidding_strategy_type` first, then use this
+    command for TARGET_ROAS and `set-bidding` for MAXIMIZE_CONVERSION_VALUE.
+
+    The mask path is set explicitly (not via the auto field-mask helper) so
+    the update touches exactly `target_roas.target_roas` and nothing else."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    campaign_service = client.get_service("CampaignService")
+    op = client.get_type("CampaignOperation")
+    c = op.update
+    c.resource_name = campaign_service.campaign_path(_customer_id(), args.campaign_id)
+    c.target_roas.target_roas = args.target_roas
+    op.update_mask.paths.append("target_roas.target_roas")
+
+    try:
+        resp = _mutate(client, campaign_service, "MutateCampaignsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute, f"update target_roas to {args.target_roas}")
     except GoogleAdsException as ex:
         _report_failure(ex)
 
@@ -436,6 +480,120 @@ def set_shopping_feed_label(args):
         resp = _mutate(client, campaign_service, "MutateCampaignsRequest",
                        _customer_id(), [campaign_op], args.execute)
         _report_result(resp, args.execute, "set Shopping feed_label")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def set_final_url_suffix(args):
+    """Append UTM / ValueTrack parameters to one or more campaigns' landing
+    URLs via `final_url_suffix`, WITHOUT touching their `tracking_url_template`.
+
+    Use case: a campaign-level `tracking_url_template` override (often left
+    behind by a third-party attribution tool) can carry only that tool's own
+    parameters and no `utm_*`, so the storefront's own attribution never sees
+    those clicks as paid search and files them under organic/direct.
+    `final_url_suffix` is ADDITIVE — it is appended to the final landing URL
+    independently of the tracking template — so it restores UTMs without
+    disturbing whatever the template is doing. Example:
+
+        --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}"
+
+    All campaign ids go into ONE mutate call, so `validate_only` checks every
+    campaign type (Search / Shopping / PMax) against the same suffix string
+    atomically before anything executes."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    campaign_service = client.get_service("CampaignService")
+    ops = []
+    for cid in args.campaign_id:
+        op = client.get_type("CampaignOperation")
+        c = op.update
+        c.resource_name = campaign_service.campaign_path(_customer_id(), cid)
+        c.final_url_suffix = args.suffix
+        op.update_mask.paths.append("final_url_suffix")
+        ops.append(op)
+
+    try:
+        resp = _mutate(client, campaign_service, "MutateCampaignsRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute, f"set final_url_suffix on {len(ops)} campaign(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def clear_campaign_tracking_template(args):
+    """Attempt to clear a campaign-level `tracking_url_template` override so
+    the campaign falls back to the account-level default
+    (`customer.tracking_url_template`; campaign beats account in Google's
+    precedence order).
+
+    !! DOCUMENTED DEAD END — kept on purpose so the next person does not
+    rediscover the wall. In practice Google REJECTS an empty string here with
+    a `TOO_SHORT` string-length error, even with the mask path set explicitly,
+    so "inherit the account default" is not reachable through mutate. Run it
+    without `--execute` to confirm the behaviour on your account; if it fails
+    validation, either overwrite each campaign's template with the account
+    default's value, or leave the template alone and add UTMs with
+    `set-final-url-suffix` instead (which is additive and usually what you
+    actually wanted).
+
+    The mask path is appended explicitly because `""` is a proto3 default and
+    the auto field-mask helper would otherwise produce an empty mask (a
+    silent no-op rather than the clear you asked for)."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    campaign_service = client.get_service("CampaignService")
+    ops = []
+    for cid in args.campaign_id:
+        op = client.get_type("CampaignOperation")
+        c = op.update
+        c.resource_name = campaign_service.campaign_path(_customer_id(), cid)
+        c.tracking_url_template = ""
+        op.update_mask.paths.append("tracking_url_template")
+        ops.append(op)
+
+    try:
+        resp = _mutate(client, campaign_service, "MutateCampaignsRequest",
+                       _customer_id(), ops, args.execute)
+        _report_result(resp, args.execute,
+                       f"clear tracking_url_template on {len(ops)} campaign(s)")
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+
+
+def set_conversion_action_secondary(args):
+    """Demote a conversion action from PRIMARY (counts toward the default
+    Conversions column and is what Smart Bidding optimizes toward) to
+    SECONDARY (still tracked and reportable, excluded from both) by setting
+    `primary_for_goal = False`.
+
+    Typical use: two conversion actions that both fire on the same purchase
+    (e.g. a site tag plus an app/feed-integration import) and are both
+    primary, so every Target ROAS / Maximize Conversion Value campaign bids
+    against roughly double the real conversion value. Pick one as the source
+    of truth and demote the other.
+
+    `False` is a proto3 default, so the auto field-mask helper would produce
+    an EMPTY mask here: the mutate returns success and nothing changes. The
+    mask path is therefore appended explicitly. Read the action's
+    `primary_for_goal` back after `--execute` to confirm."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    svc = client.get_service("ConversionActionService")
+    op = client.get_type("ConversionActionOperation")
+    ca = op.update
+    ca.resource_name = svc.conversion_action_path(_customer_id(), args.conversion_action_id)
+    ca.primary_for_goal = False
+    op.update_mask.paths.append("primary_for_goal")
+
+    try:
+        resp = _mutate(client, svc, "MutateConversionActionsRequest",
+                       _customer_id(), [op], args.execute)
+        _report_result(resp, args.execute,
+                       f"demote conversion action {args.conversion_action_id} to secondary")
     except GoogleAdsException as ex:
         _report_failure(ex)
 
@@ -1272,6 +1430,12 @@ def main():
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=set_bidding)
 
+    p = sub.add_parser("update-target-roas")
+    p.add_argument("--campaign-id", required=True)
+    p.add_argument("--target-roas", type=float, required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=update_target_roas)
+
     p = sub.add_parser("add-campaign-negative-user-list")
     p.add_argument("--campaign-id", required=True)
     p.add_argument("--user-list-id", action="append", required=True)
@@ -1302,6 +1466,22 @@ def main():
     p.add_argument("--feed-label", required=True)
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=set_shopping_feed_label)
+
+    p = sub.add_parser("set-final-url-suffix")
+    p.add_argument("--campaign-id", action="append", required=True)
+    p.add_argument("--suffix", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=set_final_url_suffix)
+
+    p = sub.add_parser("clear-campaign-tracking-template")
+    p.add_argument("--campaign-id", action="append", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=clear_campaign_tracking_template)
+
+    p = sub.add_parser("set-conversion-action-secondary")
+    p.add_argument("--conversion-action-id", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=set_conversion_action_secondary)
 
     p = sub.add_parser("set-tis-ceiling")
     p.add_argument("--campaign-id", required=True)

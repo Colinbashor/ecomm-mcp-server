@@ -322,5 +322,63 @@ class CreateSearchCampaignTests(unittest.TestCase):
         self.assertEqual(created_campaign.status, client.enums.CampaignStatusEnum.PAUSED)
 
 
+class ExplicitMaskPathTests(unittest.TestCase):
+    """Subcommands that write a proto3 DEFAULT value (False, "") or must touch
+    exactly one arm of a oneof can't use the auto `field_mask(None, obj._pb)`
+    helper: it only sees non-default values, so the mask comes back empty and
+    the mutate succeeds while changing nothing. Each of these must append its
+    mask path explicitly -- pin that so a refactor back onto the helper fails
+    loudly here instead of silently in a live account."""
+
+    def _run(self, func, **kw):
+        client = mock.Mock()
+        args = SimpleNamespace(execute=False, **kw)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="999"), \
+             mock.patch.object(gam, "_mutate") as m, \
+             mock.patch.object(gam, "_report_result"):
+            func(args)
+        ops = m.call_args.args[4]
+        return ops, m
+
+    def _paths(self, op):
+        return [c.args[0] for c in op.update_mask.paths.append.call_args_list]
+
+    def test_conversion_action_secondary_masks_primary_for_goal(self):
+        ops, m = self._run(gam.set_conversion_action_secondary, conversion_action_id="7")
+        self.assertIn("primary_for_goal", self._paths(ops[0]))
+        self.assertIs(ops[0].update.primary_for_goal, False)
+        self.assertEqual(m.call_args.args[2], "MutateConversionActionsRequest")
+
+    def test_clear_tracking_template_masks_the_field(self):
+        ops, _ = self._run(gam.clear_campaign_tracking_template, campaign_id=["1"])
+        self.assertIn("tracking_url_template", self._paths(ops[0]))
+        self.assertEqual(ops[0].update.tracking_url_template, "")
+
+    def test_final_url_suffix_sends_every_campaign_in_one_call(self):
+        ops, m = self._run(gam.set_final_url_suffix,
+                           campaign_id=["1", "2", "3"], suffix="utm_source=google")
+        m.assert_called_once()
+        self.assertEqual(len(ops), 3)
+        for op in ops:
+            self.assertIn("final_url_suffix", self._paths(op))
+            self.assertEqual(op.update.final_url_suffix, "utm_source=google")
+
+    def test_update_target_roas_touches_only_the_target_roas_arm(self):
+        ops, _ = self._run(gam.update_target_roas, campaign_id="1", target_roas=3.5)
+        self.assertEqual(self._paths(ops[0]), ["target_roas.target_roas"])
+        self.assertEqual(ops[0].update.target_roas.target_roas, 3.5)
+
+    def test_new_subcommands_default_to_dry_run(self):
+        for func, kw in [
+            (gam.set_conversion_action_secondary, {"conversion_action_id": "7"}),
+            (gam.clear_campaign_tracking_template, {"campaign_id": ["1"]}),
+            (gam.set_final_url_suffix, {"campaign_id": ["1"], "suffix": "a=b"}),
+            (gam.update_target_roas, {"campaign_id": "1", "target_roas": 2.0}),
+        ]:
+            _, m = self._run(func, **kw)
+            self.assertFalse(m.call_args.args[5], func.__name__)
+
+
 if __name__ == "__main__":
     unittest.main()

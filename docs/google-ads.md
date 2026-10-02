@@ -12,14 +12,15 @@ current-state campaign/asset/conversion-action configuration.
 | `warehouse/connectors/google_ads.py` | core, via `run_sync.py --only google` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `google_ads_detail_sync.py` | standalone | search terms, keywords + Quality Score, paid-vs-organic overlap, conversion-action attribution, device split, Shopping/PMax product demand, PMax search themes |
 | `google_ads_structure_sync.py` | standalone | current-state snapshots: campaigns, asset groups + assets, listing-group filters, conversion-action setup |
-| `google_ads_mutate.py` | standalone, **write-capable** | pause or remove a campaign, remove an ad group, change bidding strategy or TIS bid ceiling, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
+| `google_ads_mutate.py` | standalone, **write-capable** | pause or remove a campaign, remove an ad group, change bidding strategy, a TARGET_ROAS campaign's target, or TIS bid ceiling, demote a conversion action to secondary, append a `final_url_suffix` (UTMs) to campaigns, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
 
 The structure connector in particular is aimed at "this campaign looks funded
 but isn't serving" — a question spend/impression metrics alone usually can't
 answer.
 
 `google_ads_mutate.py` is the one script in this repo that changes anything
-in your live ad account. Every subcommand except `end-experiment` sends
+in your live Google Ads account (`meta_ads_mutate.py` is its Meta sibling — see
+[meta-ads.md](meta-ads.md)). Every subcommand except `end-experiment` sends
 `validate_only=True` (full server-side validation, zero changes committed)
 unless you pass `--execute`. `end-experiment` has no validate mode: without
 `--execute` it only prints what it would do and makes no API call. See the
@@ -142,6 +143,18 @@ python google_ads_mutate.py set-keyword-urls --ad-group-id 118472772345 --file u
 
 # raise or lower a (possibly shared) budget's daily amount
 python google_ads_mutate.py update-budget --budget-id 22334455 --daily-amount 75 --execute
+
+# update the target on a campaign that runs genuine TARGET_ROAS (NOT set-bidding — see Notes)
+python google_ads_mutate.py update-target-roas --campaign-id 20593969582 --target-roas 3.5 --execute
+
+# demote a duplicate/double-counting conversion action to secondary
+python google_ads_mutate.py set-conversion-action-secondary --conversion-action-id 123456789 --execute
+
+# append UTMs to several campaigns' landing URLs in ONE atomic request
+python google_ads_mutate.py set-final-url-suffix --campaign-id 20593969582 --campaign-id 22001500480     --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}" --execute
+
+# documented dead end — Google rejects an empty template (TOO_SHORT); see Notes
+python google_ads_mutate.py clear-campaign-tracking-template --campaign-id 20593969582
 ```
 
 `remove-campaigns` accepts repeated `--campaign-id` to remove several in one
@@ -178,11 +191,43 @@ create, via `--cpc-bid-micros` (default `10000` = $0.01). Standard Shopping
 requires a bid on each leaf even under automated bidding such as tROAS,
 which ignores it.
 
-Several flags can be repeated: `--campaign-id` on `remove-campaigns`,
+Several flags can be repeated: `--campaign-id` on `remove-campaigns`, `set-final-url-suffix` and `clear-campaign-tracking-template`,
 `--user-list-id` on the audience/user-list commands, `--geo-target-constant`,
 `--language-constant`, and `--include`. On
 `flip-campaign-user-list-to-negative`, `--old-criterion-id` and
 `--user-list-id` are paired by position.
+
+**Writing a default value: the auto field-mask trap.** Most update
+subcommands build their `update_mask` with
+`google.api_core.protobuf_helpers.field_mask(None, obj._pb)`, which only sees
+NON-default values. A proto3 bool set to `False` or a string set to `""` is
+indistinguishable from "untouched", so the mask comes back empty and the
+mutate reports success while changing nothing. `set-conversion-action-secondary`
+(`primary_for_goal = False`) and `clear-campaign-tracking-template`
+(`tracking_url_template = ""`) therefore append their mask paths explicitly —
+do the same in any new subcommand that writes a zero/false/empty value, and
+read the field back after `--execute` to confirm.
+
+**`update-target-roas` vs `set-bidding --target-roas`.** They write different
+arms of the `campaign_bidding_strategy` oneof: `set-bidding` writes
+`maximize_conversion_value.target_roas`, `update-target-roas` writes
+`target_roas.target_roas`. Oneof arms are mutually exclusive, so running
+`set-bidding` against a campaign that uses the standalone TARGET_ROAS
+strategy (common on standard Shopping) silently switches its strategy type.
+Check `campaign.bidding_strategy_type` first and pick the matching command.
+
+**`set-final-url-suffix` vs the tracking template.** A campaign-level
+`tracking_url_template` override (often written by a third-party
+attribution tool) can carry only that tool's parameters and no `utm_*`, which
+makes your storefront's own attribution file those paid clicks as organic.
+`final_url_suffix` is appended to the landing URL independently of the
+template, so it restores UTMs without touching the template. All
+`--campaign-id`s go in one request, so validation covers every campaign type
+before anything commits. `clear-campaign-tracking-template` is kept as a
+**documented dead end**: in practice Google rejects an empty template with a
+`TOO_SHORT` error even with an explicit mask, so "fall back to the
+account-level template" is not reachable through mutate. Use the suffix
+instead.
 
 `end-experiment` has no `validate_only` mode at all — the API call itself
 isn't dry-runnable, so `--execute` is the *only* thing standing between a
@@ -331,3 +376,10 @@ cross-table rollup:
 
 `tests/test_google_ads_detail_sync.py`, `tests/test_google_ads_structure_sync.py`,
 `tests/test_google_ads_connector.py`, `tests/test_google_ads_mutate.py`
+
+`tests/test_google_ads_mutate.py` also pins that the subcommands writing a
+proto3 default (`set-conversion-action-secondary`,
+`clear-campaign-tracking-template`) and the single-oneof-arm
+`update-target-roas` append their mask paths explicitly rather than relying
+on the auto field-mask helper, and that `set-final-url-suffix` sends every
+campaign in one request.
