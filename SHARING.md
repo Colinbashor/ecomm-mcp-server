@@ -226,7 +226,8 @@ While the flag is set:
   write to the warehouse.
 - **Leave `WAREHOUSE_MCP_ENABLE_WRITES` unset on a shared server** unless you
   mean it. Setting it to `1` registers Google Sheets / Apps Script write tools
-  (see the README's "Optional write tools") for **every** client of that
+  (see the README's "Optional write tools" and
+  [docs/google-sheets.md](docs/google-sheets.md)) for **every** client of that
   process — anyone with the bearer token could then edit the Sheets the
   configured Google user can edit and redeploy its public Apps Script web
   apps. The flag is read once at startup and logged loudly either way; if only

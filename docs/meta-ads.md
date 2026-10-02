@@ -295,7 +295,7 @@ same pinned Graph API version as the core connector; it writes nothing to
 - `copy-adset` is the exception. The `/{adset_id}/copies` edge is not
   documented to honour `validate_only`, so instead of sending a "dry run"
   that might really create a copy, the subcommand **refuses to run without
-  `--execute`**. The copy is created `PAUSED` unless `--go-live` is also
+  `--execute`** (exit code 2, versus 1 for an API error). The copy is created `PAUSED` unless `--go-live` is also
   passed. It is a genuinely new ad set with a fresh learning phase — none of
   the source's delivery history carries over (Meta has no native "move").
 - Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
