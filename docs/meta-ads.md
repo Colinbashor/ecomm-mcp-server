@@ -1,7 +1,9 @@
 # Meta (Facebook / Instagram) Ads
 
 Campaign-level spend/clicks/conversions from the core connector, plus an
-optional standalone script for ad/adset/creative/video-level detail.
+optional standalone script for ad/adset/creative/video-level detail, and a
+write-capable `meta_ads_mutate.py` for pausing/resuming, budgets and ad-set
+copies (see the last section).
 
 **Script:** `warehouse/connectors/meta_ads.py`, via `run_sync.py --only meta`
 (plain HTTPS against the Graph/Marketing API `v23.0`, no Meta SDK)
@@ -266,3 +268,78 @@ re-stored, unresolved ids reported), and `run()` / `main()` behaviour
 (`--only insights`, spend-bounded creative targeting,
 `--refresh-creatives`, video crawl of new references, skipped days and the
 `degraded` vs `ok` status).
+
+## Standalone extra: write-capable `meta_ads_mutate.py`
+
+**Script:** `meta_ads_mutate.py` — the Meta counterpart to
+[`google_ads_mutate.py`](google-ads.md), and the only file in this repo that
+changes anything in a live Meta ad account. Plain `requests` POSTs against the
+same pinned Graph API version as the core connector; it writes nothing to
+`warehouse.db`.
+
+| Subcommand | Does |
+|---|---|
+| `pause-campaign` / `resume-campaign --campaign-id ID` | set campaign `status` |
+| `pause-adset` / `resume-adset --adset-id ID` | set ad set `status` |
+| `pause-ad` / `resume-ad --ad-id ID` | set ad `status` |
+| `set-adset-budget --adset-id ID --daily-amount N [--currency-offset 100]` | set `daily_budget`, converting major → minor currency units |
+| `copy-adset --adset-id ID --dest-campaign-id ID [--go-live] --execute` | deep-copy an ad set and its ads into another campaign |
+
+### Safety model
+
+- Every field update sends `execution_options=["validate_only"]` unless you
+  pass `--execute`: Meta runs full server-side validation (real ids, real
+  permission checks) and commits nothing. Meta answers `{"success": true}`
+  for both a dry run and a real commit, so the script prints
+  `VALIDATE_ONLY passed` or `EXECUTED` explicitly.
+- `copy-adset` is the exception. The `/{adset_id}/copies` edge is not
+  documented to honour `validate_only`, so instead of sending a "dry run"
+  that might really create a copy, the subcommand **refuses to run without
+  `--execute`**. The copy is created `PAUSED` unless `--go-live` is also
+  passed. It is a genuinely new ad set with a fresh learning phase — none of
+  the source's delivery history carries over (Meta has no native "move").
+- Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
+  with Meta's message, type, code and subcode.
+
+### Permissions — two independent axes
+
+1. The token's OAuth scopes must include `ads_management` (`ads_read` is
+   enough for the read-only connectors, not here). Check with
+   `GET /debug_token`.
+2. The token's user or system user must **also** hold an Advertiser-level
+   (or higher) role on the ad account in Business Manager. A token with
+   `ads_management` but a read-level role fails every write, validate-only
+   ones included. Fix the role, not the scope.
+
+No new environment variables: it reuses `META_ACCESS_TOKEN`.
+
+### Usage
+
+```bash
+python meta_ads_mutate.py pause-campaign --campaign-id 1234567890           # dry run
+python meta_ads_mutate.py pause-campaign --campaign-id 1234567890 --execute
+python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 50
+python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 3000 \
+    --currency-offset 1 --execute                                           # zero-decimal currency (JPY/KRW)
+python meta_ads_mutate.py copy-adset --adset-id 1234567890 --dest-campaign-id 9876543210 --execute
+```
+
+### Notes
+
+- `daily_budget` is an integer in the account currency's minor unit:
+  `--currency-offset` is 100 for two-decimal currencies (50 → 5000) and 1 for
+  zero-decimal ones. Compare against an existing ad set's `daily_budget`
+  before writing if unsure. Ad sets under Advantage campaign budget (CBO)
+  have no budget of their own and reject this write.
+- An ACTIVE ad set whose ads are all PAUSED spends nothing, and the ad-set
+  row in Ads Manager doesn't make that obvious. Check the ads'
+  `effective_status` and use `resume-ad` when an ad set "looks live" but
+  isn't delivering.
+
+### Tests
+
+`tests/test_meta_ads_mutate.py` — hermetic (fake `requests.post`): every
+status subcommand defaults to `validate_only`, `--execute` drops it,
+`copy-adset` refuses without `--execute` and defaults to `PAUSED`, budget
+minor-unit conversion (including a zero-decimal offset), and non-zero exit on
+an API error (including an error body on HTTP 200).
