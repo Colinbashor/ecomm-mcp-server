@@ -57,6 +57,8 @@ same variables — nothing new to configure.
 ```bash
 python run_sync.py --only google         # core campaign metrics, start = today − 7 through today (inclusive)
 python google_ads_detail_sync.py          # search terms, keywords, product demand; start = today − 3 (--days 3)
+                                          # (lagging grains reach further back: google_paid_organic ≥ 10 days,
+                                          #  google_conversion_actions_daily ≥ 35 days — see Notes)
 python google_ads_detail_sync.py --days 30
 python google_ads_detail_sync.py --start 2026-01-01 --end 2026-01-31
 python google_ads_detail_sync.py --only google_pmax_search_themes --start 2026-01-01 --end 2026-01-31
@@ -285,7 +287,7 @@ cross-table rollup:
   clicks/impressions only, for paid-vs-organic overlap.
 - **A few grains publish later than the default lookback window reaches.**
   `google_paid_organic` in particular tends to lag several days behind the
-  others. `google_ads_detail_sync.py`'s `LAGGING_GRAINS` dict gives such a
+  others, so it has a 10-day floor. `google_ads_detail_sync.py`'s `LAGGING_GRAINS` dict gives such a
   grain its own wider minimum lookback so a slow-to-publish date gets more
   chances to land before it ages out of every future run's window — without
   it, a date that Google hasn't published yet by the last run still inside
@@ -303,6 +305,15 @@ cross-table rollup:
   conversions — a plausible-looking number, not an error. It is in
   `LAGGING_GRAINS` with a 35-day floor; raise it if your conversion actions
   use a longer click-through window.
+- **How a `LAGGING_GRAINS` floor is applied.** The floor is measured back
+  from `--end`, and it only ever *widens* a window: the effective start is
+  the earlier of your `--start` (or `today − --days`) and `end − floor`, so
+  an explicit backfill that already reaches further back is untouched. The
+  widened window is then split into ≤30-day chunks like every other grain,
+  so a plain daily run makes **two** requests for
+  `google_conversion_actions_daily` (36 days inclusive: a 30-day and a 6-day chunk) and one for
+  each non-lagging grain. Re-pulled rows are `INSERT OR REPLACE`d on the full
+  primary key, so the overlap overwrites rather than duplicates.
 - **Never sum `google_conversion_actions_daily.conversions` with
   `ad_metrics`** — the two attribute the same conversions differently, and
   adding them double-counts.
@@ -392,3 +403,8 @@ proto3 default (`set-conversion-action-secondary`,
 `update-target-roas` append their mask paths explicitly rather than relying
 on the auto field-mask helper, and that `set-final-url-suffix` sends every
 campaign in one request.
+
+`tests/test_google_ads_detail_sync.py` pins the `LAGGING_GRAINS` floors:
+`google_paid_organic` widens a one-day run back 10 days, the
+`google_conversion_actions_daily` floor is at least 30 days and widens a
+one-day run to `end − 35`, and non-lagging grains keep the requested window.
