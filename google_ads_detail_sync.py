@@ -65,6 +65,15 @@ independent lookback floor so they get more chances to catch up before that
 window closes; re-pulling is safe (INSERT OR REPLACE on the full primary
 key), so widening the window costs nothing but a few extra API calls.
 
+`google_conversion_actions_daily` is in `LAGGING_GRAINS` for a related but
+different reason: its view publishes promptly, but conversion counts for a
+given date keep RESTATING upward for the length of each action's
+click-through window as late conversions are attributed back to the click
+date. A plain `--days 3` run would freeze each row at its first few days of
+attribution and silently understate conversions — the frozen number looks
+plausible, not broken. Its 35-day floor re-pulls the whole attribution window
+every run so the stored rows converge on the final figure.
+
 WHY THIS GRAIN IS DIFFERENT (google_pmax_search_themes). Every other grain
 here is keyed by a specific calendar date, so a daily run just adds new rows.
 `campaign_search_term_insight` isn't like that: Google Ads only returns it as
@@ -334,7 +343,18 @@ WINDOW_GRAINS = frozenset({"google_pmax_search_themes"})
 # The value is a MINIMUM lookback in days — a floor, not a ceiling: an
 # explicit --start that is already wider still wins. Tune per-account if a
 # lagging view's actual publish delay turns out to differ.
-LAGGING_GRAINS = {"google_paid_organic": 10}
+#
+# google_conversion_actions_daily lags for a different reason: the view
+# publishes on time, but its numbers keep CHANGING afterwards. Conversions are
+# credited back to the date of the ad interaction, and they keep arriving for
+# as long as the conversion action's click-through window (commonly 30 days)
+# — so a row pulled a few days after its date is a snapshot of an attribution
+# total that is still growing. Without a wide floor every row freezes at
+# roughly "date + days" and permanently understates conversions for any
+# action with a meaningful click-to-purchase delay. 35 days covers a 30-day
+# window plus a few days of reporting delay; raise it if your conversion
+# actions use a longer click-through window (up to 90 days).
+LAGGING_GRAINS = {"google_paid_organic": 10, "google_conversion_actions_daily": 35}
 
 
 def ensure_schema(conn) -> None:
