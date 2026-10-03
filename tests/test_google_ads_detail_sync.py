@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import google_ads_detail_sync as gads
@@ -177,6 +178,30 @@ class RunTests(unittest.TestCase):
         # The requested window is a single day, but the grain's lookback floor
         # (10 days) should have pulled the start back to cover it.
         self.assertEqual(seen_windows, [("2026-05-31", "2026-06-10")])
+
+    def test_conversion_actions_grain_covers_a_30_day_attribution_window(self) -> None:
+        # Conversions restate upward for the click-through window (commonly
+        # 30 days); a shorter floor would freeze rows before they settle.
+        self.assertGreaterEqual(
+            gads.LAGGING_GRAINS.get("google_conversion_actions_daily", 0), 30)
+
+        seen_windows: list[tuple[str, str]] = []
+
+        def _tracking_fetch(start, end):
+            seen_windows.append((start, end))
+            return []
+
+        with patch.dict(gads.REPORTS, {
+            "google_conversion_actions_daily": {
+                **gads.REPORTS["google_conversion_actions_daily"],
+                "fetch": _tracking_fetch},
+        }):
+            gads.run("2026-06-10", "2026-06-10",
+                     only=["google_conversion_actions_daily"])
+        lookback = gads.LAGGING_GRAINS["google_conversion_actions_daily"]
+        expected_start = (date(2026, 6, 10) - timedelta(days=lookback)).isoformat()
+        self.assertEqual(seen_windows[0][0], expected_start)
+        self.assertEqual(seen_windows[-1][1], "2026-06-10")
 
     def test_non_lagging_grain_is_unaffected_by_lagging_grains(self) -> None:
         seen_windows: list[tuple[str, str]] = []

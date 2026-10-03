@@ -294,6 +294,15 @@ cross-table rollup:
   grain that behaves this way, add it to `LAGGING_GRAINS` rather than
   widening the connector's default `--days`, which would cost every other
   grain extra API calls it doesn't need.
+- **`google_conversion_actions_daily` restates for weeks, so it re-pulls a
+  35-day window every run.** Conversions are credited back to the date of
+  the ad interaction and keep arriving for the length of each action's
+  click-through window (commonly 30 days, up to 90). A row pulled a few days
+  after its date is an early snapshot of a still-growing total, and with only
+  the default lookback it would freeze there and permanently understate
+  conversions — a plausible-looking number, not an error. It is in
+  `LAGGING_GRAINS` with a 35-day floor; raise it if your conversion actions
+  use a longer click-through window.
 - **Never sum `google_conversion_actions_daily.conversions` with
   `ad_metrics`** — the two attribute the same conversions differently, and
   adding them double-counts.
