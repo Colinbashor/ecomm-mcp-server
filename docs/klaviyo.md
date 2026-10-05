@@ -10,7 +10,11 @@ so it's safe to run against a brand-new `warehouse.db`.
 
 ## Setup
 
-Two auth modes — pick one. If both are configured, OAuth wins.
+Two auth modes — pick one. If both are configured, OAuth wins. OAuth only
+counts as configured when **all three** of `KLAVIYO_CLIENT_ID`,
+`KLAVIYO_CLIENT_SECRET`, and `KLAVIYO_REFRESH_TOKEN` are set. With only some
+of them set, the script falls back to `KLAVIYO_API_KEY`, or skips if that's
+unset too.
 
 **Private API key** (simpler):
 
@@ -49,7 +53,8 @@ Two auth modes — pick one. If both are configured, OAuth wins.
 
 With neither credential set, `klaviyo_sync.py` prints a `SKIPPED` line and
 exits 0 without logging an error, so a scheduled job stays green until
-credentials land. Leave an empty gating variable with no inline `#` comment
+credentials land. (The script exits 0 after a section *fails*, too — see
+[Failures and exit codes](#failures-and-exit-codes).) Leave an empty gating variable with no inline `#` comment
 on its line, since python-dotenv can read the comment as the value.
 
 Either way, also set:
@@ -77,10 +82,30 @@ python klaviyo_sync.py --only attributed --days 90        # longer attributed-re
 | `--campaign-timeframe` | `KLAVIYO_CAMPAIGN_TIMEFRAME` | Overrides the campaign report's timeframe key for this run. |
 | `--days` | `35` | Lookback for the **attributed** section only, capped at 365. It has no effect on campaigns, flows, or audience. |
 
+`--only` doesn't validate names. A typo (`--only campaign`) runs zero
+sections and exits 0 without an error. `--days` has no lower bound, only the
+365 cap.
+
+### Failures and exit codes
+
 Each section logs to `sync_log` under its own platform name:
 `klaviyo_campaigns`, `klaviyo_flows`, `klaviyo_audience`, and two for
-`attributed` (`klaviyo_attr_channel` and `klaviyo_attr_flow`). If one fails,
-the others still run.
+`attributed` (`klaviyo_attr_channel` and `klaviyo_attr_flow`). An exception
+*inside* a section logs that section `error`, and the others still run.
+
+Two caveats:
+
+- **The script always exits 0**, even when a section logged `error`. A
+  scheduler watching exit codes won't notice a failure. Check `sync_log` (or
+  the `last_sync_status` MCP tool) instead.
+- Some calls happen **before** the per-section loop, and a failure there
+  crashes the whole run with a traceback and writes **no** `sync_log` rows:
+  - opening/initialising the database;
+  - building the HTTP session, which for OAuth means refreshing the access
+    token (an expired or revoked refresh token fails here);
+  - when `attributed` is selected, listing `/flows/` for flow names, which is
+    shared by both attributed sub-sections. A failed flow listing aborts
+    campaigns, flows, and audience as well.
 
 ## Tables
 
@@ -89,7 +114,45 @@ the others still run.
 | `klaviyo_campaigns` | `campaign_id` | campaign timeframe (default last 30 days) | **Email campaigns only.** The report filters on `send_channel = 'email'`, so SMS campaigns aren't stored. Recipients, delivered, unique opens and clicks, conversions, revenue, unsubscribes, bounces, spam complaints, and derived rates (open, click, conversion, click-to-open, revenue per recipient, AOV). |
 | `klaviyo_flows` | `(flow_id, channel, month_start)` | prior calendar month and current month to date | Flow performance per flow **per send channel** (email, SMS, etc.), with the same metric set as campaigns minus spam complaints, plus `trigger_type`. |
 | `klaviyo_audience_growth` | `(audience_id, month_start)` | prior calendar month and current month to date | Monthly **segment** membership: total members, members added, members removed, net change. `audience_type` is always `segment`; lists aren't pulled. All-zero months (before a segment existed) are skipped. |
-| `klaviyo_attributed_daily` | `(date, dimension_type, dimension_id)` | last `--days` (default 35) | Daily Klaviyo-attributed conversions, unique conversions, and revenue for the conversion metric. `dimension_type` is `channel` (e.g. `email`, `sms`, `unattributed`) or `flow` (flow id, where an empty id is named `campaign/unattributed`). Days with no activity aren't stored. |
+| `klaviyo_attributed_daily` | `(date, dimension_type, dimension_id)` | last `--days` (default 35) | Daily Klaviyo-attributed conversions, unique conversions, and revenue for the conversion metric. `dimension_type` is `channel` or `flow` — see [the dimension columns](#klaviyo_attributed_daily-dimension-columns) below. Day/dimension cells with no activity aren't stored. |
+
+### Columns
+
+- `klaviyo_campaigns`: `campaign_id`, `name`, `channel`, `status`,
+  `send_time` (converted to `KLAVIYO_TIMEZONE`), `recipients`, `delivered`,
+  `opens_unique`, `clicks_unique`, `conversions`, `conversion_uniques`,
+  `revenue`, `unsubscribes`, `bounced`, `spam_complaints`, `open_rate`,
+  `click_rate`, `conversion_rate`, `revenue_per_recipient`,
+  `average_order_value`, `click_to_open_rate`, `conversion_metric_id`,
+  `as_of`, `synced_at`.
+- `klaviyo_flows`: `flow_id`, `name`, `channel`, `trigger_type`,
+  `month_start`, then the same metric/rate columns as campaigns minus
+  `spam_complaints`, plus `conversion_metric_id`, `as_of`, `synced_at`.
+- `klaviyo_audience_growth`: `audience_id`, `audience_type`, `name`,
+  `month_start`, `total_members`, `members_added`, `members_removed`,
+  `net_members_changed`, `as_of`, `synced_at`. There's no
+  `conversion_metric_id` here, since membership has nothing to do with the
+  conversion metric.
+- `klaviyo_attributed_daily`: `date`, `dimension_type`, `dimension_id`,
+  `dimension_name`, `conversions`, `conversion_uniques`, `revenue`,
+  `conversion_metric_id`, `synced_at` (no `as_of`).
+
+### `klaviyo_attributed_daily` dimension columns
+
+`dimension_id` holds Klaviyo's **raw** grouping value. Only `dimension_name`
+holds the friendly label:
+
+| `dimension_type` | `dimension_id` | `dimension_name` |
+|---|---|---|
+| `channel` | `$email_channel`, `$sms_channel`, … | `email`, `sms`, … (`$` and `_channel` stripped) |
+| `channel` | `''` (unattributed) | `unattributed` |
+| `flow` | the flow id | the flow's name, or `NULL` if the id isn't in the `/flows/` listing (e.g. a deleted flow) |
+| `flow` | `''` (not from a flow) | `campaign/unattributed` |
+
+So filter on `dimension_name = 'email'` (or `dimension_id = '$email_channel'`).
+`WHERE dimension_id = 'email'` matches nothing.
+
+### Semantics
 
 Every row carries `conversion_metric_id`, so changing
 `KLAVIYO_CONVERSION_METRIC` later doesn't silently mix metrics. All writes are
@@ -98,9 +161,34 @@ Every row carries `conversion_metric_id`, so changing
 Rates (`open_rate`, `click_rate`, `conversion_rate`) are **fractions from 0
 to 1** of `delivered`, not percentages. `click_to_open_rate` is unique clicks
 divided by unique opens, and `average_order_value` is revenue per conversion.
-All of them are recomputed from the summed counts after the message/variant
-roll-up, not averaged across rows. When you aggregate across campaigns or
+`revenue_per_recipient` divides by `recipients`, not `delivered`.
+`conversion_rate` uses `conversion_uniques`, but `average_order_value` divides
+by `conversions` (not uniques). Any rate whose denominator is 0 is stored as
+`0.0`, not `NULL`. All of them are recomputed from the summed counts after
+the message/variant roll-up, not averaged across rows. When you aggregate across campaigns or
 months yourself, do the same: sum the counts, then divide.
+
+**Snapshots, never pruned.** Rows are upserted and nothing is deleted:
+- A campaign that drops out of the report timeframe keeps its last-synced
+  numbers. Use `as_of` to see how fresh a row is.
+- A month's `klaviyo_flows` / `klaviyo_audience_growth` rows stop updating
+  once that month is older than the prior calendar month.
+
+**NULLs.**
+- Campaign `name`/`status`/`send_time` are best-effort. If the one-off
+  metadata lookup for a campaign fails, they're stored as `NULL` and the
+  metrics are still written.
+- Individual `klaviyo_audience_growth` stat columns can be `NULL` when Klaviyo
+  omits that series.
+- The "skip all-zero months" rule also drops a real segment's month that
+  genuinely had zero members and zero change.
+
+**Time zones.**
+- `KLAVIYO_TIMEZONE` sets the daily buckets in `klaviyo_attributed_daily` and
+  converts campaign `send_time`.
+- The attributed window *starts* at midnight **UTC** `--days` back, so in a
+  non-UTC zone the first local day can be partial.
+- Month boundaries for flows and audience (`month_start`) are always UTC.
 
 ## Notes
 
@@ -123,8 +211,11 @@ or you're debugging a 4xx:
 - Klaviyo caps report timeframes at about 1 year per request, and a wider
   window returns a 400 rather than being truncated. That's why `--days` is
   capped at 365.
-- A 429 honours `Retry-After`. 5xx responses and dropped connections are
-  retried with exponential backoff, up to 6 tries. Any other 4xx fails
+- Every request has a 60s timeout and up to 6 tries in total. A 429 honours
+  `Retry-After` (or waits `2^attempt` seconds without it), capped at 60s, and
+  429s use up tries too. 5xx responses and dropped connections back off
+  `2^attempt` seconds, capped at 30s. Running out of tries raises
+  `exhausted retries`. Any other 4xx fails
   immediately with the response body, since that's almost always a
   request-shape problem.
 - Klaviyo's API paths and versions have changed before (e.g. `-report` vs
@@ -134,4 +225,13 @@ or you're debugging a 4xx:
 
 ## Tests
 
-`tests/test_klaviyo_sync.py`, `tests/test_klaviyo_auth.py`
+- `tests/test_klaviyo_sync.py` covers: schema creation, rate and derived-value
+  maths (including zero denominators), channel naming, the campaign
+  message-row roll-up and its idempotent upsert, attributed-dimension loading
+  (empty cells skipped, flow names, the unattributed bucket, the 365-day cap),
+  auth-mode precedence (including partial OAuth config falling back), retry
+  behaviour (connection errors, 429 `Retry-After`, 5xx, hard 4xx), and the
+  clean skips when there are no credentials or no conversion metric.
+- `tests/test_klaviyo_auth.py` covers: the PKCE verifier and S256 challenge,
+  redirect-URI and scope defaults and overrides, and required-variable
+  errors.

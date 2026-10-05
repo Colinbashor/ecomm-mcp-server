@@ -60,18 +60,40 @@ All flags:
 | Flag | Default | Effect |
 |---|---|---|
 | `--backfill` | off | Pulls the deepest history available for every grain. Weekly grains start at `--backfill-start`, and the `--sample-days`/`--creator-days` recency windows are dropped, so the full population is fetched. |
-| `--backfill-start YYYY-MM-DD` | 2 years back | Earliest week for weekly grains under `--backfill`. Reacher returns empty windows before your real data floor, so you don't need the exact date. |
+| `--backfill-start YYYY-MM-DD` | 2 years back | Under `--backfill`, the earliest week for weekly grains **and** the start of the daily-metrics pull (unless `--days` is also given, which wins). Reacher returns empty windows before your real data floor, so you don't need the exact date. |
 | `--days N` | metrics: 30; GMV Max: 90 | Overrides the daily-metrics window. It also narrows the `gmv_max`/`gmv_max_products` window, which otherwise always pulls the full 90-day cap and can never exceed it. |
 | `--weeks N` | `2` | Weeks of weekly-grain history on an incremental run: the current partial week plus last week's restatements. |
 | `--creator-min-gmv X` | `0.01` | Minimum GMV for a `reacher_creator_weekly` row. Use `0` to keep zero-earning creator-weeks too. Because of this filter, row counts there are **not** "active creators"; get that from `reacher_metrics_daily`. |
-| `--sample-days N` | `90` | Refreshes only samples updated in the last N days. Ignored with `--backfill`. |
+| `--sample-days N` | `90` | Refreshes only sample requests **created** in the last N days (the API filters on `created_at`, not `updated_at`). A status change on an older request isn't picked up by an incremental run, so run `--only samples --backfill` occasionally to re-read every request. Ignored with `--backfill`. (The script's own `--help` text says "updated"; the code and its comment say created.) |
 | `--creator-days N` | `30` | Refreshes the creator snapshot only for creators touched in the last N days. Ignored with `--backfill`. |
 | `--only GRAIN` / `--skip GRAIN` | all | Repeatable. Grains: `metrics`, `shop_gmv`, `gmv_max`, `gmv_max_products`, `creators`, `creator_weekly`, `creator_products`, `product_weekly`, `samples`, `sample_requests_weekly`, `automation_products`, `sample_products`, `video_creative`, `shop_health`, `automations`, `outreach_weekly`. |
-| `--pages N` | `0` (no cap) | Caps pages per paginated grain. Useful for a quick probe. |
+| `--pages N` | `0` (no cap) | Rough size cap for a quick probe. For most weekly/creator/sample grains it caps rows at N × 100 (the page size). `product_weekly` always stops at 40 pages per week (`PRODUCT_WEEK_PAGE_CAP`) even with `0`, and also stops at the first page where no product has any activity. It has no effect on `metrics`, `shop_gmv`, `gmv_max`, `gmv_max_products`, `video_creative` (fixed top 50), `shop_health`, `automations`, `automation_products`, or `outreach_weekly`. |
 | `--dry-run` | off | Fetches and reports without writing rows. Tables are still created. |
 
-With `REACHER_API_KEY` unset, the script prints a skip line and exits
-cleanly.
+### Windows per grain
+
+The flags above don't apply evenly. What each grain actually pulls:
+
+| Grain(s) | Window | Notes |
+|---|---|---|
+| `metrics` | today − `--days` (default 30) … today | Fetched in 180-day chunks. Under `--backfill` without `--days`, starts at `--backfill-start`. |
+| `shop_gmv`, `shop_health` | always the 90 days ending **yesterday** | Ignore `--days` and `--backfill`; today is skipped because it's incomplete. |
+| `gmv_max`, `gmv_max_products` | the last `min(--days, 90)` days **including today** | Today's row is partial and gets overwritten by the next run. `gmv_max_products` is fetched in 30-day chunks. |
+| weekly grains (`creator_weekly`, `creator_products`, `product_weekly`, `sample_requests_weekly`, `sample_products`, `video_creative`, `outreach_weekly`) | the last `--weeks` week starts (default 2) | `--backfill`: every week from `--backfill-start`. |
+| `samples` | requests created in the last `--sample-days` | All requests under `--backfill`. |
+| `creators` | creators touched in the last `--creator-days` | Everyone else keeps their last snapshot. All creators under `--backfill`. |
+| `automations`, `automation_products` | current state | No window. |
+
+### Exit codes and `sync_log`
+
+- `REACHER_API_KEY` unset: prints a skip line and exits **0**.
+- `REACHER_API_KEY` set but `REACHER_SHOP_ID` missing: exits **non-zero**
+  with `Missing required env var(s)`.
+- Each grain logs to `sync_log` as `reacher_<grain>` (e.g. `reacher_metrics`,
+  `reacher_gmv_max_products`). One grain failing doesn't stop the rest. If any
+  grain failed, the run ends with `SystemExit("Reacher sync failures: ...")`,
+  which is a non-zero exit.
+- `--dry-run` writes no `sync_log` rows and skips the `ad_metrics` mirror.
 
 **Run the GMV Max grain (or the whole script) on a real schedule if you use
 GMV Max ads at all.** `shop-gmv` and `gmv-max/*` both hard-cap at 90 days of
@@ -99,7 +121,42 @@ All `reacher_*`, created by this script (nothing added to shared
   — outreach program state and the open-vs-Target-Collab sample split
 - `reacher_video_creative` — top-N weekly videos + AI creative breakdown
 - `reacher_shop_health_daily` — TikTok Shop Performance Score
-- `reacher_sync_state` — internal bookkeeping
+- `reacher_sync_state` — reserved for incremental bookkeeping. The helpers
+  exist, but nothing calls them yet, so the table is always empty.
+
+### Row semantics worth knowing before you query
+
+- **GMV Max → `ad_metrics`.** Only days with non-zero spend or gross revenue
+  are mirrored. The mapping is `platform = 'tiktok'`,
+  `account_id = REACHER_SHOP_ID`, `campaign_type = shopping_ads_type`,
+  `conversions = orders`, `revenue = gross_revenue`, with currency falling
+  back to `USD`. Rows are written with `INSERT OR REPLACE` on
+  `(platform, account_id, campaign_id, date)`.
+- **One row per creator × product.** `reacher_sample_request` is keyed on
+  `(creator_handle, product_id)`, so repeat requests collapse into one row.
+  It upserts with `ON CONFLICT DO UPDATE` to keep `first_seen_at`. Every other
+  table uses `INSERT OR REPLACE`.
+- **Filtered populations.**
+  - `reacher_product_weekly` only stores products with some activity that week.
+  - `reacher_video_creative` is the top **50** videos per week
+    (`CREATIVE_LIMIT`).
+  - `reacher_outreach_weekly` skips weeks where the aggregate is empty.
+  - `reacher_automation_product` only covers Target Collab automations (type
+    contains "Target Collab" or "TC"). A failed per-automation detail call is
+    skipped with a printed line.
+  - `reacher_creator_weekly` drops creator-weeks under `--creator-min-gmv`.
+- **Don't sum these.**
+  - In `reacher_metrics_daily`, `gmv_per_video`, `gmv_per_sample`, `aov`,
+    `ctr`, `conversion_rate`, and `reply_rate` are ratios, so average them.
+  - `creators` is distinct **per day**, so summing it double-counts.
+  - `customers` in `reacher_shop_gmv_daily` and `sc_customers` in
+    `reacher_product_weekly` are unique per period.
+- **Don't use these, even though they're stored.**
+  - `reacher_outreach_weekly.tc_acceptance_rate_raw` is the API's mean of
+    daily rates, so it's not window-correct and can fall outside 0–100%.
+    Derive the rate yourself as `accepted_tc_count / tc_invites_creator_count`.
+  - `commission_rate` is still stored in `reacher_creator` and
+    `reacher_automation_product`, but see the scale warning below.
 
 ## Notes
 
@@ -120,11 +177,21 @@ All `reacher_*`, created by this script (nothing added to shared
   for anything numeric.
 - **Email is never stored**, even though the sample-requests endpoint returns
   it. Public profile fields (bio, categories) are kept for niche-fit triage.
-- Rate limits (3,000/hr and 60/min) are self-paced proactively rather than
-  handled by retrying 429s reactively.
-- **The video feed has known defects.** Some `posted_date` values are Unix
-  epoch zero or future-dated placeholders (this connector nulls them rather
-  than storing a lie), and `/products/{id}/creators`'s `gmv` field is NULL on
+- **Rate limits (3,000/hr and 60/min) are paced up front, and 429s are retried
+  anyway.** Requests are spaced at least 1.3s apart (about 46/min), with a
+  rolling-hour cap of 2,900. A 429 that still slips through waits
+  `Retry-After` (default 30s) and retries.
+- **Retries:** 8 attempts per request, 180s timeout each.
+  - Connection errors and timeouts back off `min(60, 5 × (n+1))` seconds.
+  - 5xx backs off `min(90, 10 × (n+1))` seconds.
+  - `401`/`403` fail at once, with a Cloudflare 1010 hint when the body
+    mentions it.
+  - `404` raises `LookupError`; a tier you haven't enabled reads as absent.
+  - `400` and any other non-200 fail at once.
+- **The video feed has known defects.** Some `posted_date` values are
+  missing, Unix epoch zero, or future-dated placeholders. The connector stores
+  `NULL` for any of these (including anything later than tomorrow) rather than
+  a wrong date, and `/products/{id}/creators`'s `gmv` field is NULL on
   every row observed — use `reacher_creator_product_weekly` (from
   `/videos/leaderboard`) for real creator-x-product attribution instead.
 - **`tc_invites` counts invitation batches; `accepted_tc_count` and
@@ -162,6 +229,16 @@ python reacher_sample_limits.py reset --all --yes                               
 python reacher_sample_limits.py status                                            # tracked overrides + live drift check
 ```
 
+Other details:
+- `--reason` defaults to `"selling out"`.
+- `reset` on a product this tool doesn't track still clears any live cap.
+- `status` also shows `used_this_month` (from `GET /samples/product-usage`).
+- A `409` on create falls back to an update (`PUT`).
+- `--sku` matching ignores case, and the first match wins.
+- Even a dry run makes live `GET` calls, so it needs both env vars.
+- Requests get 5 tries with a 60s timeout, and there's no up-front pacing.
+- `--limit` isn't validated, so don't pass a negative number.
+
 **Every command defaults to a dry run** that prints what it would do; pass
 `--yes` to actually call the API. `zero` defaults to a cap of `0`; pass
 `--limit N` to cap at some other positive number instead (the subcommand name
@@ -188,8 +265,15 @@ request regardless of what this script sets.
 database — this is operational state about a live external system, not
 warehouse data), so `reset --all` needs no memorized product list. Every
 actual write is also appended to `reacher_sample_limits_log.txt` as a
-plain-text audit trail.
+plain-text audit trail. The log matches `.gitignore`'s `*_log.txt`; the
+overrides JSON is **not** gitignored, so don't commit it by accident.
+
+**Related:** Meta ad videos named in Reacher's convention can be tied back
+to `reacher_video_creative.creator_handle` via
+`meta_ads_detail_sync.parse_reacher_title()` — see [Meta Ads](meta-ads.md).
 
 ## Tests
 
-`tests/test_reacher_sync.py`, `tests/test_reacher_sample_limits.py`
+`tests/test_reacher_sync.py` (sync script), `tests/test_reacher_sample_limits.py`
+(write-back script). The Meta↔Reacher title parser is tested in
+`tests/test_meta_ads_detail_sync.py`.
