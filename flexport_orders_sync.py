@@ -108,6 +108,43 @@ USAGE:
   python flexport_orders_sync.py --since-days 30   # seed a cursor ~30 days back and walk forward from there
   python flexport_orders_sync.py --pages 200       # cap this run at 200 event pages (safety bound)
   python flexport_orders_sync.py --restart         # ignore the stored cursor; crawl from the feed floor
+  python flexport_orders_sync.py --from-shopify --days 10   # fetch by id, ids enumerated from Shopify
+
+SHOPIFY-DRIVEN DIRECT FETCH (`--from-shopify`) — the faster path for recent orders
+The /events crawl above is bounded by that endpoint's per-page latency (often
+~20s+ against a ~29s gateway cap), so on a busy store it can fall days behind.
+If your Flexport `externalOrderId` is derivable from Shopify, you can skip the
+crawl: enumerate the ids from the order system of record and fetch each order
+directly with `GET /orders/external_id/{id}` (sub-second). This mode:
+
+  * pages Shopify `orders` created in the last `--days` and reads each order's
+    `fulfillmentOrders`; a fulfillment order counts only if it is assigned to
+    the Shopify location named by FLEXPORT_SHOPIFY_LOCATION AND Flexport has
+    ACCEPTED it (requestStatus ACCEPTED / CLOSED / CANCELLATION_*; a
+    CANCELLED fulfillment order is skipped);
+  * builds the external id as `<order name><FLEXPORT_EXTERNAL_ID_SPLIT_MARKER><numeric
+    fulfillment-order id>` (marker unset -> just the order name). Whatever the
+    integration that pushes orders to Flexport does, mirror it here;
+  * percent-encodes the id in the path (order names can contain "/");
+  * skips ids already stored WITH a cost, but re-fetches ones stored before
+    they shipped (cost NULL) so the cost lands once Flexport posts it;
+  * fetches in a thread pool (`--workers`, default ORDER_FETCH_WORKERS) and
+    upserts with NAMED columns (see ORDER_COLS / PACKAGE_COLS).
+
+A 404 is an EXPECTED answer here ("Flexport has not received this fulfillment
+order yet") and raises FlexportNotFound rather than a generic error. But an
+ACCEPTED fulfillment order must exist on Flexport's side, so a miss rate above
+ACCEPTED_404_ALARM means the id rule no longer matches your integration — a
+silent zero, not a lag — and the run logs `degraded`. An empty pull (no Shopify
+orders or no Flexport ids) also logs `degraded`, never `ok`. Degraded exits 75
+(graceful pause), the same convention as the crawl. Rows are logged under
+platform `flexport_orders_direct`.
+
+Needs Shopify credentials (see warehouse/connectors/shopify.py) with the read
+scopes `read_merchant_managed_fulfillment_orders` and
+`read_third_party_fulfillment_orders`, plus:
+  FLEXPORT_SHOPIFY_LOCATION            name of the Shopify location that maps to Flexport
+  FLEXPORT_EXTERNAL_ID_SPLIT_MARKER    optional literal between order name and FO id
 """
 from __future__ import annotations
 
@@ -118,6 +155,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
@@ -218,6 +256,14 @@ class FlexportBadCursor(RuntimeError):
     """The event feed rejected the page_info cursor (HTTP 400)."""
 
 
+class FlexportNotFound(RuntimeError):
+    """404 on a direct lookup. Subclasses RuntimeError so every pre-existing
+    caller (which treats any RuntimeError as a failed fetch) is unchanged; the
+    Shopify-driven path catches it separately because there a 404 is an EXPECTED
+    answer — "Flexport has not received this fulfillment order yet" — not an
+    error."""
+
+
 class FlexportTransient(RuntimeError):
     """Transient (5xx/connection/429) failures exhausted every retry. Distinct
     from a hard error (401/other 4xx) so the caller can pause gracefully —
@@ -299,6 +345,8 @@ def _request(path: str, params: dict) -> requests.Response:
             bad_cursor = True
             time.sleep(backoff)
             continue
+        if resp.status_code == 404:
+            raise FlexportNotFound(f"Flexport {path} 404: {resp.text[:200]}")
         if resp.status_code != 200:
             raise RuntimeError(f"Flexport {path} {resp.status_code}: {resp.text[:200]}")
         return resp
@@ -648,6 +696,198 @@ def run(conn: sqlite3.Connection, *, restart: bool, since_days: int | None,
         pool.shutdown(wait=True)
 
 
+# ---- SHOPIFY-DRIVEN DIRECT FETCH (see the module docstring) -------------------
+DIRECT_PLATFORM = "flexport_orders_direct"
+DIRECT_DEFAULT_DAYS = 10    # shipping lags order creation; only unshipped ones are re-checked
+# Only fulfillment orders Flexport has ACCEPTED exist on its side; unsubmitted
+# ones (e.g. orders another channel ships itself) legitimately 404 and are not
+# asked for.
+FLEXPORT_ACCEPTED_REQUESTS = frozenset({
+    "ACCEPTED", "CLOSED", "CANCELLATION_REQUESTED", "CANCELLATION_ACCEPTED",
+    "CANCELLATION_REJECTED"})
+# An ACCEPTED fulfillment order MUST exist at Flexport. If more than this share
+# of them 404, the external-id rule has stopped matching.
+ACCEPTED_404_ALARM = 0.05
+
+_SHOPIFY_FO_QUERY = """
+query($q: String!, $after: String) {
+  orders(first: 50, after: $after, query: $q, sortKey: CREATED_AT) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      name
+      fulfillmentOrders(first: 10) {
+        nodes { id status requestStatus assignedLocation { name } }
+      }
+    }
+  }
+}"""
+
+# Named columns, never a positional INSERT: SQLite appends a migrated column at
+# the table's physical end, so VALUES (?,?,?) can silently shift every value.
+ORDER_COLS = ("order_id", "external_order_id", "cost", "currency",
+              "internal_status", "fulfillment_status", "created_at", "shipped_at",
+              "delivered_at", "units", "n_shipments", "n_packages",
+              "total_weight_oz", "carriers", "shipping_methods",
+              "is_international", "synced_at")
+PACKAGE_COLS = ("order_id", "shipment_id", "package_id", "warehouse_id", "carrier",
+                "shipping_method", "tracking_code", "weight_oz", "length_in",
+                "width_in", "height_in", "logistics_skus", "synced_at")
+
+
+def flexport_external_ids(order_nodes: list[dict], location: str,
+                          split_marker: str = "") -> list[tuple[str, str]]:
+    """(externalOrderId, fulfillment-order status) for every fulfillment order
+    assigned to `location` AND accepted by Flexport, from Shopify `orders` nodes.
+    Cancelled ones are skipped.
+
+    One Shopify order can carry several fulfillment orders (different
+    locations), and in principle more than one for the same location after a
+    split, so this yields one id per matching fulfillment order."""
+    out: list[tuple[str, str]] = []
+    for node in order_nodes:
+        name = node.get("name") or ""
+        for fo in ((node.get("fulfillmentOrders") or {}).get("nodes") or []):
+            loc = (fo.get("assignedLocation") or {}).get("name")
+            status = fo.get("status") or ""
+            if (loc != location or status == "CANCELLED"
+                    or fo.get("requestStatus") not in FLEXPORT_ACCEPTED_REQUESTS):
+                continue
+            fo_id = str(fo.get("id") or "").rstrip("/").rsplit("/", 1)[-1]
+            if name and fo_id.isdigit():
+                out.append((f"{name}{split_marker}{fo_id}" if split_marker else name, status))
+    return out
+
+
+def external_id_path(external_id: str) -> str:
+    """Order names may contain a slash: sent raw the path 404s, percent-encoded it
+    resolves."""
+    return f"/orders/external_id/{quote(external_id, safe='')}"
+
+
+def _shopify_flexport_ids(since_iso: str, location: str,
+                          split_marker: str) -> tuple[int, list[tuple[str, str]]]:
+    """(Shopify orders seen, Flexport (external id, FO status) pairs) for orders
+    created on/after since_iso."""
+    from warehouse.connectors import shopify as shopify_api   # needs Shopify env only here
+    n_orders = 0
+    ids: list[tuple[str, str]] = []
+    after = None
+    while True:
+        data = shopify_api._post({"q": f"created_at:>='{since_iso}'", "after": after},
+                                 _SHOPIFY_FO_QUERY)
+        page = data["orders"]
+        nodes = page.get("nodes") or []
+        n_orders += len(nodes)
+        ids.extend(flexport_external_ids(nodes, location, split_marker))
+        info = page.get("pageInfo") or {}
+        # Pagination stops on the API's own end signal or an EMPTY page, never on
+        # a short one (a short page only means "that is all this request carried").
+        if not nodes or not info.get("hasNextPage"):
+            break
+        after = info.get("endCursor")
+        if n_orders % 5000 < 50:
+            print(f"  Shopify: {n_orders:,} orders scanned, {len(ids):,} Flexport ids",
+                  flush=True)
+    return n_orders, ids
+
+
+def _fetch_by_external_id(item: tuple[str, str]) -> tuple[str, str, str, dict | None]:
+    """-> (external id, FO status, outcome, order) where outcome is ok |
+    not_found | error. Never raises, so one bad order cannot sink the pool."""
+    ext, fo_status = item
+    try:
+        o = _request(external_id_path(ext), {}).json()
+    except FlexportNotFound:
+        return ext, fo_status, "not_found", None
+    except RuntimeError as e:   # incl. FlexportTransient after the full retry budget
+        print(f"  {ext} failed: {e}", flush=True)
+        return ext, fo_status, "error", None
+    if isinstance(o, dict) and "id" in o:
+        return ext, fo_status, "ok", o
+    return ext, fo_status, "error", None
+
+
+def run_from_shopify(days: int, workers: int) -> int:
+    """Enumerate Flexport orders from Shopify and fetch each one directly.
+
+    Skips ids already stored WITH a cost; an order stored before it shipped
+    (cost NULL) is re-fetched so its cost lands once Flexport posts it."""
+    location = os.environ.get("FLEXPORT_SHOPIFY_LOCATION", "").strip()
+    if not location:
+        print("FLEXPORT_SHOPIFY_LOCATION not set — cannot enumerate Flexport orders "
+              "from Shopify (name of the Shopify location that maps to Flexport).")
+        return 1
+    split_marker = os.environ.get("FLEXPORT_EXTERNAL_ID_SPLIT_MARKER", "")
+    started = db.now()
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+    conn = db.connect()
+    ensure_schema(conn)
+    try:
+        n_shop, pairs = _shopify_flexport_ids(since, location, split_marker)
+        done = {r[0] for r in conn.execute(
+            "SELECT external_order_id FROM flexport_order_costs "
+            "WHERE cost IS NOT NULL AND external_order_id IS NOT NULL")}
+        todo = list(dict.fromkeys(p for p in pairs if p[0] not in done))
+        print(f"Flexport direct fetch since {since}: {n_shop:,} Shopify orders, "
+              f"{len(pairs):,} Flexport fulfillment orders, {len(pairs) - len(todo):,} "
+              f"already costed, {len(todo):,} to fetch at {workers}-way.", flush=True)
+
+        counts = {"ok": 0, "not_found": 0, "error": 0}
+        n_costed = 0
+        order_rows: list[tuple] = []
+        pkg_rows: list[tuple] = []
+        o_sql = (f"INSERT OR REPLACE INTO flexport_order_costs ({', '.join(ORDER_COLS)}) "
+                 f"VALUES ({', '.join('?' * len(ORDER_COLS))})")
+        p_sql = (f"INSERT OR REPLACE INTO flexport_order_packages ({', '.join(PACKAGE_COLS)}) "
+                 f"VALUES ({', '.join('?' * len(PACKAGE_COLS))})")
+
+        def flush_rows() -> None:
+            nonlocal order_rows, pkg_rows
+            if order_rows or pkg_rows:
+                with conn:
+                    conn.executemany(o_sql, order_rows)
+                    conn.executemany(p_sql, pkg_rows)
+                order_rows, pkg_rows = [], []
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for _ext, _fo_status, outcome, o in pool.map(_fetch_by_external_id, todo):
+                counts[outcome] += 1
+                if o is None:
+                    continue
+                orow, prows = rows_for_order(o, stamp)
+                order_rows.append(orow)
+                pkg_rows.extend(prows)
+                n_costed += orow[2] is not None
+                if len(order_rows) >= 500:
+                    flush_rows()
+                    print(f"  {sum(counts.values()):,}/{len(todo):,} fetched", flush=True)
+        flush_rows()
+        newest = conn.execute("SELECT MAX(created_at) FROM flexport_order_costs").fetchone()[0]
+    except Exception as e:  # noqa: BLE001 - log the failure, then fail the step
+        conn.close()
+        db.log_sync(DIRECT_PLATFORM, started, 0, "error", str(e)[:500])
+        raise
+    conn.close()
+
+    miss_rate = counts["not_found"] / len(todo) if todo else 0.0
+    msg = (f"since {since[:10]}: {n_shop} shopify orders, {len(pairs)} flexport-accepted "
+           f"FOs, fetched {counts['ok']} ({n_costed} with cost), {counts['not_found']} "
+           f"404 ({miss_rate:.1%}), {counts['error']} errors; newest order {newest}")
+    # An empty pull is degraded, never ok. And an ACCEPTED order Flexport cannot
+    # find means the id rule broke — loud, not a quiet zero.
+    status = "ok"
+    if n_shop == 0 or not pairs:
+        status, msg = "degraded", "EMPTY: " + msg
+    elif len(todo) >= 20 and miss_rate > ACCEPTED_404_ALARM:
+        status, msg = "degraded", "EXTERNAL-ID RULE MAY HAVE CHANGED: " + msg
+    elif counts["error"] > max(5, 0.01 * len(todo)):
+        status = "degraded"
+    db.log_sync(DIRECT_PLATFORM, started, counts["ok"], status, msg)
+    print(f"\n[{status}] {msg}")
+    return 0 if status == "ok" else 75   # 75 = graceful pause, same as the crawl
+
+
 def main() -> int:
     if not os.environ.get("FLEXPORT_API_TOKEN"):
         print("FLEXPORT_API_TOKEN not set — skipping Flexport order-cost sync.")
@@ -660,7 +900,17 @@ def main() -> int:
                    help="seed the crawl ~N days back instead of resuming the stored cursor")
     p.add_argument("--restart", action="store_true",
                    help="ignore the stored cursor; crawl from the feed floor")
+    p.add_argument("--from-shopify", action="store_true",
+                   help="enumerate ids from Shopify and fetch each order directly "
+                        "(see the module docstring) instead of crawling /events")
+    p.add_argument("--days", type=int, default=DIRECT_DEFAULT_DAYS,
+                   help="with --from-shopify: look back N days of Shopify orders")
+    p.add_argument("--workers", type=int, default=ORDER_FETCH_WORKERS,
+                   help="with --from-shopify: concurrent order fetches")
     args = p.parse_args()
+
+    if args.from_shopify:
+        return run_from_shopify(args.days, args.workers)
 
     conn = db.connect()
     ensure_schema(conn)

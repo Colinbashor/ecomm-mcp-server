@@ -46,12 +46,13 @@ class ReacherTitleParsingTests(unittest.TestCase):
 
 
 class SchemaTests(unittest.TestCase):
-    def test_ddl_creates_all_three_tables(self) -> None:
+    def test_ddl_creates_all_tables(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript(detail.DDL)
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {"meta_ad_daily", "meta_ad_creatives", "meta_ad_videos"})
+        self.assertEqual(tables, {"meta_ad_daily", "meta_ad_creatives", "meta_ad_videos",
+                          "meta_adset_funnel"})
         conn.close()
 
     def test_ddl_is_idempotent(self) -> None:
@@ -103,8 +104,12 @@ class RunTests(unittest.TestCase):
         self.db_path = Path(path)
         self._patch_db = patch.object(detail, "DB", self.db_path)
         self._patch_db.start()
+        # run() reads ad set targeting after the insights loop; keep it offline.
+        self._patch_funnel = patch.object(detail, "fetch_adset_funnel", return_value=[])
+        self._patch_funnel.start()
 
     def tearDown(self) -> None:
+        self._patch_funnel.stop()
         self._patch_db.stop()
         self.db_path.unlink(missing_ok=True)
 
@@ -172,6 +177,35 @@ class RunTests(unittest.TestCase):
             stats = detail.run("2026-08-01", "2026-08-01", only="insights")
         self.assertEqual(stats["days_skipped"], 1)
         self.assertEqual(stats["insight_rows"], 0)
+
+    def test_adset_stage_is_stored_and_unknown_is_counted(self) -> None:
+        frows = [("as1", "2026-08-02", "c1", "Adset", "retargeting", "s"),
+                 ("as2", "2026-08-02", "c1", "Other", "unknown", "s")]
+        with patch.object(detail, "fetch_day", return_value=self._fake_day_rows()), \
+             patch.object(detail, "fetch_adset_funnel", return_value=frows) as ff:
+            stats = detail.run("2026-08-01", "2026-08-01", only="insights")
+        self.assertEqual(ff.call_args.args[0], ["as1"])   # only ad sets that spent
+        self.assertEqual(stats["adsets_staged"], 2)
+        self.assertEqual(stats["stage_unknown"], 1)
+        conn = self._conn()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta_adset_funnel").fetchone()[0], 2)
+        conn.close()
+
+    def test_fetch_adset_funnel_classifies_from_targeting(self) -> None:
+        fake = {"1": {"name": "A", "campaign_id": "c", "targeting": {"age_min": 18}},
+                "2": {"name": "B", "campaign_id": "c",
+                      "targeting": {"custom_audiences": [{"name": "Website Visitors 180"}]}},
+                "3": {"name": "C", "campaign_id": "c",
+                      "targeting": {"custom_audiences": [{"name": "Lookalike 1%"}]}}}
+        self._patch_funnel.stop()
+        try:
+            with patch.object(detail, "_batch_get", return_value=fake):
+                rows = {r[0]: r for r in detail.fetch_adset_funnel(["1", "2", "3"], "2026-08-02")}
+        finally:
+            self._patch_funnel.start()
+        self.assertEqual(rows["1"][4], "cold")
+        self.assertEqual(rows["2"][4], "retargeting")
+        self.assertEqual(rows["3"][4], "unknown")
 
 
 class MainStatusTests(unittest.TestCase):

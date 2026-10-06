@@ -51,6 +51,10 @@ USAGE
   python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 50
   python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 50 --execute
 
+  python meta_ads_mutate.py rename --object-id 1234567890 --name "New name"
+  python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv            # dry run, whole plan
+  python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv --execute
+
   # no dry run exists for copies -- --execute is required; created PAUSED
   python meta_ads_mutate.py copy-adset --adset-id 1234567890 \
       --dest-campaign-id 9876543210 --execute
@@ -58,9 +62,11 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
+import time
 
 import requests
 from dotenv import load_dotenv
@@ -70,6 +76,7 @@ load_dotenv()
 API_VERSION = "v23.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}"
 REQUEST_TIMEOUT_SECONDS = 60
+RATE_LIMIT_SLEEP_SECONDS = 35  # Meta write limit (code 613) is roughly 1 write / 30s
 
 
 def _token() -> str:
@@ -177,6 +184,66 @@ def set_adset_budget(args):
           args.execute)
 
 
+def rename(args):
+    """Rename a campaign / ad set / ad. A name write only: it does not touch
+    delivery, budget or learning."""
+    _post(args.object_id, {"name": args.name}, args.execute)
+
+
+def _post_quiet(object_id: str, payload: dict, execute: bool, retries: int = 4) -> str:
+    """Like `_post` but returns a status string ("ok" or "FAILED ...") instead of
+    exiting, and rides out Meta's write rate limit (code 613) by sleeping, so a
+    batch can finish. Dry-run unless `execute`."""
+    params = dict(payload, access_token=_token())
+    if not execute:
+        params["execution_options"] = json.dumps(["validate_only"])
+    for _ in range(retries):
+        data = requests.post(f"{BASE}/{object_id}", data=params,
+                             timeout=REQUEST_TIMEOUT_SECONDS).json()
+        err = data.get("error")
+        if not err:
+            return "ok"
+        if err.get("code") == 613:
+            time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+            continue
+        return f"FAILED {err.get('message')}"
+    return "FAILED rate limit"
+
+
+def rename_from_csv(args):
+    """Apply a rename plan CSV (columns: level,id,current_name,proposed_name).
+
+    Before each write the LIVE name is read and compared with `current_name`; a
+    mismatch is skipped and reported, never overwritten, so a name someone
+    changed since the plan was drafted is not clobbered. Rows whose live name
+    already equals `proposed_name` are reported SAME and not written. Without
+    `--execute` every write is a server-side validate-only pass."""
+    norm = lambda n: (n or "").strip()
+    with open(args.csv, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    ok = skipped = failed = 0
+    for r in rows:
+        oid = r["id"]
+        live = requests.get(f"{BASE}/{oid}", params={"fields": "name", "access_token": _token()},
+                            timeout=REQUEST_TIMEOUT_SECONDS).json().get("name")
+        if norm(live) != norm(r["current_name"]):
+            print(f"SKIP  {oid}  live name differs: {live!r}")
+            skipped += 1
+            continue
+        if norm(live) == r["proposed_name"]:
+            print(f"SAME  {oid}")
+            continue
+        res = _post_quiet(oid, {"name": r["proposed_name"]}, args.execute)
+        tag = "FAIL " if res != "ok" else "DONE " if args.execute else "CHECK"
+        print(f"{tag} {r['level']:<8}{oid}  {norm(live)[:50]!r} -> {r['proposed_name']!r}"
+              + ("" if res == "ok" else f"  [{res}]"))
+        ok += res == "ok"
+        failed += res != "ok"
+        time.sleep(args.delay)
+    mode = "executed" if args.execute else "validated"
+    print(f"\n{mode}: {ok}  skipped: {skipped}  failed: {failed}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -210,6 +277,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="minor units per major unit: 100 for USD/EUR/GBP, 1 for JPY/KRW")
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=set_adset_budget)
+
+    p = sub.add_parser("rename")
+    p.add_argument("--object-id", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=rename)
+
+    p = sub.add_parser("rename-from-csv")
+    p.add_argument("--csv", required=True)
+    p.add_argument("--delay", type=float, default=2.0, help="seconds between writes")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=rename_from_csv)
     return ap
 
 

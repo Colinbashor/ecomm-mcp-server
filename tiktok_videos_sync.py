@@ -117,27 +117,39 @@ def _sign(path: str, params: dict, secret: str) -> str:
 
 
 def _request_page(params: dict) -> dict:
-    """One signed GET. Refreshes an expired access token once, then retries."""
+    """One signed GET. Refreshes an expired access token once and rides out
+    transient connection resets, rate limits and 5xx errors with exponential
+    backoff (1, 2, 4, 8, 16s; 6 attempts). A month of videos is hundreds of
+    pages, so without this a single hiccup anywhere killed the whole pull."""
     secret = os.environ["TIKTOK_APP_SECRET"]
-    for attempt in (1, 2):  # attempt 2 only happens after a token refresh
+    refreshed = False
+    for attempt in range(6):
         params["timestamp"] = str(int(time.time()))
         params.pop("sign", None)
         params["sign"] = _sign(PATH, params, secret)
-        r = requests.get(
-            f"{BASE}{PATH}", params=params,
-            headers={"content-type": "application/json",
-                     "x-tts-access-token": os.environ["TIKTOK_ACCESS_TOKEN"]},
-            timeout=60,
-        )
-        data = r.json()
+        try:
+            r = requests.get(
+                f"{BASE}{PATH}", params=params,
+                headers={"content-type": "application/json",
+                         "x-tts-access-token": os.environ["TIKTOK_ACCESS_TOKEN"]},
+                timeout=60,
+            )
+            data = r.json()
+        except (requests.ConnectionError, requests.Timeout, ValueError):
+            time.sleep(2 ** attempt)  # network hiccup or non-JSON body
+            continue
         code = data.get("code")
-        if code in TOKEN_EXPIRED_CODES and attempt == 1:
+        if code in TOKEN_EXPIRED_CODES and not refreshed:
             _refresh_access_token()  # saves the new token to .env + os.environ
+            refreshed = True
+            continue
+        if code in (105050, 105051, 429000) or r.status_code == 429 or r.status_code >= 500:
+            time.sleep(2 ** attempt)  # rate limited, or a transient server error
             continue
         if code != 0:
             raise RuntimeError(f"TikTok video API {r.status_code} code={code}: {data.get('message')}")
         return data
-    raise RuntimeError("TikTok request failed even after refreshing the access token.")
+    raise RuntimeError("TikTok video API failed after retries (last attempt exhausted).")
 
 
 def fetch(account_type: str, start: str, end: str, gmv_positive_only: bool = False) -> list[dict]:

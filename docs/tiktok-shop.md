@@ -78,6 +78,8 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
 python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit 400   # smoke test: first 400 ids
 ```
 
+`tiktok_videos_sync.py` retries each page up to 6 times: it refreshes an expired access token once, and backs off exponentially (1, 2, 4, 8, 16s) on connection resets, timeouts, non-JSON bodies, HTTP 429/5xx and API codes 105050 / 105051 / 429000. A month of videos is hundreds of pages, so without this one transient failure would abort the whole pull; any other non-zero API code still fails immediately.
+
 ## Tables
 
 - `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))

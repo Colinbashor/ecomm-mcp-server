@@ -173,7 +173,7 @@ python meta_ads_detail_sync.py --full-video-crawl           # seed the whole acc
 
 ### Tables
 
-All three are created by the script itself (`CREATE TABLE IF NOT EXISTS`,
+All four are created by the script itself (`CREATE TABLE IF NOT EXISTS`,
 not in `warehouse/schema.sql`) and written with `INSERT OR REPLACE`
 (upsert; nothing is deleted). `synced_at` is a UTC ISO timestamp of the run.
 
@@ -200,6 +200,26 @@ not in `warehouse/schema.sql`) and written with `INSERT OR REPLACE`
   `creator_handle, period, reacher_hash` (NULL unless the title matches the
   optional convention below), `synced_at`.
 
+- `meta_adset_funnel` — PK `(adset_id, observed_date)`. The funnel stage of
+  each ad set that spent in the window, read from its **targeting** (the
+  custom audiences it includes) by `meta_funnel.classify_targeting`, never
+  from its hand-typed name. Columns: `adset_id, observed_date, campaign_id,
+  adset_name, stage, synced_at`. `stage` is one of `retention` (customer-list
+  audience), `retargeting` (site-visitor / engager audiences), `warm_product`
+  (product-page-visitor / video-viewer audiences), `cold` (no custom audience
+  included) or `unknown` (no targeting, or an included audience that matches
+  no pattern — stored and counted, never guessed). One row per observation
+  date because audiences can be edited: join a spend row to the latest
+  `observed_date <=` its date. Only ad sets seen in the window's insights are
+  read, so dead ad sets under paused campaigns cost nothing.
+
+  The audience-name patterns are a convention you adapt to your own naming
+  scheme; override them with `META_FUNNEL_RETENTION_PATTERN`,
+  `META_FUNNEL_RETARGETING_PATTERN` and `META_FUNNEL_WARM_PRODUCT_PATTERN`
+  (case-insensitive regexes; defaults are in the `meta_funnel.py` docstring).
+  `python meta_funnel.py` lists every active ad set with its stage — a quick way
+  to see which audiences need a pattern.
+
 ### sync_log and exit code
 
 One `sync_log` row per run with `platform='meta_ads_detail'` and
@@ -207,8 +227,11 @@ One `sync_log` row per run with `platform='meta_ads_detail'` and
 
 - `status='ok'` — every day fetched; message like
   `<start> -> <end>; N creatives, M new videos (K Reacher)`.
-- `status='degraded'` — one or more days were skipped; message gets
-  `; N day(s) skipped` appended. **Exit code 1** in this case.
+- `status='degraded'` — one or more days were skipped (message gets
+  `; N day(s) skipped` appended, **exit code 1**), and/or one or more ad sets
+  have an unrecognised audience (stage `unknown`; message names the count and
+  points at `meta_funnel.py`; exit code stays 0 — the data is stored, the
+  classifier just needs a pattern).
 - `status='error'` — an uncaught exception (e.g. missing env var, a failure
   in the creative or video stage); the exception text is logged and
   re-raised.
@@ -322,7 +345,21 @@ python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 
 python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 3000 \
     --currency-offset 1 --execute                                           # zero-decimal currency (JPY/KRW)
 python meta_ads_mutate.py copy-adset --adset-id 1234567890 --dest-campaign-id 9876543210 --execute
+python meta_ads_mutate.py rename --object-id 1234567890 --name "New name"   # dry run; add --execute
+python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv             # dry run of the whole plan
+python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv --execute --delay 2
 ```
+
+`rename` changes a campaign / ad set / ad name only (no delivery, budget or
+learning impact). `rename-from-csv` applies a plan with columns
+`level,id,current_name,proposed_name`. Before each write it reads the object's
+**live** name and compares it with `current_name`: a mismatch is skipped and
+reported (`SKIP`), never overwritten, so a name someone changed after the plan
+was drafted is not clobbered; a row already at `proposed_name` is reported
+`SAME`. Writes ride out Meta's write rate limit (error code 613, roughly one
+write per 30 seconds) by sleeping and retrying instead of aborting the batch,
+and the run ends with `executed|validated: N  skipped: N  failed: N`. Keep real
+rename plans out of version control — they are account data.
 
 ### Notes
 
@@ -342,4 +379,5 @@ python meta_ads_mutate.py copy-adset --adset-id 1234567890 --dest-campaign-id 98
 status subcommand defaults to `validate_only`, `--execute` drops it,
 `copy-adset` refuses without `--execute` and defaults to `PAUSED`, budget
 minor-unit conversion (including a zero-decimal offset), and non-zero exit on
-an API error (including an error body on HTTP 200).
+an API error (including an error body on HTTP 200), `rename` validate-only,
+`rename-from-csv` skipping a drifted live name, and the rate-limit retry.

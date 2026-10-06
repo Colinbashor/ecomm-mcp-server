@@ -110,5 +110,45 @@ class MetaMutateTests(unittest.TestCase):
                 args.func(args)
 
 
+class RenameTests(unittest.TestCase):
+    def setUp(self):
+        env = mock.patch.dict("os.environ", {"META_ACCESS_TOKEN": "test-token"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_rename_is_validate_only_without_execute(self):
+        args = mam.build_parser().parse_args(["rename", "--object-id", "1", "--name", "N"])
+        with mock.patch.object(mam.requests, "post", return_value=_resp()) as post,              mock.patch("builtins.print"):
+            args.func(args)
+        sent = post.call_args.kwargs["data"]
+        self.assertEqual(sent["name"], "N")
+        self.assertEqual(json.loads(sent["execution_options"]), ["validate_only"])
+
+    def _csv(self, rows):
+        import os, tempfile
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write("level,id,current_name,proposed_name\n")
+            for r in rows:
+                fh.write(",".join(r) + "\n")
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_csv_skips_when_live_name_changed_and_writes_when_matching(self):
+        path = self._csv([("ad", "1", "old", "new"), ("ad", "2", "old", "new")])
+        args = mam.build_parser().parse_args(["rename-from-csv", "--csv", path, "--delay", "0"])
+        gets = [_resp(body={"name": "someone edited"}), _resp(body={"name": "old"})]
+        with mock.patch.object(mam.requests, "get", side_effect=gets),              mock.patch.object(mam.requests, "post", return_value=_resp()) as post,              mock.patch("builtins.print"):
+            args.func(args)
+        self.assertEqual(post.call_count, 1)  # only id 2 written
+        self.assertIn("/2", post.call_args.args[0])
+
+    def test_post_quiet_retries_on_rate_limit(self):
+        limited = _resp(body={"error": {"code": 613, "message": "rate"}})
+        with mock.patch.object(mam.requests, "post", side_effect=[limited, _resp()]),              mock.patch.object(mam.time, "sleep") as sl:
+            self.assertEqual(mam._post_quiet("1", {"name": "n"}, True), "ok")
+        sl.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
