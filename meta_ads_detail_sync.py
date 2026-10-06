@@ -60,6 +60,13 @@ WHAT IS CAPTURED
                      DISAGREE on the same creative, and only the latter is
                      reliably the actual ad-account video (see the trap below)
                      — `video_id_any` coalesces `story_video_id` first.
+  meta_adset_funnel  ad set x observed date -> funnel stage (cold / warm_product /
+                     retargeting / retention / unknown), classified from the ad
+                     set's TARGETING by meta_funnel.py, never from its name.
+                     Only ad sets that spent in the window are read. An
+                     unrecognised audience is stored as 'unknown' and makes the
+                     run log `degraded`. Join spend to the latest
+                     observed_date <= its date, since audiences can be edited.
   meta_ad_videos     the ad-account video library, with the optional Reacher
                      convention parsed into creator_handle / period / hash
                      when it matches.
@@ -114,6 +121,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from meta_funnel import classify_targeting
 from warehouse import db as warehouse_db
 from warehouse.connectors.meta_ads import (
     API_VERSION, _ATC_TYPES, _CHECKOUT_TYPES, _PURCHASE_TYPES, _RangeTooLarge,
@@ -196,6 +204,21 @@ CREATE TABLE IF NOT EXISTS meta_ad_videos (
     synced_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_meta_videos_handle ON meta_ad_videos(creator_handle);
+
+-- Funnel stage per ad set, read from its TARGETING (meta_funnel.classify_targeting),
+-- never from its name. One row per ad set per day it was observed, because an ad
+-- set's audiences can be edited: join a spend row to the latest observed_date <=
+-- its date. 'unknown' means an included audience the classifier does not
+-- recognise; it is stored and counted, never guessed into a stage.
+CREATE TABLE IF NOT EXISTS meta_adset_funnel (
+    adset_id      TEXT NOT NULL,
+    observed_date TEXT NOT NULL,
+    campaign_id   TEXT,
+    adset_name    TEXT,
+    stage         TEXT NOT NULL,
+    synced_at     TEXT NOT NULL,
+    PRIMARY KEY (adset_id, observed_date)
+);
 """
 
 # <creator_handle>_<Mon><Year>_RCHR_<hex> -- Reacher's own upload-naming
@@ -314,6 +337,15 @@ def fetch_creatives(ad_ids: list[str]) -> list[tuple]:
     return rows
 
 
+def fetch_adset_funnel(adset_ids: list[str], observed: str) -> list[tuple]:
+    """Stage for the given ad sets only (those that spent in the window), so the
+    long tail of dead ad sets under paused campaigns is never read."""
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return [(str(i), observed, s.get("campaign_id"), s.get("name"),
+             classify_targeting(s.get("targeting")), stamp)
+            for i, s in _batch_get(adset_ids, "id,name,campaign_id,targeting").items()]
+
+
 def crawl_videos(known: set[str], want: set[str], max_pages: int = MAX_VIDEO_PAGES,
                  stop_after: int = STOP_AFTER_BARREN_PAGES) -> tuple[list[tuple], set[str]]:
     """Walk /advideos, storing every video not already known. Reacher-parsed.
@@ -388,9 +420,11 @@ def run(start: str, end: str, only: str | None = None,
     conn = sqlite3.connect(DB, timeout=warehouse_db.BUSY_TIMEOUT_SECONDS)
     conn.executescript(DDL)
     stats = {"insight_rows": 0, "days_skipped": 0, "creatives": 0, "videos": 0,
-             "reacher_videos": 0, "videos_unresolved": 0}
+             "reacher_videos": 0, "videos_unresolved": 0,
+             "adsets_staged": 0, "stage_unknown": 0}
 
     seen_ads: set[str] = set()
+    seen_adsets: set[str] = set()
     day, last = date.fromisoformat(start), date.fromisoformat(end)
     while day <= last:
         try:
@@ -409,7 +443,18 @@ def run(start: str, end: str, only: str | None = None,
                 [r + (stamp,) for r in rows])
         stats["insight_rows"] += len(rows)
         seen_ads.update(r[2] for r in rows)
+        seen_adsets.update(r[4] for r in rows if r[4])
         day += timedelta(days=1)
+
+    if seen_adsets:
+        frows = fetch_adset_funnel(sorted(seen_adsets), date.today().isoformat())
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO meta_adset_funnel "
+                "(adset_id, observed_date, campaign_id, adset_name, stage, synced_at) "
+                "VALUES (?,?,?,?,?,?)", frows)
+        stats["adsets_staged"] = len(frows)
+        stats["stage_unknown"] = sum(1 for r in frows if r[4] == "unknown")
 
     if only == "insights":
         conn.close()
@@ -480,11 +525,15 @@ def main() -> int:
     except Exception as exc:                                    # noqa: BLE001
         warehouse_db.log_sync("meta_ads_detail", started, 0, "error", str(exc))
         raise
-    status = "degraded" if s["days_skipped"] else "ok"
+    stage_unknown = s.get("stage_unknown", 0)
+    status = "degraded" if (s["days_skipped"] or stage_unknown) else "ok"
     msg = (f"{start} -> {end}; {s['creatives']} creatives, {s['videos']} new videos "
-           f"({s['reacher_videos']} Reacher)")
+           f"({s['reacher_videos']} Reacher); {s.get('adsets_staged', 0)} ad sets staged")
     if s["days_skipped"]:
         msg += f"; {s['days_skipped']} day(s) skipped"
+    if stage_unknown:
+        msg += (f"; {stage_unknown} ad set(s) with an unrecognised audience "
+                "(stage 'unknown') -- add a pattern in meta_funnel.py")
     warehouse_db.log_sync("meta_ads_detail", started, s["insight_rows"], status, msg)
     print(f"Meta ad detail: {s['insight_rows']} ad-day rows, {s['creatives']} creatives, "
           f"{s['videos']} new videos ({s['reacher_videos']} Reacher-tagged) "

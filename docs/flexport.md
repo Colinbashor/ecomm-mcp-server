@@ -41,6 +41,7 @@ python flexport_sync.py --catalog # + a full catalog crawl (slow; run occasional
 python flexport_orders_sync.py    # per-order shipping cost (resumable event-cursor crawl)
 python flexport_orders_sync.py --since-days 30 --pages 5
 python flexport_orders_sync.py --restart   # discard the saved cursor and re-walk from scratch
+python flexport_orders_sync.py --from-shopify --days 10   # fetch by id, enumerated from Shopify
 python flexport_returns_sync.py   # customer returns
 python flexport_returns_sync.py --pages 5 --restart
 python flexport_inbounds_sync.py  # inbound supplier shipments
@@ -55,6 +56,9 @@ python flexport_inbounds_sync.py --max-pages 5
 | `flexport_orders_sync.py` | `--pages N` | `100000` | Cap on event pages walked this run (a runaway guard, not an expected size). |
 | | `--since-days N` | none | Clear the stored cursor and seed a hand-crafted cursor ~N days back. Takes precedence over `--restart`. |
 | | `--restart` | off | Clear the stored cursor and walk from the event feed's floor (~12 months back). |
+| | `--from-shopify` | off | Skip the `/events` crawl: enumerate Flexport external order ids from Shopify and fetch each with `GET /orders/external_id/{id}`. See below. |
+| | `--days N` | `10` | With `--from-shopify`: how many days of Shopify orders to scan. |
+| | `--workers N` | `8` | With `--from-shopify`: concurrent order fetches. |
 | `flexport_returns_sync.py` | `--pages N` | `100000` | Cap on `/returns` pages walked this run. |
 | | `--restart` | off | Delete the stored cursor and re-crawl from the floor. |
 | `flexport_inbounds_sync.py` | `--max-pages N` | `1000` | Cap on `/inbounds/shipments` pages walked this run. |
@@ -69,6 +73,43 @@ which can take a while for a large merchant) to fully refresh
 `--since-days` → `--restart` (feed floor) → the stored `events_page_info`
 cursor → a cursor re-seeded at the data frontier (`frontier_seed()`, see
 Notes) → the feed floor on a truly fresh database.
+
+### Shopify-driven direct fetch (`--from-shopify`)
+
+The `/events` crawl is bounded by that endpoint's per-page latency, which on a
+busy store can fall days behind. If your Flexport `externalOrderId` is
+derivable from Shopify, this mode is much faster and needs no cursor:
+
+1. Page Shopify `orders` created in the last `--days` days (needs the
+   `read_merchant_managed_fulfillment_orders` and
+   `read_third_party_fulfillment_orders` scopes plus the usual Shopify
+   credentials) and read each order's `fulfillmentOrders`.
+2. Keep fulfillment orders assigned to the Shopify location named by
+   `FLEXPORT_SHOPIFY_LOCATION` whose `requestStatus` is `ACCEPTED`, `CLOSED` or
+   `CANCELLATION_*` (Flexport only knows about accepted ones) and whose
+   `status` is not `CANCELLED`.
+3. Build the external id as `<order name><FLEXPORT_EXTERNAL_ID_SPLIT_MARKER><numeric
+   fulfillment-order id>` — leave the marker unset to use the bare order name.
+   Mirror whatever your Shopify→Flexport integration actually sends.
+4. Fetch each id (percent-encoded in the path, since order names can contain
+   `/`) in a thread pool and upsert into the same two tables, using named
+   columns. Ids already stored **with a cost** are skipped; ones stored before
+   they shipped are re-fetched so the cost lands once Flexport posts it.
+
+| Variable | Notes |
+|---|---|
+| `FLEXPORT_SHOPIFY_LOCATION` | required for this mode — name of the Shopify location that maps to Flexport; unset → exits `1` |
+| `FLEXPORT_EXTERNAL_ID_SPLIT_MARKER` | optional literal between order name and fulfillment-order id |
+
+A 404 is an *expected* answer (Flexport hasn't received it yet) and is counted,
+not raised (`FlexportNotFound`). But an accepted fulfillment order must exist on
+Flexport's side, so if more than 5% of ≥20 fetched ids 404 the run logs
+`degraded` with `EXTERNAL-ID RULE MAY HAVE CHANGED` — the id rule no longer
+matches your integration, which would otherwise look like a quiet zero. An empty
+pull (no Shopify orders, or no Flexport ids) is also `degraded`, and more than
+`max(5, 1%)` fetch errors is `degraded`. Degraded exits `75`. Logged under
+platform `flexport_orders_direct`. Run it ahead of the crawl, which stays useful
+as a backstop for orders whose external id has some other shape.
 
 ### Exit codes and `sync_log`
 
