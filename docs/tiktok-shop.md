@@ -240,6 +240,9 @@ there is no fallback id list.
 `tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
+`tests/test_tiktok_creator_marketplace_sync.py` (handle parsing/dedupe, exact-match
+only lookup rejecting fuzzy hits, not-found rows still written, group-share sums,
+resume by `--max-age-days`, consecutive-error stop),
 `tests/test_tiktok_shop_connector.py` (per-sku summing of `seller_discount`/
 `platform_discount` across unit-lines, and that `upsert_orders()` stores them
 while leaving them `NULL` for connectors that never set them),
