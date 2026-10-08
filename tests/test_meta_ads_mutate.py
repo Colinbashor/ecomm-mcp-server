@@ -110,6 +110,69 @@ class MetaMutateTests(unittest.TestCase):
                 args.func(args)
 
 
+class CopyAdsTests(unittest.TestCase):
+    SRC = {"data": [{"id": "a1", "name": "One", "effective_status": "ACTIVE"},
+                    {"id": "a2", "name": "Two", "effective_status": "PAUSED"},
+                    {"id": "a3", "name": "Gone", "effective_status": "DELETED"}]}
+
+    def setUp(self):
+        env = mock.patch.dict("os.environ", {"META_ACCESS_TOKEN": "test-token"})
+        env.start()
+        self.addCleanup(env.stop)
+        sl = mock.patch.object(mam.time, "sleep")
+        sl.start()
+        self.addCleanup(sl.stop)
+
+    @staticmethod
+    def _get(src, dst):
+        def fake(url, params=None, timeout=None):
+            m = mock.Mock()
+            m.json.return_value = src if "/111/" in url else dst
+            return m
+        return fake
+
+    def _run(self, argv, src, dst, post_side_effect=None):
+        args = mam.build_parser().parse_args(argv)
+        post_kw = ({"side_effect": post_side_effect} if post_side_effect
+                   else {"return_value": _resp(body={"copied_ad_id": "9"})})
+        with mock.patch.object(mam.requests, "get", side_effect=self._get(src, dst)), \
+             mock.patch.object(mam.requests, "post", **post_kw) as post, \
+             mock.patch("builtins.print"):
+            args.func(args)
+        return post
+
+    def test_dry_run_posts_nothing(self):
+        post = self._run(["copy-ads", "--source-adset-id", "111", "--dest-adset-id", "222"],
+                         self.SRC, {"data": []})
+        post.assert_not_called()
+
+    def test_execute_copies_paused_and_skips_deleted_and_existing(self):
+        post = self._run(["copy-ads", "--source-adset-id", "111", "--dest-adset-id", "222",
+                          "--execute"], self.SRC, {"data": [{"id": "x", "name": "One"}]})
+        self.assertEqual(post.call_count, 1)  # "One" exists, "Gone" is DELETED
+        self.assertTrue(post.call_args.args[0].endswith("/a2/copies"))
+        data = post.call_args.kwargs["data"]
+        self.assertEqual(data["adset_id"], "222")
+        self.assertEqual(data["status_option"], "PAUSED")
+
+    def test_limit_caps_copies(self):
+        post = self._run(["copy-ads", "--source-adset-id", "111", "--dest-adset-id", "222",
+                          "--limit", "1", "--execute"], self.SRC, {"data": []})
+        self.assertEqual(post.call_count, 1)
+
+    def test_list_error_aborts_instead_of_reading_as_empty(self):
+        with self.assertRaises(SystemExit):
+            self._run(["copy-ads", "--source-adset-id", "111", "--dest-adset-id", "222",
+                       "--execute"], {"error": {"message": "nope"}}, {"data": []})
+
+    def test_rate_limit_is_retried(self):
+        limited = _resp(body={"error": {"code": 613, "message": "slow"}})
+        post = self._run(["copy-ads", "--source-adset-id", "111", "--dest-adset-id", "222",
+                          "--limit", "1", "--execute"], self.SRC, {"data": []},
+                         post_side_effect=[limited, _resp(body={"copied_ad_id": "9"})])
+        self.assertEqual(post.call_count, 2)
+
+
 class RenameTests(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict("os.environ", {"META_ACCESS_TOKEN": "test-token"})

@@ -307,6 +307,7 @@ same pinned Graph API version as the core connector; it writes nothing to
 | `pause-ad` / `resume-ad --ad-id ID` | set ad `status` |
 | `set-adset-budget --adset-id ID --daily-amount N [--currency-offset 100]` | set `daily_budget`, converting major → minor currency units |
 | `copy-adset --adset-id ID --dest-campaign-id ID [--go-live] --execute` | deep-copy an ad set and its ads into another campaign |
+| `copy-ads --source-adset-id ID --dest-adset-id ID [--limit N] [--execute]` | copy the ads of one ad set into another **existing** ad set, created `PAUSED`; the dry run only lists |
 
 ### Safety model
 
@@ -321,6 +322,18 @@ same pinned Graph API version as the core connector; it writes nothing to
   `--execute`** (exit code 2, versus 1 for an API error). The copy is created `PAUSED` unless `--go-live` is also
   passed. It is a genuinely new ad set with a fresh learning phase — none of
   the source's delivery history carries over (Meta has no native "move").
+- `copy-ads` also has no server-side validation, but its dry run is purely
+  read-only: it lists the source ad set's ads (ignoring `DELETED`/`ARCHIVED`)
+  and reports which would be copied. Ads whose name already exists in the
+  destination are skipped, so re-running after a partial failure is safe;
+  `--limit N` allows a canary run of a single ad first. Use it to rebuild an
+  ad set whose `optimization_goal` cannot be edited after publish (create the
+  new ad set, then copy the ads across — each ad keeps its creative, caption,
+  link and URL tags). Writes are spaced ~31s apart and rate-limit errors
+  (codes 613/17) are retried up to 4 times, because Meta allows roughly one
+  write per 30 seconds. Execution needs publish permission on the Page /
+  Instagram account behind each ad's creative; a failed list call aborts
+  rather than being read as "no ads".
 - Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
   with Meta's message, type, code and subcode.
 
@@ -345,6 +358,8 @@ python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 
 python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 3000 \
     --currency-offset 1 --execute                                           # zero-decimal currency (JPY/KRW)
 python meta_ads_mutate.py copy-adset --adset-id 1234567890 --dest-campaign-id 9876543210 --execute
+python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455            # lists only
+python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455 --limit 1 --execute
 python meta_ads_mutate.py rename --object-id 1234567890 --name "New name"   # dry run; add --execute
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv             # dry run of the whole plan
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv --execute --delay 2

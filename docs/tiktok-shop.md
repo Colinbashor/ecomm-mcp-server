@@ -1,7 +1,7 @@
 # TikTok Shop
 
-Order ground truth (core), plus six standalone scripts for video
-performance, LIVE-shopping, creator identity, sales-source attribution,
+Order ground truth (core), plus seven standalone scripts for video
+performance, LIVE-shopping, creator identity and Marketplace profiles, sales-source attribution,
 settlement/fee data, and listing-quality diagnostics.
 
 ## Scripts
@@ -12,6 +12,7 @@ settlement/fee data, and listing-quality diagnostics.
 | `tiktok_videos_sync.py` | standalone | video performance |
 | `tiktok_live_sync.py` | standalone | LIVE-shopping broadcast + product funnel |
 | `tiktok_creators_sync.py` | standalone | handle ↔ display-name ↔ user-id creator/affiliate identity bridge |
+| `tiktok_creator_marketplace_sync.py` | standalone | per-creator Marketplace profile (whole-shop category split, GMV/units bands, rating, commission) for handles you supply |
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
 | `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
 | `tiktok_listing_quality_sync.py` | standalone | per-product content-quality tier + issues (Listings Diagnosis API) |
@@ -64,6 +65,9 @@ python tiktok_creators_sync.py api                  # or `import path/to/export.
 python tiktok_creators_sync.py import --dir exports/   # import every .xlsx/.csv in a folder
 python tiktok_creators_sync.py api --dry-run        # fetch + report, write nothing (also on `import`)
 
+python tiktok_creator_marketplace_sync.py --handles creator_one,creator_two
+python tiktok_creator_marketplace_sync.py --from-table tiktok_creators --handle-column handle     --group footwear=601352 --group bags=824584 --max-age-days 14
+
 python tiktok_analytics_sync.py                     # trailing 30 days (default)
 python tiktok_analytics_sync.py --start 2026-01-01 --end 2026-01-31
 python tiktok_analytics_sync.py --dry-run           # fetch and report, write nothing
@@ -86,6 +90,7 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit
 - `tiktok_shop_videos`
 - `tiktok_shop_lives`, `tiktok_shop_live_products`
 - `tiktok_creators`
+- `tiktok_creator_marketplace`, `tiktok_category_top`
 - `tiktok_shop_performance`
 - `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
 - `tiktok_weekly_product` (VIEW, rebuilt by `tiktok_finance_sync.py`) — weekly
@@ -110,6 +115,33 @@ bridge closes that gap via the API plus an optional manual CSV import. The
 switches behavior based on how far it got: a partial crawl **merges** into
 existing rows, while a complete crawl **replaces** them outright — see the
 module docstring before assuming every run behaves the same way.
+
+`tiktok_creator_marketplace_sync.py` answers "is this creator a category fit?"
+BEFORE you spend on a sample. Your own orders only show what a creator sold for
+you; TikTok's Marketplace profile carries their whole-shop
+`category_gmv_distribution`. Handles come from `--handles`, `--handles-file` or
+a read-only `--from-table`/`--handle-column` (for example the `handle` column
+of `tiktok_creators`). It uses the `affiliate_seller` endpoints with the
+ordinary seller token (the `affiliate_creator` namespace needs a creator-type
+authorisation and is not used). Things to know before trusting the numbers:
+
+- Search is fuzzy, so only an **exact case-insensitive username match** is
+  accepted; anything else is stored as `found = 0`.
+- Coverage is "what was asked": every looked-up handle gets a row (found or
+  not) with `fetched_at`, and `--max-age-days` resume is keyed on that
+  timestamp, never on missing rows.
+- `category_gmv_distribution` values are **fractions** ("0.85" = 85%), and
+  category id `-1` is the uncategorised bucket (`uncategorised_share`).
+  `--group NAME=ID,ID` sums chosen top-level category ids into
+  `group_pct_json`; the ids to use are in `tiktok_category_top`, refreshed each
+  run. TikTok has no top-level category for niche segments, so a group share
+  cannot isolate one that sits inside a broader category.
+- `gmv_band` / `units_band` are bands (`$150K+`), not numbers, and an empty
+  category list usually means the creator has not authorised data sharing —
+  not that they are a poor fit.
+- Five consecutive request errors stop the run with exit code 75 and a
+  `degraded` `sync_log` row (platform `tiktok_creator_marketplace`); a run
+  where no handle matched at all is also `degraded`, never `ok`.
 
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction. It chunks

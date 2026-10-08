@@ -5,8 +5,9 @@ Meta Marketing API MUTATE operations — the Meta counterpart to
 Every other Meta file here (`warehouse/connectors/meta_ads.py`,
 `meta_ads_detail_sync.py`) only issues GET requests against the Graph API.
 This one POSTs updates, so it can change a live ad account: pause or resume a
-campaign / ad set / ad, change an ad set's daily budget, or copy an ad set
-(with its ads) into a different campaign.
+campaign / ad set / ad, change an ad set's daily budget, copy an ad set
+(with its ads) into a different campaign, or copy the ads of one ad set into
+another existing ad set.
 
 SAME SAFETY DISCIPLINE AS THE GOOGLE ADS SCRIPT: every field update defaults to
 a dry run. Meta's equivalent of Google's `validate_only` is the
@@ -26,6 +27,16 @@ to honour `validate_only`, so a "dry run" could still create a real copy.
 Rather than trust an undocumented behaviour, that subcommand REFUSES to run
 without `--execute`, and the copy is created PAUSED unless `--go-live` is also
 passed — so even an executed copy is held for inspection before it can spend.
+
+`copy-ads` HAS THE SAME LIMITATION BUT IS DRY-RUNNABLE: its dry run (no
+`--execute`) only READS — it lists the source ad set's ads and reports what
+WOULD be copied — and sends no POST at all. `--execute` copies each ad
+(`/{ad_id}/copies` with `adset_id`) PAUSED, skipping any ad whose name already
+exists in the destination so a re-run never duplicates. Typical use: a
+published ad set's `optimization_goal` cannot be edited and ads cannot be
+moved, so changing (say) a conversions ad set to a value-optimised one means
+building a new ad set and copying the ads across, which keeps each ad's
+creative (caption, link, URL tags, partner/branded-content settings).
 
 AUTH — TWO INDEPENDENT PERMISSION AXES (same shape as Google Ads):
   1. The access token's OAuth scopes must include `ads_management`
@@ -58,6 +69,11 @@ USAGE
   # no dry run exists for copies -- --execute is required; created PAUSED
   python meta_ads_mutate.py copy-adset --adset-id 1234567890 \
       --dest-campaign-id 9876543210 --execute
+
+  # copy the ads of one ad set into another EXISTING ad set (dry run only lists)
+  python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455
+  python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455 \
+      --limit 1 --execute        # canary: copy a single ad first
 """
 from __future__ import annotations
 
@@ -76,6 +92,9 @@ load_dotenv()
 API_VERSION = "v23.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}"
 REQUEST_TIMEOUT_SECONDS = 60
+COPY_SPACING_SECONDS = 31  # pause between ad copies (Meta write limit ~1 / 30s)
+COPY_MAX_ATTEMPTS = 4
+RATE_LIMIT_CODES = (613, 17)  # call-count rate limits worth sleeping through
 RATE_LIMIT_SLEEP_SECONDS = 35  # Meta write limit (code 613) is roughly 1 write / 30s
 
 
@@ -164,6 +183,63 @@ def copy_adset(args):
         "deep_copy": "true",
     }
     _post(f"{args.adset_id}/copies", payload, args.execute, validate_only=False)
+
+
+def _list_ads(adset_id: str, fields: str) -> list[dict]:
+    """GET the ads of an ad set (first 200). An API error raises: an error is
+    not "zero ads", and treating it as such would make `copy-ads` believe the
+    destination is empty and duplicate everything."""
+    data = requests.get(f"{BASE}/{adset_id}/ads",
+                        params={"fields": fields, "limit": 200, "access_token": _token()},
+                        timeout=REQUEST_TIMEOUT_SECONDS).json()
+    if "error" in data:
+        raise SystemExit(f"could not list ads of {adset_id}: {data['error'].get('message')}")
+    return data.get("data", [])
+
+
+def copy_ads(args):
+    """Copy the ads of one ad set into ANOTHER EXISTING ad set via
+    `POST /{ad_id}/copies` with `adset_id`, keeping each ad's creative. Copies
+    are created PAUSED.
+
+    `/copies` has no `validate_only`, so without `--execute` this only lists
+    what WOULD be copied (reads only). Ads in the source that are DELETED or
+    ARCHIVED are ignored, and ads whose name already exists in the destination
+    are skipped, so a re-run never duplicates. `--limit N` caps the number
+    copied per run (canary). Writes are spaced and rate-limit errors retried,
+    since Meta allows roughly one write every 30 seconds. Needs publish
+    permission on the Page/Instagram account behind each ad's creative."""
+    skip_status = {"DELETED", "ARCHIVED"}
+    src = [a for a in _list_ads(args.source_adset_id, "id,name,effective_status")
+           if a.get("effective_status") not in skip_status]
+    have = {a["name"] for a in _list_ads(args.dest_adset_id, "id,name")}
+    todo = [a for a in src if a["name"] not in have]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"source {args.source_adset_id}: {len(src)} ads | already in "
+          f"{args.dest_adset_id}: {sum(a['name'] in have for a in src)} | to copy: {len(todo)}")
+    for a in todo:
+        if not args.execute:
+            print(f"  would copy {a['id']}  {a['name']}")
+            continue
+        err = None
+        for _ in range(COPY_MAX_ATTEMPTS):
+            data = requests.post(f"{BASE}/{a['id']}/copies", data={
+                "adset_id": args.dest_adset_id, "status_option": "PAUSED",
+                "rename_options": json.dumps({"rename_strategy": "NO_RENAME"}),
+                "access_token": _token()}, timeout=REQUEST_TIMEOUT_SECONDS).json()
+            err = data.get("error")
+            if err and err.get("code") in RATE_LIMIT_CODES:
+                time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                continue
+            break
+        if err:
+            print(f"  FAILED {a['id']}  {a['name']}: {err.get('message')}")
+        else:
+            print(f"  COPIED {a['id']} -> {data.get('copied_ad_id') or data}  {a['name']}")
+        time.sleep(COPY_SPACING_SECONDS)
+    if not args.execute:
+        print("(dry run: nothing copied; pass --execute)")
 
 
 def to_minor_units(amount: float, offset: int) -> int:
@@ -268,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--go-live", action="store_true", help="create ACTIVE instead of PAUSED")
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=copy_adset)
+
+    p = sub.add_parser("copy-ads")
+    p.add_argument("--source-adset-id", required=True)
+    p.add_argument("--dest-adset-id", required=True)
+    p.add_argument("--limit", type=int, default=0, help="copy at most N ads this run (0 = all)")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=copy_ads)
 
     p = sub.add_parser("set-adset-budget")
     p.add_argument("--adset-id", required=True)
