@@ -57,8 +57,11 @@ import os
 import re
 import smtplib
 import time
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -238,7 +241,8 @@ def _smtp_config() -> tuple[str, int, str, str, str] | None:
 
 
 def send_email(subject: str, html_body: str, to: list[str],
-                plaintext_body: str | None = None, cc: list[str] | None = None) -> bool:
+                plaintext_body: str | None = None, cc: list[str] | None = None,
+                attachments: list | None = None) -> bool:
     """Send a fully custom HTML email over the SMTP mailbox configured in
     .env (SMTP_HOST/PORT/USER/PASSWORD/FROM). This is the one SMTP-sending
     path in this module -- `send(dest=...)`'s email target calls this too
@@ -264,7 +268,13 @@ def send_email(subject: str, html_body: str, to: list[str],
     is resaved. Sending a hand-built MIME message directly over SMTP avoids
     that rewrite entirely, and is also the only path that can run unattended
     from a non-interactive scheduled job (an interactive OAuth session
-    cannot)."""
+    cannot).
+
+    `attachments` is an optional list of file paths. When given, the message
+    becomes multipart/mixed: the text/html alternative part first, then each
+    file as a base64 application/octet-stream part named after the file. A
+    path that cannot be read raises before any SMTP connection is opened.
+    Without attachments the message shape is unchanged."""
     cfg = _smtp_config()
     if cfg is None:
         print("[notify] SMTP not configured in .env -- email not sent")
@@ -274,17 +284,29 @@ def send_email(subject: str, html_body: str, to: list[str],
         return False
     host, port, user, password, from_addr = cfg
 
-    msg = MIMEMultipart("alternative")
+    # Plain text first, HTML second -- a client renders the LAST alternative
+    # part it understands, and HTML is the one wanted when supported.
+    body_part = MIMEMultipart("alternative")
+    if plaintext_body:
+        body_part.attach(MIMEText(plaintext_body, "plain", "utf-8"))
+    body_part.attach(MIMEText(html_body, "html", "utf-8"))
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(body_part)
+        for att in attachments:
+            att = Path(att)
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(att.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=att.name)
+            msg.attach(part)
+    else:
+        msg = body_part
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = ", ".join(to)
     if cc:
         msg["Cc"] = ", ".join(cc)
-    # Plain text first, HTML second -- a client renders the LAST alternative
-    # part it understands, and HTML is the one wanted when supported.
-    if plaintext_body:
-        msg.attach(MIMEText(plaintext_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     recipients = list(to) + list(cc or [])
     body = msg.as_string()

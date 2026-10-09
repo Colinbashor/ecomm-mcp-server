@@ -209,6 +209,33 @@ class SendEmailFunctionTests(unittest.TestCase):
         self.assertIn("rich html", by_type["text/html"].get_payload(decode=True).decode())
 
     @patch("warehouse.notify.smtplib.SMTP")
+    def test_attachments_make_a_mixed_message(self, smtp_cls: Mock) -> None:
+        import tempfile
+        from pathlib import Path
+        server = Mock()
+        smtp_cls.return_value.__enter__.return_value = server
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "report.xlsx"
+            f.write_bytes(b"abc-binary")
+            ok = notify.send_email("Subj", "<p>hi</p>", ["a@example.com"],
+                                    plaintext_body="plain", attachments=[f])
+        self.assertTrue(ok)
+        parsed = message_from_string(server.sendmail.call_args.args[2])
+        self.assertEqual(parsed.get_content_type(), "multipart/mixed")
+        body, att = parsed.get_payload()
+        self.assertEqual(body.get_content_type(), "multipart/alternative")
+        self.assertEqual(att.get_filename(), "report.xlsx")
+        self.assertEqual(att.get_payload(decode=True), b"abc-binary")
+
+    @patch("warehouse.notify.smtplib.SMTP")
+    def test_no_attachments_stays_alternative(self, smtp_cls: Mock) -> None:
+        server = Mock()
+        smtp_cls.return_value.__enter__.return_value = server
+        notify.send_email("Subj", "<p>hi</p>", ["a@example.com"])
+        parsed = message_from_string(server.sendmail.call_args.args[2])
+        self.assertEqual(parsed.get_content_type(), "multipart/alternative")
+
+    @patch("warehouse.notify.smtplib.SMTP")
     def test_cc_recipients_get_the_message_and_the_header(self, smtp_cls: Mock) -> None:
         server = Mock()
         smtp_cls.return_value.__enter__.return_value = server
