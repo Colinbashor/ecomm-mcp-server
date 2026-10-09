@@ -22,6 +22,7 @@ requires brand registry.
 | `amazon_fees_sync.py` | standalone | SP-API fee reports: previews, storage, reimbursements, promotions, fulfilled shipments/MCF |
 | `amazon_economics_sync.py` | standalone | Data Kiosk SKU economics — actual fees + net proceeds, vs. the fee-preview estimate |
 | `amazon_traffic_sync.py` | standalone | per-ASIN Sales & Traffic: sessions, page views, Buy Box %, units/sales, weekly and monthly grain |
+| `amazon_event_pull.py` | standalone | Sales & Traffic for an arbitrary date window (a sale event inside the current week), stored apart from the weekly tables with its own coverage record |
 | `amazon_listing_quality_sync.py` | standalone | per-SKU content-quality issues (Listings Items API) — the same checks behind Seller Central's Listing Quality Dashboard |
 | `voc_import.py` | standalone, manual CSV | per-ASIN/SKU Voice of the Customer health |
 
@@ -73,6 +74,7 @@ python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --w
 python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
 python amazon_traffic_sync.py --repair               # re-pull only weeks recorded incomplete
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
+python amazon_event_pull.py --event-id spring_sale --name "Spring Sale" --start 2026-03-10 --end 2026-03-11
 python amazon_listing_quality_sync.py --skus SKU1,SKU2
 python amazon_listing_quality_sync.py --skus-file skus.txt
 python amazon_listing_quality_sync.py --skus-file skus.txt --limit 100   # smoke test: first 100 SKUs only
