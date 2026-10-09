@@ -97,6 +97,9 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 - `amazon_economics`
 - `amazon_traffic_weekly`, `amazon_traffic_monthly`, `amazon_traffic_daily`,
   `amazon_traffic_monthly_account`, `amazon_traffic_coverage`
+- `amazon_event_asin`, `amazon_event_pull`, `dim_event_calendar` — written by
+  `amazon_event_pull.py` (see [Event window pulls](#event-window-pulls)).
+  `amazon_traffic_daily` is also written by it.
 - `amazon_listing_quality` — one row per seller SKU (PK `seller_sku`): `asin`,
   `item_name`, `product_type`, `is_discoverable` / `is_buyable` (0/1, from
   the listing summary's status), `issue_count` and `max_severity`
@@ -234,10 +237,64 @@ separate API or report exposes it) — plus `item_type_keyword` (Amazon's own
 category classifier), at no extra API cost. A NULL here means the field is
 genuinely empty on that listing, a real content gap worth surfacing.
 
+### Event window pulls
+
+`amazon_traffic_sync.py` only pulls whole Mon–Sun weeks, so a sale event that
+falls inside the **current** week is invisible until the week closes.
+`amazon_event_pull.py` pulls an arbitrary `--start`/`--end` window directly
+and stores it **apart from the weekly tables** (and their coverage table), so
+a partial week can never be mistaken for a finished one. It reuses
+`amazon_traffic_sync`'s report request/poll/download helpers and `coverage()`
+validation, so it needs the same SP-API credentials (`SPAPI_CLIENT_ID`,
+`SPAPI_CLIENT_SECRET`, `SPAPI_REFRESH_TOKEN`, optional `SPAPI_REGION`) and
+Sales & Traffic report access.
+
+```bash
+python amazon_event_pull.py --event-id spring_sale_2026 --name "Spring Sale"     --start 2026-03-10 --end 2026-03-11
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--event-id` | required | Stable key; re-running with the same id **replaces** that event's rows |
+| `--name` | required | Human label stored in `dim_event_calendar.event_name` |
+| `--start` / `--end` | required | Inclusive `YYYY-MM-DD` window |
+| `--channel` | `amazon` | Stored in `dim_event_calendar.channel` |
+| `--pad-days` | `1` | Extra pre-event days of account-daily totals stored as a baseline |
+| `--notes` | empty | Free text for `dim_event_calendar.notes` (defaults to the completeness note) |
+
+Two reports are requested concurrently: the event window alone (per-ASIN
+totals aggregate the whole requested range, so they must never include the
+baseline pad) and, when `--pad-days` > 0, a padded window used only for the
+daily rows.
+
+Tables written (all in one transaction):
+
+- `amazon_event_asin` — PK (`event_id`, `asin`): `parent_asin`, `sessions`,
+  `page_views`, `buy_box_pct`, `units_ordered`, `ordered_sales`, `range_start`,
+  `range_end`, `synced_at`. Totals over the event window only.
+- `amazon_traffic_daily` — account daily totals for `[start − pad, end]`, the
+  same rows the weekly pull writes (the next weekly pull overwrites them
+  identically).
+- `amazon_event_pull` — what was **asked** and what Amazon **returned**:
+  `days_expected`, `days_returned`, `missing_days`, `bydate_sales`,
+  `byasin_sales`, `sections_gap`, `is_complete` (0/1), `note`. As with the
+  weekly coverage table, recorded intent — not absence of rows — is the
+  completeness marker.
+- `dim_event_calendar` — one row per event (`event_type='platform'`,
+  `mechanic='deal'`) so event windows can be joined to any channel's data.
+
+Completeness and exit codes: the same two checks as the weekly pull apply
+(every day present; byDate vs byAsin sales within 2%). A complete pull logs
+`ok` and exits `0`; a short pull logs `degraded` (sync log platform
+`amazon_event`) and exits `1`. Amazon publishes the latest day late, so a pull
+made while the event is still current is often short and the final day may
+restate upward — re-run until `is_complete = 1`. The weekly pull after the
+week closes is authoritative.
+
 ## Tests
 
 `tests/test_amazon_inventory_sync.py`, `tests/test_amazon_awd_sync.py`,
 `tests/test_amazon_awd.py`, `tests/test_amazon_returns_sync.py`,
 `tests/test_amazon_rank_sync.py`, `tests/test_amazon_fees_sync.py`,
-`tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`,
+`tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`, `tests/test_amazon_event_pull.py`,
 `tests/test_amazon_listing_quality_sync.py`, `tests/test_voc_import.py`

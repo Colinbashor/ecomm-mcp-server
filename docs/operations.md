@@ -85,6 +85,7 @@ ok = notify.send_email(
     to=["team@example.com"],
     plaintext_body="Weekly Top Sellers (see HTML version)",  # optional
     cc=["manager@example.com"],                              # optional
+    attachments=["reports/top_sellers.csv"],                 # optional file paths
 )
 if not ok:
     ...  # the email is usually the only copy of this report — handle the failure
@@ -92,6 +93,16 @@ if not ok:
 
 The message is `multipart/alternative` (plain text first if given, then the
 HTML, both UTF-8); `cc` addresses get a `Cc:` header and receive the message.
+
+**Attachments.** `attachments` is an optional list of file paths (str or
+`Path`). When given, the message becomes `multipart/mixed`: the
+text/html alternative part first, then each file as a base64
+`application/octet-stream` part whose filename is the file's basename. Every
+file is read before any SMTP connection is opened, so an unreadable or
+missing path **raises** (`OSError`) rather than returning `False`. No MIME
+type guessing or size limit is applied — keep attachments within your SMTP
+provider's message-size cap (about 25 MB for Gmail). Without `attachments`
+the message shape is unchanged.
 
 Unlike `send()`, a missing SMTP config (`SMTP_USER` or `SMTP_PASSWORD`
 unset), an empty `to` list, or an exhausted retry loop is **not** swallowed —
