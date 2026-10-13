@@ -42,6 +42,11 @@ ENV_PATH = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
 # TikTok business codes that mean "your access token is no longer valid"
 TOKEN_EXPIRED_CODES = {105001, 105002}
 
+# Business codes (returned inside an HTTP 200) that mean "TikTok's side hiccuped,
+# try again" -- not a problem with the request. Retried with backoff.
+TRANSIENT_CODES = {98001021, 36009003}
+MAX_TRANSIENT_RETRIES = 5
+
 
 def _sign(path: str, params: dict, body: str, secret: str) -> str:
     ordered = "".join(f"{k}{params[k]}" for k in sorted(params) if k not in ("sign", "access_token"))
@@ -83,11 +88,20 @@ def _refresh_access_token() -> str:
 
 
 def _fetch_page(shop_cipher: str, path: str, body: str, page_token: str) -> dict:
-    """One signed request. Refreshes the token once if it's expired, then retries."""
+    """One signed request.
+
+    Two independent retry budgets: the token is refreshed at most once, and
+    transient upstream faults (TRANSIENT_CODES, connection resets, timeouts,
+    non-JSON bodies) are retried up to MAX_TRANSIENT_RETRIES times with a
+    growing backoff. Every pass rebuilds and re-signs the request so the
+    timestamp is fresh. Anything else non-zero raises immediately.
+    """
     app_key = os.environ["TIKTOK_APP_KEY"]
     secret = os.environ["TIKTOK_APP_SECRET"]
 
-    for attempt in (1, 2):  # attempt 2 only happens after a token refresh
+    refreshed = False
+    transient = 0
+    while True:
         access_token = os.environ["TIKTOK_ACCESS_TOKEN"]
         params = {
             "app_key": app_key,
@@ -99,28 +113,34 @@ def _fetch_page(shop_cipher: str, path: str, body: str, page_token: str) -> dict
             params["page_token"] = page_token
         params["sign"] = _sign(path, params, body, secret)
 
-        resp = requests.post(
-            f"{BASE}{path}",
-            params=params,
-            data=body,
-            headers={"Content-Type": "application/json", "x-tts-access-token": access_token},
-            timeout=60,
-        )
         try:
+            resp = requests.post(
+                f"{BASE}{path}",
+                params=params,
+                data=body,
+                headers={"Content-Type": "application/json", "x-tts-access-token": access_token},
+                timeout=60,
+            )
             payload = resp.json()
-        except Exception:
-            resp.raise_for_status()
-            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ValueError):
+            if transient >= MAX_TRANSIENT_RETRIES:
+                raise
+            transient += 1
+            time.sleep(min(15 * transient, 60))
+            continue
 
         code = payload.get("code")
-        if code in TOKEN_EXPIRED_CODES and attempt == 1:
+        if code in TOKEN_EXPIRED_CODES and not refreshed:
             _refresh_access_token()
+            refreshed = True
             continue  # retry the same page with the new token
+        if code in TRANSIENT_CODES and transient < MAX_TRANSIENT_RETRIES:
+            transient += 1
+            time.sleep(min(15 * transient, 60))
+            continue
         if code not in (0, None):
             raise RuntimeError(f"TikTok API error {code}: {payload.get('message')}")
         return payload.get("data", {}) or {}
-
-    raise RuntimeError("TikTok request failed even after refreshing the access token.")
 
 
 def sync(start_date: str, end_date: str) -> list[dict]:
