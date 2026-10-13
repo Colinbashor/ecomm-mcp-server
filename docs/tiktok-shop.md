@@ -84,6 +84,15 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit
 
 `tiktok_videos_sync.py` retries each page up to 6 times: it refreshes an expired access token once, and backs off exponentially (1, 2, 4, 8, 16s) on connection resets, timeouts, non-JSON bodies, HTTP 429/5xx and API codes 105050 / 105051 / 429000. A month of videos is hundreds of pages, so without this one transient failure would abort the whole pull; any other non-zero API code still fails immediately.
 
+The orders connector (`warehouse/connectors/tiktok_shop.py`, driven by
+`run_sync.py`) keeps two independent retry budgets per page request: the access
+token is refreshed at most once (codes 105001 / 105002), and transient upstream
+faults are retried up to 5 times with a growing sleep (15s, 30s, 45s, 60s, 60s).
+Transient means business codes 98001021 / 36009003 (returned inside an HTTP 200),
+connection resets, timeouts and non-JSON bodies. Every attempt rebuilds and
+re-signs the request so the timestamp is fresh. Any other non-zero code raises
+immediately, so a bad request is never masked as a hiccup.
+
 ## Tables
 
 - `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
