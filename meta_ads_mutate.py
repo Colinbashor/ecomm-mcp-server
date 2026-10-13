@@ -74,6 +74,18 @@ USAGE
   python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455
   python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455 \
       --limit 1 --execute        # canary: copy a single ad first
+
+  # create a product-page-visitors website audience (URL contains a keyword,
+  # last 180 days, your pixel). Needs META_PIXEL_ID. Idempotent by name.
+  python meta_ads_mutate.py create-pdp-audience --name "Blue Jacket PDP Visitors" \
+      --url-keyword blue-jacket
+  python meta_ads_mutate.py create-pdp-audience --name "Blue Jacket PDP Visitors" \
+      --url-keyword blue-jacket --execute
+
+`create-pdp-audience` is a pure audience definition: it delivers nothing and
+spends nothing until an ad set targets it. `/customaudiences` has no
+validate_only, so without --execute it only prints what it would create, and an
+audience whose name already exists is never created twice.
 """
 from __future__ import annotations
 
@@ -250,6 +262,39 @@ def to_minor_units(amount: float, offset: int) -> int:
     return int(round(amount * offset))
 
 
+def create_pdp_audience(args):
+    """Create a product-page-visitors website custom audience: URL contains
+    `--url-keyword`, 180-day retention, the pixel in META_PIXEL_ID. Dry run by
+    default; an audience with the same name is reported as EXISTS, never duplicated."""
+    pixel_id = os.environ.get("META_PIXEL_ID")
+    if not pixel_id:
+        raise SystemExit("META_PIXEL_ID is not set in .env")
+    account = os.environ["META_AD_ACCOUNT_ID"]
+    account = account if account.startswith("act_") else "act_" + account
+    ex = requests.get(f"{BASE}/{account}/customaudiences", params={
+        "fields": "id,name", "limit": 500, "access_token": _token()}).json()
+    if "error" in ex:
+        raise SystemExit(f"could not list audiences: {ex['error'].get('message')}")
+    for a in ex.get("data", []):
+        if a["name"] == args.name:
+            print(f"EXISTS {a['id']}  {args.name}")
+            return
+    rule = {"inclusions": {"operator": "or", "rules": [{
+        "event_sources": [{"type": "pixel", "id": pixel_id}], "retention_seconds": 180 * 86400,
+        "filter": {"operator": "and", "filters": [
+            {"operator": "or", "filters": [{"field": "url", "operator": "i_contains", "value": args.url_keyword}]},
+            {"field": "url", "operator": "i_contains", "value": ""}]},
+        "template": "VISITORS_BY_URL"}]}}
+    print(f"  create audience {args.name!r}: visited a URL containing {args.url_keyword!r}, 180d")
+    if not args.execute:
+        print("(dry run: nothing created; pass --execute)")
+        return
+    d = requests.post(f"{BASE}/{account}/customaudiences", data={
+        "name": args.name, "pixel_id": pixel_id, "retention_days": 180, "rule": json.dumps(rule),
+        "prefill": "true", "access_token": _token()}).json()
+    print("EXECUTED" if "id" in d else "FAILED", json.dumps(d)[:300])
+
+
 def set_adset_budget(args):
     """Set an ad set's `daily_budget`. `--daily-amount` is in MAJOR units of
     the account currency (e.g. dollars); it is converted with
@@ -351,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=0, help="copy at most N ads this run (0 = all)")
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=copy_ads)
+
+    p = sub.add_parser("create-pdp-audience")
+    p.add_argument("--name", required=True)
+    p.add_argument("--url-keyword", required=True, help="product handle that appears in the page URL")
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=create_pdp_audience)
 
     p = sub.add_parser("set-adset-budget")
     p.add_argument("--adset-id", required=True)
