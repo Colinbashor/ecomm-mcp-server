@@ -120,8 +120,35 @@ def _parse_summary(s: dict, snapshot_date: str, stamp: str) -> dict:
     }
 
 
+class _TokenExpired(RuntimeError):
+    """Amazon rejected a nextToken (expired or already consumed) mid-pagination."""
+
+
+MAX_RESTARTS = 3
+
+
 def fetch_inventory() -> list[dict]:
-    """Pull every FBA inventory summary for the configured marketplace."""
+    """Pull every FBA inventory summary for the configured marketplace.
+
+    A paged crawl cannot resume from a dead nextToken (a retry after a
+    connection reset can reuse one Amazon already consumed). The snapshot is one
+    row per (date, sku) and is only written after the crawl completes, so
+    restarting from page 1 is safe: partial rows are discarded and the crawl
+    starts over, at most MAX_RESTARTS times, so a genuine fault still fails loudly.
+    """
+    for attempt in range(MAX_RESTARTS + 1):
+        try:
+            return _fetch_inventory_once()
+        except _TokenExpired as e:
+            if attempt == MAX_RESTARTS:
+                raise RuntimeError(f"{e} (after {MAX_RESTARTS} restarts)") from e
+            print(f"nextToken expired; restarting crawl ({attempt + 1}/{MAX_RESTARTS})")
+            time.sleep(30)
+    raise AssertionError("unreachable")
+
+
+def _fetch_inventory_once() -> list[dict]:
+    """One full crawl of the FBA inventory summaries (see fetch_inventory)."""
     host = HOSTS[os.environ.get("SPAPI_REGION", "NA").upper()]
     mkt = os.environ["SPAPI_MARKETPLACE_ID"]
     snapshot_date = date.today().isoformat()
@@ -149,6 +176,8 @@ def fetch_inventory() -> list[dict]:
             if resp.status_code == 429:
                 time.sleep(float(resp.headers.get("Retry-After", 5)))
                 continue
+            if resp.status_code == 400 and "nextToken" in params and "Next token" in resp.text:
+                raise _TokenExpired(f"FBA inventory 400: {resp.text[:200]}")
             if resp.status_code != 200:
                 raise RuntimeError(f"FBA inventory {resp.status_code}: {resp.text[:200]}")
             break

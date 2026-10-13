@@ -137,6 +137,43 @@ class FetchInventoryTests(unittest.TestCase):
                 inv.fetch_inventory()
         self.assertIn("500", str(cm.exception))
 
+    def test_expired_next_token_restarts_crawl_from_page_one(self) -> None:
+        page1 = _FakeResp(200, {
+            "payload": {"inventorySummaries": [{"sellerSku": "A", "totalQuantity": 1}]},
+            "pagination": {"nextToken": "dead"},
+        })
+        expired = _FakeResp(400, {}, {}, text="Next token is invalid or expired")
+        ok = _FakeResp(200, {"payload": {"inventorySummaries": [{"sellerSku": "B", "totalQuantity": 2}]}})
+        with patch.object(inv, "requests") as fake_requests, patch.object(inv.time, "sleep"):
+            fake_requests.get.side_effect = [page1, expired, ok]
+            fake_requests.exceptions = __import__("requests").exceptions
+            rows = inv.fetch_inventory()
+        # partial rows from the aborted crawl are discarded
+        self.assertEqual({r["sku"] for r in rows}, {"B"})
+
+    def test_expired_next_token_is_bounded(self) -> None:
+        page1 = _FakeResp(200, {
+            "payload": {"inventorySummaries": []},
+            "pagination": {"nextToken": "dead"},
+        })
+        expired = _FakeResp(400, {}, {}, text="Next token is invalid or expired")
+        with patch.object(inv, "requests") as fake_requests, patch.object(inv.time, "sleep"):
+            fake_requests.get.side_effect = [page1, expired] * (inv.MAX_RESTARTS + 1)
+            fake_requests.exceptions = __import__("requests").exceptions
+            with self.assertRaises(RuntimeError) as cm:
+                inv.fetch_inventory()
+        self.assertIn("restarts", str(cm.exception))
+
+    def test_other_400_still_fails_fast(self) -> None:
+        bad = _FakeResp(400, {}, {}, text="InvalidInput")
+        with patch.object(inv, "requests") as fake_requests, patch.object(inv.time, "sleep"):
+            fake_requests.get.return_value = bad
+            fake_requests.exceptions = __import__("requests").exceptions
+            with self.assertRaises(RuntimeError) as cm:
+                inv.fetch_inventory()
+        self.assertIn("400", str(cm.exception))
+        self.assertEqual(fake_requests.get.call_count, 1)
+
 
 class WriteRowsTests(unittest.TestCase):
     def test_write_and_overwrite_same_key(self) -> None:
