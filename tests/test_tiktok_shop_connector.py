@@ -105,5 +105,61 @@ class UpsertOrdersDiscountColumnsTests(unittest.TestCase):
         self.assertTrue({"seller_discount", "platform_discount"} <= cols)
 
 
+class FetchPageRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        env = patch.dict(os.environ, {"TIKTOK_APP_KEY": "k", "TIKTOK_APP_SECRET": "s",
+                                      "TIKTOK_ACCESS_TOKEN": "t"})
+        env.start()
+        self.addCleanup(env.stop)
+        sleep = patch.object(tiktok_shop.time, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    @staticmethod
+    def _resp(payload):
+        class R:
+            def json(self):
+                return payload
+        return R()
+
+    def _run(self, responses):
+        with patch.object(tiktok_shop.requests, "post", side_effect=responses) as post:
+            out = tiktok_shop._fetch_page("c", "/p", "{}", "")
+        return out, post
+
+    def test_transient_code_retries_then_succeeds(self) -> None:
+        bad = self._resp({"code": 98001021, "message": "downstream"})
+        ok = self._resp({"code": 0, "data": {"orders": []}})
+        out, post = self._run([bad, bad, ok])
+        self.assertEqual(out, {"orders": []})
+        self.assertEqual(post.call_count, 3)
+
+    def test_connection_error_retries(self) -> None:
+        ok = self._resp({"code": 0, "data": {"x": 1}})
+        out, _ = self._run([tiktok_shop.requests.exceptions.ConnectionError("reset"), ok])
+        self.assertEqual(out, {"x": 1})
+
+    def test_transient_budget_exhausts_and_raises(self) -> None:
+        bad = self._resp({"code": 36009003, "message": "try again"})
+        with patch.object(tiktok_shop.requests, "post", return_value=bad) as post:
+            with self.assertRaises(RuntimeError):
+                tiktok_shop._fetch_page("c", "/p", "{}", "")
+        self.assertEqual(post.call_count, tiktok_shop.MAX_TRANSIENT_RETRIES + 1)
+
+    def test_non_transient_error_fails_fast(self) -> None:
+        bad = self._resp({"code": 12345, "message": "nope"})
+        with patch.object(tiktok_shop.requests, "post", return_value=bad) as post:
+            with self.assertRaises(RuntimeError):
+                tiktok_shop._fetch_page("c", "/p", "{}", "")
+        self.assertEqual(post.call_count, 1)
+
+    def test_token_refreshed_once(self) -> None:
+        expired = self._resp({"code": 105002, "message": "expired"})
+        ok = self._resp({"code": 0, "data": {}})
+        with patch.object(tiktok_shop, "_refresh_access_token") as refresh:
+            self._run([expired, ok])
+        refresh.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
