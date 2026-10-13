@@ -16,6 +16,7 @@ Fill in `.env` (both variables are listed in `.env.example`):
 |---|---|
 | `META_ACCESS_TOKEN` | a long-lived system-user token. This is the only variable `run_sync.py` checks before attempting `meta` — if it is empty, `meta` is printed as `SKIPPED (no credentials in .env)`. |
 | `META_AD_ACCOUNT_ID` | looks like `act_1234567890` (include the `act_` prefix — it is used verbatim in the URL path). Not pre-checked: if the token is set but this is missing, the run fails with a `KeyError` and is logged as an error. |
+| `META_PIXEL_ID` | optional; only `meta_ads_mutate.py create-pdp-audience` needs it (the site pixel the audience is built from). |
 
 Optional, shared with every script: `WAREHOUSE_DB` overrides the SQLite path
 (default `warehouse.db` in the repo root).
@@ -307,6 +308,7 @@ same pinned Graph API version as the core connector; it writes nothing to
 | `pause-ad` / `resume-ad --ad-id ID` | set ad `status` |
 | `set-adset-budget --adset-id ID --daily-amount N [--currency-offset 100]` | set `daily_budget`, converting major → minor currency units |
 | `copy-adset --adset-id ID --dest-campaign-id ID [--go-live] --execute` | deep-copy an ad set and its ads into another campaign |
+| `create-pdp-audience --name NAME --url-keyword HANDLE [--execute]` | create a product-page-visitors website audience (URL contains the keyword, 180 days, pixel from `META_PIXEL_ID`); idempotent by name, dry run by default |
 | `copy-ads --source-adset-id ID --dest-adset-id ID [--limit N] [--execute]` | copy the ads of one ad set into another **existing** ad set, created `PAUSED`; the dry run only lists |
 
 ### Safety model

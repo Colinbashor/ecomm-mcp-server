@@ -173,6 +173,56 @@ class CopyAdsTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
 
 
+class PdpAudienceTests(unittest.TestCase):
+    def setUp(self):
+        env = mock.patch.dict("os.environ", {
+            "META_ACCESS_TOKEN": "t", "META_AD_ACCOUNT_ID": "123", "META_PIXEL_ID": "999"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _args(self, execute=False):
+        return mam.build_parser().parse_args(
+            ["create-pdp-audience", "--name", "X PDP Visitors", "--url-keyword", "x-handle"]
+            + (["--execute"] if execute else []))
+
+    def _listing(self, data):
+        r = mock.Mock()
+        r.json.return_value = {"data": data}
+        return r
+
+    def test_dry_run_posts_nothing(self):
+        with mock.patch.object(mam.requests, "get", return_value=self._listing([])), \
+                mock.patch.object(mam.requests, "post") as post:
+            args = self._args()
+            args.func(args)
+        post.assert_not_called()
+
+    def test_existing_name_is_not_recreated(self):
+        with mock.patch.object(mam.requests, "get",
+                               return_value=self._listing([{"id": "7", "name": "X PDP Visitors"}])), \
+                mock.patch.object(mam.requests, "post") as post:
+            args = self._args(execute=True)
+            args.func(args)
+        post.assert_not_called()
+
+    def test_execute_posts_rule_with_pixel(self):
+        created = mock.Mock()
+        created.json.return_value = {"id": "55"}
+        with mock.patch.object(mam.requests, "get", return_value=self._listing([])), \
+                mock.patch.object(mam.requests, "post", return_value=created) as post:
+            args = self._args(execute=True)
+            args.func(args)
+        data = post.call_args.kwargs["data"]
+        self.assertEqual(data["pixel_id"], "999")
+        self.assertIn("x-handle", data["rule"])
+
+    def test_missing_pixel_env_exits(self):
+        with mock.patch.dict("os.environ", {"META_PIXEL_ID": ""}):
+            args = self._args()
+            with self.assertRaises(SystemExit):
+                args.func(args)
+
+
 class RenameTests(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict("os.environ", {"META_ACCESS_TOKEN": "test-token"})
