@@ -133,6 +133,15 @@ BY seller_sku` can double-count. Check the module docstring in
 `amazon_inventory_sync.py` before writing aggregate queries against this
 table.
 
+`amazon_inventory_sync.py` pages through the Inventory API with `nextToken`.
+A dead token (expired, or already consumed by a request that was retried after
+a connection reset) returns HTTP 400 "Next token ..."; a crawl cannot resume
+from it, so the sync discards the partial rows and restarts from page 1, up to 3
+restarts with a 30s pause. This is safe because the snapshot (one row per date
+and SKU) is only written after a crawl completes. If all restarts fail it raises
+rather than writing a partial snapshot. HTTP 429 is handled separately by
+honoring `Retry-After`.
+
 `amazon_awd_inventory` (Amazon Warehousing & Distribution — a bulk-storage
 tier upstream of FBA, only relevant if you use it) is invisible to the FBA
 Inventory API entirely, so it's a genuinely separate stock pool, not a
