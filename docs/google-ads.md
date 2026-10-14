@@ -12,7 +12,7 @@ current-state campaign/asset/conversion-action configuration.
 | `warehouse/connectors/google_ads.py` | core, via `run_sync.py --only google` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `google_ads_detail_sync.py` | standalone | search terms, keywords + Quality Score, paid-vs-organic overlap, conversion-action attribution, device split, Shopping/PMax product demand, PMax search themes |
 | `google_ads_structure_sync.py` | standalone | current-state snapshots: campaigns, asset groups + assets, listing-group filters, conversion-action setup |
-| `google_ads_mutate.py` | standalone, **write-capable** | pause or remove a campaign, remove an ad group, change bidding strategy, a TARGET_ROAS campaign's target, or TIS bid ceiling, demote a conversion action to secondary, append a `final_url_suffix` (UTMs) to campaigns, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
+| `google_ads_mutate.py` | standalone, **write-capable** | pause or remove a campaign, remove an ad group, change bidding strategy, a TARGET_ROAS campaign's target, or TIS bid ceiling, demote a conversion action to secondary, append a `final_url_suffix` (UTMs) to campaigns, restrict a Shopping campaign to one feed label, edit a Performance Max *or* standard Shopping listing-group filter tree, add/remove keywords, add/remove/flip `user_list` audience criteria on a campaign, edit an Audience's segment membership, end a Campaign Experiment, build a new search campaign from scratch (budget → campaign → ad group → keywords), clone a Performance Max campaign into a new paused one scoped to one custom-label segment, copy an RSA between ad groups, set campaign geo/language targeting, manage campaign-level negative keywords and shared negative-keyword/brand-exclusion sets, enable a campaign, set per-keyword final URLs, update a shared budget |
 
 The structure connector in particular is aimed at "this campaign looks funded
 but isn't serving" — a question spend/impression metrics alone usually can't
@@ -128,6 +128,11 @@ python google_ads_mutate.py add-keywords --ad-group-id 100000000004 --file keywo
     --match-type EXACT --execute
 python google_ads_mutate.py enable-campaign --campaign-id 10000000002 --execute   # the deliberate go-live step
 
+# clone a PMax campaign into a new PAUSED one that serves only one custom-label
+# segment, with its own budget + tROAS — ONE atomic mutate (see the prose below)
+python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers"     --source-campaign-id 1234567890 --daily-budget 500 --target-roas 4.0     --dimension custom_label_4 --include "Fast"
+python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers"     --source-campaign-id 1234567890 --source-asset-group-id 9876543210     --daily-budget 500 --target-roas 4.0 --dimension custom_label_4     --include "Fast" --include "Steady" --execute
+
 # copy an existing ENABLED responsive search ad into a new ad group
 python google_ads_mutate.py copy-rsa --source-ad-group-id 100000000004 \
     --target-ad-group-id 118472772999 --execute
@@ -153,7 +158,8 @@ python google_ads_mutate.py update-target-roas --campaign-id 10000000002 --targe
 python google_ads_mutate.py set-conversion-action-secondary --conversion-action-id 123456789 --execute
 
 # append UTMs to several campaigns' landing URLs in ONE atomic request
-python google_ads_mutate.py set-final-url-suffix --campaign-id 10000000002 --campaign-id 10000000003 \n    --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}" --execute
+python google_ads_mutate.py set-final-url-suffix --campaign-id 10000000002 --campaign-id 10000000003 \
+    --suffix "utm_source=google&utm_medium=cpc&utm_campaign={campaignid}" --execute
 
 # documented dead end — Google rejects an empty template (TOO_SHORT); see the prose below
 python google_ads_mutate.py clear-campaign-tracking-template --campaign-id 10000000002
@@ -172,6 +178,26 @@ ad group) is both a safety interlock and honest about who owns ad content.
 `set-campaign-geo`/`set-campaign-language` exist because an unset geo or
 language target means "target literally everywhere / every language," not
 "inherit a sensible default." Run both before `enable-campaign`.
+`create-pmax-campaign` is the Performance Max counterpart, built the
+opposite way: PMax will not accept a campaign without its budget and asset
+group in the same request, so every resource goes into ONE
+`GoogleAdsService.mutate` with temporary ids, and the validate-only dry run
+checks the whole build atomically. It clones a running PMax campaign (Merchant
+Center link and feed label, URL suffix / tracking template, asset automation
+settings, brand-guidelines assets, LOCATION / LANGUAGE / BRAND_LIST criteria,
+enabled negative-keyword shared sets, and one asset group's URLs, asset links
+and audience / search-theme signals) and changes only the name, the
+non-shared daily budget, the tROAS (`maximize_conversion_value.target_roas`)
+and the listing tree, which becomes a SUBDIVISION on `--dimension` with one
+`UNIT_INCLUDED` leaf per `--include` value and an index-only `UNIT_EXCLUDED`
+"everything else" leaf. Asset links are re-linked by id, not copied, and only
+`ADVERTISER`-source links are taken: Google rejects automatically created
+assets on create and regenerates its own. The source must have exactly one
+enabled asset group, or you pass `--source-asset-group-id`. The new campaign
+is always created **paused**; use `enable-campaign` to go live. A common use
+is splitting a segment your feed already labels (sell-through pace, margin
+tier, season) into its own campaign so it can get a different budget and
+return target from the rest of the catalog.
 `copy-rsa` copies the first `ENABLED` responsive search ad it finds in the
 source ad group (one ad only), and the copy is created `ENABLED`. It won't
 serve until the campaign itself is enabled. `add-keywords`' `--match-type` defaults to `BROAD`
@@ -403,6 +429,13 @@ proto3 default (`set-conversion-action-secondary`,
 `update-target-roas` append their mask paths explicitly rather than relying
 on the auto field-mask helper, and that `set-final-url-suffix` sends every
 campaign in one request.
+
+`CreatePmaxCampaignTests` drives `create-pmax-campaign` against a mocked
+client with canned GAQL rows. It pins the single validate-only mutate, the
+operation order (budget → campaign → criteria → brand assets → shared sets →
+asset group → asset links → signals → listing tree), the PAUSED status and
+non-shared budget, the `ADVERTISER`-only asset filters, the include /
+everything-else leaves, and the exits on a non-PMax or ambiguous source.
 
 `tests/test_google_ads_detail_sync.py` pins the `LAGGING_GRAINS` floors:
 `google_paid_organic` widens a one-day run back 10 days, the
