@@ -310,6 +310,8 @@ same pinned Graph API version as the core connector; it writes nothing to
 | `copy-adset --adset-id ID --dest-campaign-id ID [--go-live] --execute` | deep-copy an ad set and its ads into another campaign |
 | `create-pdp-audience --name NAME --url-keyword HANDLE [--execute]` | create a product-page-visitors website audience (URL contains the keyword, 180 days, pixel from `META_PIXEL_ID`); idempotent by name, dry run by default |
 | `copy-ads --source-adset-id ID --dest-adset-id ID [--limit N] [--execute]` | copy the ads of one ad set into another **existing** ad set, created `PAUSED`; the dry run only lists |
+| `rename --object-id ID --name NAME [--execute]` | rename one campaign / ad set / ad (validate-only by default) |
+| `rename-from-csv --csv PLAN.csv [--delay 2] [--execute]` | apply a rename plan, skipping rows whose live name drifted (see [Usage](#usage)) |
 
 ### Safety model
 
@@ -336,6 +338,17 @@ same pinned Graph API version as the core connector; it writes nothing to
   write per 30 seconds. Execution needs publish permission on the Page /
   Instagram account behind each ad's creative; a failed list call aborts
   rather than being read as "no ads".
+- `create-pdp-audience` has no server-side validation either; its dry run
+  makes one read-only call (it lists the account's custom audiences) and
+  posts nothing. If an audience with exactly `--name` already exists it
+  prints `EXISTS <id>` and stops, so re-runs never create duplicates. With
+  `--execute` it creates a pixel-based website audience (template
+  `VISITORS_BY_URL`): anyone who visited a URL containing `--url-keyword`
+  (case-insensitive — pass the product handle, e.g. `ruffle-mini-dress`) in
+  the last 180 days, prefilled from existing pixel history. It prints
+  `EXECUTED` or `FAILED` with Meta's response; a failed create does **not**
+  exit non-zero, so check the output in scripts. It exits early if
+  `META_PIXEL_ID` is unset or the audience list call errors.
 - Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
   with Meta's message, type, code and subcode.
 
@@ -349,7 +362,10 @@ same pinned Graph API version as the core connector; it writes nothing to
    `ads_management` but a read-level role fails every write, validate-only
    ones included. Fix the role, not the scope.
 
-No new environment variables: it reuses `META_ACCESS_TOKEN`.
+Environment: every subcommand reuses `META_ACCESS_TOKEN`.
+`create-pdp-audience` additionally reads `META_AD_ACCOUNT_ID` (the `act_`
+prefix is optional) and `META_PIXEL_ID` (the site pixel the audience is
+built from); nothing else needs them.
 
 ### Usage
 
@@ -362,6 +378,8 @@ python meta_ads_mutate.py set-adset-budget --adset-id 1234567890 --daily-amount 
 python meta_ads_mutate.py copy-adset --adset-id 1234567890 --dest-campaign-id 9876543210 --execute
 python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455            # lists only
 python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455 --limit 1 --execute
+python meta_ads_mutate.py create-pdp-audience --name "PDP - Ruffle Mini Dress" --url-keyword ruffle-mini-dress            # dry run
+python meta_ads_mutate.py create-pdp-audience --name "PDP - Ruffle Mini Dress" --url-keyword ruffle-mini-dress --execute
 python meta_ads_mutate.py rename --object-id 1234567890 --name "New name"   # dry run; add --execute
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv             # dry run of the whole plan
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv --execute --delay 2
@@ -398,3 +416,8 @@ status subcommand defaults to `validate_only`, `--execute` drops it,
 minor-unit conversion (including a zero-decimal offset), and non-zero exit on
 an API error (including an error body on HTTP 200), `rename` validate-only,
 `rename-from-csv` skipping a drifted live name, and the rate-limit retry.
+`CopyAdsTests` cover the read-only dry run, `PAUSED` copies that skip
+deleted/already-present ads, `--limit`, aborting on a list error and the
+rate-limit retry. `PdpAudienceTests` cover the post-free dry run, an existing
+name not being recreated, the executed rule carrying the pixel id, and the
+exit when `META_PIXEL_ID` is missing.
