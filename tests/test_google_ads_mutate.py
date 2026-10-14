@@ -380,5 +380,183 @@ class ExplicitMaskPathTests(unittest.TestCase):
             self.assertFalse(m.call_args.args[5], func.__name__)
 
 
+class CreatePmaxCampaignTests(unittest.TestCase):
+    """create_pmax_campaign reads a source campaign via GAQL and builds ONE
+    atomic GoogleAdsService.mutate. A plain Mock client stands in for the SDK:
+    `client.enums.X.Y` returns a stable Mock attribute (so enum identities can
+    be compared) and `client.get_type(...)` returns a fresh Mock per call (so
+    each MutateOperation's `.create` message can be inspected afterwards)."""
+
+    def _client(self, *, channel="PMAX", ag_count=1, brand_guidelines=True,
+                ag_assets=2, signals=("audience", "theme")):
+        client = mock.Mock()
+        enums = client.enums
+        pmax = enums.AdvertisingChannelTypeEnum.PERFORMANCE_MAX
+        campaign = SimpleNamespace(
+            advertising_channel_type=pmax if channel == "PMAX" else "SEARCH",
+            shopping_setting=SimpleNamespace(merchant_id=111, feed_label="US"),
+            final_url_suffix="utm_source=google", tracking_url_template="",
+            asset_automation_settings=[], brand_guidelines_enabled=brand_guidelines)
+        groups = [SimpleNamespace(asset_group=SimpleNamespace(
+            id=500 + i, name=f"AG{i}", final_urls=["https://example.com"],
+            final_mobile_urls=[], path1="", path2="")) for i in range(ag_count)]
+        asset_rows = [SimpleNamespace(asset_group_asset=SimpleNamespace(
+            asset=f"assets/{i}", field_type="HEADLINE")) for i in range(ag_assets)]
+        camp_asset_rows = [SimpleNamespace(campaign_asset=SimpleNamespace(
+            asset="assets/logo", field_type="LOGO"))]
+        crit_rows = [SimpleNamespace(campaign_criterion=SimpleNamespace(
+            type_=enums.CriterionTypeEnum.LOCATION, negative=False,
+            location=SimpleNamespace(geo_target_constant="geoTargetConstants/1")))]
+        shared_rows = [SimpleNamespace(campaign_shared_set=SimpleNamespace(
+            shared_set="sharedSets/9"))]
+        sig_rows = [SimpleNamespace(asset_group_signal=SimpleNamespace(
+            audience=SimpleNamespace(audience="audiences/3" if kind == "audience" else ""),
+            search_theme=SimpleNamespace(text="theme" if kind == "theme" else "")))
+            for kind in signals]
+        self.queries = []
+
+        def search(customer_id, query):
+            self.queries.append(query)
+            # most specific FROM first: "FROM asset_group" prefixes the others
+            for marker, rows in [("FROM campaign_criterion", crit_rows),
+                                 ("FROM campaign_shared_set", shared_rows),
+                                 ("FROM campaign_asset", camp_asset_rows),
+                                 ("FROM asset_group_signal", sig_rows),
+                                 ("FROM asset_group_asset", asset_rows),
+                                 ("FROM asset_group", groups)]:
+                if marker in query:
+                    return rows
+            return [SimpleNamespace(campaign=campaign)]
+
+        self.ga = mock.Mock()
+        self.ga.search.side_effect = search
+        client.get_service.return_value = self.ga
+        client.get_type.side_effect = lambda name: mock.Mock(name=name)
+        return client
+
+    def _run(self, client, **kw):
+        args = SimpleNamespace(
+            name="PMax - Segment", source_campaign_id="42", source_asset_group_id=None,
+            daily_budget=123.45, target_roas=4.0, dimension="custom_label_4",
+            include=["Fast", "Steady"], execute=False)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        with mock.patch.object(gam, "_client", return_value=client), \
+             mock.patch.object(gam, "_customer_id", return_value="999"):
+            gam.create_pmax_campaign(args)
+        return self.ga.mutate.call_args.kwargs["request"]
+
+    @staticmethod
+    def _kind(op):
+        # Mock only materialises the attributes the code actually touched.
+        return [k for k in op._mock_children if k.endswith("_operation")][0]
+
+    def _creates(self, req, kind):
+        return [getattr(op, kind).create for op in req.mutate_operations
+                if self._kind(op) == kind]
+
+    def test_everything_goes_in_one_validate_only_mutate(self):
+        req = self._run(self._client())
+        self.ga.mutate.assert_called_once()
+        self.assertTrue(req.validate_only)
+        self.assertEqual(req.customer_id, "999")
+
+    def test_execute_flips_validate_only(self):
+        client = self._client()
+        self.ga.mutate.return_value.mutate_operation_responses = []
+        req = self._run(client, execute=True)
+        self.assertFalse(req.validate_only)
+
+    def test_operation_order_and_count(self):
+        req = self._run(self._client())
+        self.assertEqual([self._kind(op) for op in req.mutate_operations], [
+            "campaign_budget_operation",
+            "campaign_operation",
+            "campaign_criterion_operation",
+            "campaign_asset_operation",
+            "campaign_shared_set_operation",
+            "asset_group_operation",
+            "asset_group_asset_operation", "asset_group_asset_operation",
+            "asset_group_signal_operation", "asset_group_signal_operation",
+            "asset_group_listing_group_filter_operation",   # root
+            "asset_group_listing_group_filter_operation",   # Fast
+            "asset_group_listing_group_filter_operation",   # Steady
+            "asset_group_listing_group_filter_operation",   # everything else
+        ])
+
+    def test_campaign_is_paused_with_non_shared_budget(self):
+        client = self._client()
+        req = self._run(client)
+        budget, = self._creates(req, "campaign_budget_operation")
+        camp, = self._creates(req, "campaign_operation")
+        self.assertIs(budget.explicitly_shared, False)
+        self.assertEqual(budget.amount_micros, 123_450_000)
+        self.assertEqual(camp.status, client.enums.CampaignStatusEnum.PAUSED)
+        self.assertEqual(camp.maximize_conversion_value.target_roas, 4.0)
+        self.assertEqual(camp.shopping_setting.merchant_id, 111)
+        self.assertEqual(camp.campaign_budget, budget.resource_name)
+
+    def test_asset_queries_filter_to_advertiser_source(self):
+        self._run(self._client())
+        asset_queries = [q for q in self.queries
+                         if "FROM asset_group_asset" in q or "FROM campaign_asset" in q]
+        self.assertEqual(len(asset_queries), 2)
+        for q in asset_queries:
+            self.assertIn("source = 'ADVERTISER'", q)
+
+    def test_brand_assets_skipped_when_brand_guidelines_off(self):
+        req = self._run(self._client(brand_guidelines=False))
+        self.assertEqual(self._creates(req, "campaign_asset_operation"), [])
+        self.assertFalse(any("FROM campaign_asset" in q for q in self.queries))
+
+    def test_listing_tree_includes_values_and_excludes_everything_else(self):
+        client = self._client()
+        req = self._run(client)
+        root, *leaves, other = self._creates(req, "asset_group_listing_group_filter_operation")
+        t = client.enums.ListingGroupFilterTypeEnum
+        self.assertEqual(root.type_, t.SUBDIVISION)
+        self.assertEqual([leaf.type_ for leaf in leaves], [t.UNIT_INCLUDED, t.UNIT_INCLUDED])
+        self.assertEqual([leaf.case_value.product_custom_attribute.value for leaf in leaves],
+                         ["Fast", "Steady"])
+        self.assertEqual(other.type_, t.UNIT_EXCLUDED)
+        for node in (*leaves, other):
+            self.assertEqual(node.parent_listing_group_filter, root.resource_name)
+        # "everything else" carries the index but never a value
+        self.assertNotIn("value", vars(other.case_value.product_custom_attribute))
+        self.assertIn("value", vars(leaves[0].case_value.product_custom_attribute))
+
+    def test_exits_when_source_is_not_pmax(self):
+        client = self._client(channel="SEARCH")
+        with self.assertRaises(SystemExit):
+            self._run(client)
+        self.ga.mutate.assert_not_called()
+
+    def test_exits_when_source_has_several_enabled_asset_groups(self):
+        client = self._client(ag_count=2)
+        with self.assertRaises(SystemExit):
+            self._run(client)
+        self.ga.mutate.assert_not_called()
+
+    def test_source_asset_group_id_disambiguates(self):
+        self._run(self._client(ag_count=2), source_asset_group_id="501")
+        self.ga.mutate.assert_called_once()
+
+    def test_cli_wiring_defaults_to_dry_run(self):
+        """Parse through the REAL main() parser (the subcommand function is
+        patched out), so the subparser itself is what's under test."""
+        base = ["google_ads_mutate.py", "create-pmax-campaign", "--name", "N",
+                "--source-campaign-id", "1", "--daily-budget", "10", "--target-roas", "3",
+                "--dimension", "custom_label_4"]
+        with mock.patch.object(gam, "create_pmax_campaign") as fn:
+            with mock.patch("sys.argv", base + ["--include", "A", "--include", "B"]):
+                gam.main()
+            args = fn.call_args.args[0]
+            self.assertEqual(args.include, ["A", "B"])
+            self.assertFalse(args.execute)
+            for bad in (base, base[:-1] + ["not_a_label", "--include", "A"]):
+                with mock.patch("sys.argv", bad), self.assertRaises(SystemExit):
+                    gam.main()
+
+
 if __name__ == "__main__":
     unittest.main()

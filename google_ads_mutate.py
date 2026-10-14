@@ -17,7 +17,8 @@ campaign (including converting an existing positive criterion into a
 negative/exclusion one), edit an `Audience` resource's segment membership,
 demote a conversion action to secondary, append a `final_url_suffix` to
 campaigns' landing URLs, update a genuine TARGET_ROAS campaign's target, or
-end a Campaign Experiment.
+end a Campaign Experiment, or clone a Performance Max campaign into a new
+PAUSED one scoped to a single custom-label segment.
 
 THE AUTO FIELD-MASK TRAP (read before adding a subcommand): most updates here
 build their `update_mask` with `field_mask(None, obj._pb)`, which diffs the
@@ -67,6 +68,8 @@ USAGE
   python google_ads_mutate.py build-tier-subdivision --campaign-id 10000000003 \
       --asset-group-id 2000000001 --remove-filter-id 30000000001 \
       --dimension custom_label_0 --include "A - Hero" --include "B - Scale up"
+
+  python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers"       --source-campaign-id 1234567890 --daily-budget 500 --target-roas 4.0       --dimension custom_label_4 --include "Fast"
 """
 from __future__ import annotations
 
@@ -1024,6 +1027,265 @@ def create_search_campaign(args):
         _report_failure(ex)
 
 
+def create_pmax_campaign(args):
+    """Create a PAUSED Performance Max campaign cloned from an existing one,
+    differing only in name, daily budget, target ROAS and its listing-group
+    filter.
+
+    Typical use: carve one product segment (a custom label your feed already
+    carries -- a sell-through band, a margin tier, a season) out of a running
+    PMax campaign into its own campaign with its own budget and tROAS,
+    without rebuilding the creative, targeting and Merchant Center link by
+    hand.
+
+    Copied from `--source-campaign-id`: the Merchant Center link
+    (`merchant_id` + `feed_label`), `final_url_suffix` /
+    `tracking_url_template`, every `asset_automation_settings` entry (URL
+    expansion and text/video automation), brand-guidelines mode (plus its
+    BUSINESS_NAME / LOGO / LANDSCAPE_LOGO campaign assets), campaign criteria
+    of type LOCATION, LANGUAGE and BRAND_LIST (negatives included), ENABLED
+    negative-keyword shared sets, and ONE asset group's final URLs, path1/2,
+    asset links (the SAME asset ids -- links, not copies) and audience /
+    search-theme signals.
+
+    Listing tree on the new asset group:
+        SUBDIVISION on --dimension
+        +-- each --include value -> UNIT_INCLUDED
+        +-- everything else      -> UNIT_EXCLUDED  (index set, no value)
+
+    API behavior this works around (each found as a live 400, not documented):
+      * PMax's budget, campaign and asset group must land TOGETHER, so every
+        operation goes in ONE `GoogleAdsService.mutate` using temporary
+        resource ids (-1 budget, -2 campaign, -3 asset group, -4 listing
+        root). That also makes the validate_only dry run check the whole
+        build atomically.
+      * Only ADVERTISER-source asset links are copied. AUTOMATICALLY_CREATED
+        links (AI headlines, auto images/videos) are rejected on create --
+        Google regenerates them itself -- and auto-created logos are usually
+        site favicons that fail the logo size check.
+      * The budget must be non-shared (`explicitly_shared = False`); PMax
+        rejects shared budgets.
+      * `contains_eu_political_advertising` is required on create (v24+).
+        Set it to whatever is factually true for your account.
+      * Since v24, URL expansion lives in `asset_automation_settings` (it
+        replaced the `url_expansion_opt_out` bool); the list is copied as-is.
+      * GAQL: every field a WHERE clause references must also be SELECTed,
+        which is why `campaign.id` / `asset_group.id` appear in SELECTs that
+        otherwise would not need them.
+
+    Exits without mutating if the source is missing or not PMax, or if it
+    does not resolve to exactly one ENABLED asset group (pass
+    `--source-asset-group-id` when the source has several). Always created
+    PAUSED; going live is a separate, deliberate `enable-campaign`."""
+    client = _client()
+    from google.ads.googleads.errors import GoogleAdsException
+
+    ga = client.get_service("GoogleAdsService")
+    cid = _customer_id()
+    src = args.source_campaign_id
+
+    def q(query):
+        try:
+            return list(ga.search(customer_id=cid, query=query))
+        except GoogleAdsException as ex:
+            _report_failure(ex)
+
+    # GAQL: every field a WHERE clause references must also be SELECTed.
+    srows = q(f"""SELECT campaign.id, campaign.advertising_channel_type,
+                         campaign.shopping_setting.merchant_id, campaign.shopping_setting.feed_label,
+                         campaign.final_url_suffix, campaign.tracking_url_template,
+                         campaign.asset_automation_settings, campaign.brand_guidelines_enabled
+                  FROM campaign WHERE campaign.id = {src}""")
+    if not srows:
+        sys.exit(f"source campaign {src} not found")
+    s = srows[0].campaign
+    if s.advertising_channel_type != client.enums.AdvertisingChannelTypeEnum.PERFORMANCE_MAX:
+        sys.exit(f"source campaign {src} is not Performance Max")
+
+    ag_rows = q(f"""SELECT campaign.id, asset_group.id, asset_group.name, asset_group.status,
+                           asset_group.final_urls, asset_group.final_mobile_urls,
+                           asset_group.path1, asset_group.path2
+                    FROM asset_group WHERE campaign.id = {src} AND asset_group.status = 'ENABLED'""")
+    if args.source_asset_group_id:
+        ag_rows = [r for r in ag_rows if str(r.asset_group.id) == str(args.source_asset_group_id)]
+    if len(ag_rows) != 1:
+        names = ", ".join(f"{r.asset_group.id} ({r.asset_group.name})" for r in ag_rows) or "none"
+        sys.exit(f"need exactly one enabled source asset group, found: {names} - pass --source-asset-group-id")
+    sag = ag_rows[0].asset_group
+
+    # ADVERTISER links only: AUTOMATICALLY_CREATED ones (AI headlines, AD_IMAGE,
+    # auto videos) are rejected on create - Google regenerates them itself.
+    ag_assets = q(f"""SELECT asset_group.id, asset_group_asset.asset, asset_group_asset.field_type,
+                             asset_group_asset.status, asset_group_asset.source
+                      FROM asset_group_asset
+                      WHERE asset_group.id = {sag.id} AND asset_group_asset.status != 'REMOVED'
+                        AND asset_group_asset.source = 'ADVERTISER'""")
+    # Same ADVERTISER-only rule: auto-created logos are site favicons (16/128px)
+    # that fail the logo dimension check on create.
+    camp_assets = q(f"""SELECT campaign.id, campaign_asset.asset, campaign_asset.field_type,
+                               campaign_asset.status, campaign_asset.source
+                        FROM campaign_asset
+                        WHERE campaign.id = {src} AND campaign_asset.status != 'REMOVED'
+                          AND campaign_asset.source = 'ADVERTISER'
+                          AND campaign_asset.field_type IN ('BUSINESS_NAME', 'LOGO', 'LANDSCAPE_LOGO')""") \
+        if s.brand_guidelines_enabled else []
+    crits = q(f"""SELECT campaign.id, campaign_criterion.type, campaign_criterion.status,
+                         campaign_criterion.negative,
+                         campaign_criterion.location.geo_target_constant,
+                         campaign_criterion.language.language_constant,
+                         campaign_criterion.brand_list.shared_set
+                  FROM campaign_criterion WHERE campaign.id = {src}
+                    AND campaign_criterion.status != 'REMOVED'
+                    AND campaign_criterion.type IN ('LOCATION', 'LANGUAGE', 'BRAND_LIST')""")
+    shared = q(f"""SELECT campaign.id, campaign_shared_set.shared_set, campaign_shared_set.status
+                   FROM campaign_shared_set
+                   WHERE campaign.id = {src} AND campaign_shared_set.status = 'ENABLED'""")
+    signals = q(f"""SELECT asset_group.id, asset_group_signal.audience.audience,
+                           asset_group_signal.search_theme.text
+                    FROM asset_group_signal WHERE asset_group.id = {sag.id}""")
+
+    budget_path = client.get_service("CampaignBudgetService").campaign_budget_path(cid, "-1")
+    camp_path = client.get_service("CampaignService").campaign_path(cid, "-2")
+    ag_path = client.get_service("AssetGroupService").asset_group_path(cid, "-3")
+    lg = _listing_group_service(client)
+    root_path = lg.asset_group_listing_group_filter_path(cid, "-3", "-4")
+    ops = []
+
+    def op(field):
+        mop = client.get_type("MutateOperation")
+        ops.append(mop)
+        return getattr(mop, field).create
+
+    b = op("campaign_budget_operation")
+    b.resource_name = budget_path
+    b.name = f"{args.name} budget"
+    b.amount_micros = int(round(args.daily_budget * 1_000_000))
+    b.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    b.explicitly_shared = False   # PMax rejects shared budgets
+
+    c = op("campaign_operation")
+    c.resource_name = camp_path
+    c.name = args.name
+    c.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.PERFORMANCE_MAX
+    c.status = client.enums.CampaignStatusEnum.PAUSED
+    c.campaign_budget = budget_path
+    c.maximize_conversion_value.target_roas = args.target_roas
+    c.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING)
+    c.shopping_setting.merchant_id = s.shopping_setting.merchant_id
+    if s.shopping_setting.feed_label:
+        c.shopping_setting.feed_label = s.shopping_setting.feed_label
+    if s.final_url_suffix:
+        c.final_url_suffix = s.final_url_suffix
+    if s.tracking_url_template:
+        c.tracking_url_template = s.tracking_url_template
+    # v24: URL expansion (and text/video automation) live in
+    # asset_automation_settings, replacing the old url_expansion_opt_out bool.
+    for setting in s.asset_automation_settings:
+        new = client.get_type("Campaign").AssetAutomationSetting()
+        new.asset_automation_type = setting.asset_automation_type
+        new.asset_automation_status = setting.asset_automation_status
+        c.asset_automation_settings.append(new)
+    c.brand_guidelines_enabled = s.brand_guidelines_enabled
+
+    for r in crits:
+        cc = r.campaign_criterion
+        n = op("campaign_criterion_operation")
+        n.campaign = camp_path
+        if cc.type_ == client.enums.CriterionTypeEnum.LOCATION:
+            n.negative = cc.negative
+            n.location.geo_target_constant = cc.location.geo_target_constant
+        elif cc.type_ == client.enums.CriterionTypeEnum.LANGUAGE:
+            n.language.language_constant = cc.language.language_constant
+        else:
+            n.brand_list.shared_set = cc.brand_list.shared_set
+            n.negative = cc.negative
+
+    for r in camp_assets:
+        a = op("campaign_asset_operation")
+        a.campaign = camp_path
+        a.asset = r.campaign_asset.asset
+        a.field_type = r.campaign_asset.field_type
+
+    for r in shared:
+        ss = op("campaign_shared_set_operation")
+        ss.campaign = camp_path
+        ss.shared_set = r.campaign_shared_set.shared_set
+
+    g = op("asset_group_operation")
+    g.resource_name = ag_path
+    g.name = args.name
+    g.campaign = camp_path
+    g.status = client.enums.AssetGroupStatusEnum.ENABLED
+    g.final_urls.extend(sag.final_urls)
+    g.final_mobile_urls.extend(sag.final_mobile_urls)
+    if sag.path1:
+        g.path1 = sag.path1
+    if sag.path2:
+        g.path2 = sag.path2
+
+    for r in ag_assets:
+        a = op("asset_group_asset_operation")
+        a.asset_group = ag_path
+        a.asset = r.asset_group_asset.asset
+        a.field_type = r.asset_group_asset.field_type
+
+    for r in signals:
+        sig = r.asset_group_signal
+        if sig.audience.audience:
+            n = op("asset_group_signal_operation")
+            n.asset_group = ag_path
+            n.audience.audience = sig.audience.audience
+        elif sig.search_theme.text:
+            n = op("asset_group_signal_operation")
+            n.asset_group = ag_path
+            n.search_theme.text = sig.search_theme.text
+
+    index = getattr(client.enums.ListingGroupFilterCustomAttributeIndexEnum,
+                    CUSTOM_LABEL_INDEX[args.dimension])
+    root = op("asset_group_listing_group_filter_operation")
+    root.resource_name = root_path
+    root.asset_group = ag_path
+    root.type_ = client.enums.ListingGroupFilterTypeEnum.SUBDIVISION
+    root.listing_source = client.enums.ListingGroupFilterListingSourceEnum.SHOPPING
+    for value in args.include:
+        leaf = op("asset_group_listing_group_filter_operation")
+        leaf.asset_group = ag_path
+        leaf.type_ = client.enums.ListingGroupFilterTypeEnum.UNIT_INCLUDED
+        leaf.listing_source = client.enums.ListingGroupFilterListingSourceEnum.SHOPPING
+        leaf.parent_listing_group_filter = root_path
+        leaf.case_value.product_custom_attribute.index = index
+        leaf.case_value.product_custom_attribute.value = value
+    other = op("asset_group_listing_group_filter_operation")
+    other.asset_group = ag_path
+    other.type_ = client.enums.ListingGroupFilterTypeEnum.UNIT_EXCLUDED
+    other.listing_source = client.enums.ListingGroupFilterListingSourceEnum.SHOPPING
+    other.parent_listing_group_filter = root_path
+    other.case_value.product_custom_attribute.index = index   # index only = "everything else"
+
+    print(f"cloning from campaign {src}, asset group {sag.id} ({sag.name}): "
+          f"{len(ag_assets)} asset links, {len(camp_assets)} brand assets, {len(crits)} criteria, "
+          f"{len(shared)} shared sets, {len(signals)} signals; "
+          f"{args.dimension} include {args.include}; ${args.daily_budget:,.2f}/day, tROAS {args.target_roas}")
+
+    req = client.get_type("MutateGoogleAdsRequest")
+    req.customer_id = cid
+    req.mutate_operations = ops
+    req.validate_only = not args.execute
+    try:
+        resp = ga.mutate(request=req)
+    except GoogleAdsException as ex:
+        _report_failure(ex)
+    if args.execute:
+        print(f"EXECUTED — created PAUSED PMax campaign '{args.name}'. Resources:")
+        for r in resp.mutate_operation_responses:
+            kind = r._pb.WhichOneof("response")
+            print(f"  {getattr(r, kind).resource_name}")
+    else:
+        print(f"VALIDATE_ONLY passed — PAUSED PMax campaign '{args.name}' ({len(ops)} operations) "
+              f"would be created. Re-run with --execute to actually create it.")
+
+
 def create_ad_group(args):
     client = _client()
     from google.ads.googleads.errors import GoogleAdsException
@@ -1563,6 +1825,18 @@ def main():
     p.add_argument("--target-roas", type=float)
     p.add_argument("--execute", action="store_true")
     p.set_defaults(func=create_search_campaign)
+
+    p = sub.add_parser("create-pmax-campaign",
+                       help="PAUSED PMax cloned from --source-campaign-id, own budget/tROAS/listing filter")
+    p.add_argument("--name", required=True)
+    p.add_argument("--source-campaign-id", required=True)
+    p.add_argument("--source-asset-group-id", help="required if the source has more than one enabled asset group")
+    p.add_argument("--daily-budget", type=float, required=True, help="in account currency")
+    p.add_argument("--target-roas", type=float, required=True, help="e.g. 5.2 for 520%%")
+    p.add_argument("--dimension", required=True, choices=CUSTOM_LABEL_INDEX)
+    p.add_argument("--include", action="append", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.set_defaults(func=create_pmax_campaign)
 
     p = sub.add_parser("create-ad-group")
     p.add_argument("--name", required=True)
