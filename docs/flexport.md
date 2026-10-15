@@ -12,7 +12,7 @@ wired into `run_sync.py`, since 3PL data doesn't fit its ads/orders shape)
 |---|---|---|---|---|
 | `flexport_sync.py` | catalog + current inventory levels | `/products`, `/products/inventory/all`, `/products/{logisticsSku}` | limit/offset (500) | `flexport` |
 | `flexport_orders_sync.py` | per-order realized outbound cost + packages | `/events?type=Shipment.Created`, `/orders/{orderId}` | `Link` header `page_info` cursor (100) | `flexport_orders` |
-| `flexport_returns_sync.py` | customer returns + returned lines | `/returns` | `Link` header `page_info` cursor (100) | `flexport_returns` |
+| `flexport_returns_sync.py` | customer returns + returned lines | `/returns` | newest-first `Link` header `page_info` cursor (100), always from the head | `flexport_returns` |
 | `flexport_inbounds_sync.py` | inbound supplier shipments + lines | `/inbounds/shipments` | limit/offset (100, shrinks on 504) | `flexport_inbounds` |
 
 All four call `https://logistics-api.flexport.com/logistics/api/2024-06` with
@@ -42,8 +42,8 @@ python flexport_orders_sync.py    # per-order shipping cost (resumable event-cur
 python flexport_orders_sync.py --since-days 30 --pages 5
 python flexport_orders_sync.py --restart   # discard the saved cursor and re-walk from scratch
 python flexport_orders_sync.py --from-shopify --days 10   # fetch by id, enumerated from Shopify
-python flexport_returns_sync.py   # customer returns
-python flexport_returns_sync.py --pages 5 --restart
+python flexport_returns_sync.py   # customer returns: window walk from the head (full walk when one is due)
+python flexport_returns_sync.py --full      # walk the whole feed now (--restart is an alias)
 python flexport_inbounds_sync.py  # inbound supplier shipments
 python flexport_inbounds_sync.py --max-pages 5
 ```
@@ -59,8 +59,9 @@ python flexport_inbounds_sync.py --max-pages 5
 | | `--from-shopify` | off | Skip the `/events` crawl: enumerate Flexport external order ids from Shopify and fetch each with `GET /orders/external_id/{id}`. See below. |
 | | `--days N` | `10` | With `--from-shopify`: how many days of Shopify orders to scan. |
 | | `--workers N` | `8` | With `--from-shopify`: concurrent order fetches. |
-| `flexport_returns_sync.py` | `--pages N` | `100000` | Cap on `/returns` pages walked this run. |
-| | `--restart` | off | Delete the stored cursor and re-crawl from the floor. |
+| `flexport_returns_sync.py` | `--pages N` | `100000` | Cap on `/returns` pages walked this run. A walk that hits the cap is incomplete: logged `degraded`, exit `75`, high-water mark not advanced. |
+| | `--full` | off | Walk the whole feed to the empty page now (otherwise automatic every 7 days, and on the first run). |
+| | `--restart` | off | Alias of `--full`. |
 | `flexport_inbounds_sync.py` | `--max-pages N` | `1000` | Cap on `/inbounds/shipments` pages walked this run. |
 
 A bare `flexport_sync.py` run does **not** do a full catalog crawl — only
@@ -117,11 +118,13 @@ as a backstop for orders whose external id has some other shape.
 |---|---|---|---|
 | Token unset | `0` | (no row) | — |
 | Clean run | `0` | `ok` | inventory rows / new orders / returns / shipments |
-| Transient pause (orders, inbounds only) | `75` | `degraded` (message `paused, resumable` / `paused (transient)`) | rows committed before the pause |
+| Transient pause (orders, inbounds, returns) | `75` | `degraded` (message `paused, resumable` / `paused (transient)`) | rows committed before the pause |
+| Returns walk incomplete (page cap) or found no new/changed return | `75` | `degraded` (message `INCOMPLETE` / `NO PROGRESS`) | new + changed returns |
 | Any other exception | non-zero (traceback re-raised) | `error` (message = exception text, truncated to 500 chars) | `0` |
 
-`flexport_sync.py` and `flexport_returns_sync.py` have no degraded/75 path:
-retry exhaustion there raises `RuntimeError` and the run is logged `error`.
+`flexport_sync.py` has no degraded/75 path: retry exhaustion there raises
+`RuntimeError` and the run is logged `error`. For `flexport_returns_sync.py`,
+`rows_written` is new + changed returns, never rows merely re-read.
 
 ## Tables
 
@@ -208,12 +211,14 @@ printed and dropped for this run rather than aborting the page.
 ### `flexport_returns_sync.py`
 
 **`flexport_returns`** — PK `id` (Flexport return id), indexed on `status`.
-Columns: `id`, `status` (CREATED/SHIPPED/RECEIVED/INSPECTED/PROCESSED),
+Columns: `id`, `status` (CREATED/SHIPPED/RECEIVED_FOR_PROCESSING/PROCESSED/CANCELLED),
 `rma`, `external_return_id`, `fulfillment_order_id` (joins
 `flexport_order_costs.order_id` when supplied — often `NULL`), `carrier`,
 `tracking_code`, `tracking_status`, `source_name`, `source_city`,
 `source_state`, `source_zip`, `source_country` (where the customer shipped
-from), `shipped_at`, `received_at`, `inspected_at`, `n_lines`, `synced_at`.
+from), `shipped_at`, `received_at`, `inspected_at`, `n_lines`, `synced_at`
+(the last time a walk SAW the return, not when it last changed). Upserted by
+named column, in place.
 
 **`flexport_return_lines`** — PK `(return_id, line_no)` (`line_no` is the
 0-based position in the return's item list), indexed on `identifier`.
@@ -221,12 +226,45 @@ Columns: `return_id`, `line_no`, `identifier` (the returned SKU),
 `expected_quantity`, `n_inspected`, `received_condition`,
 `final_condition`, `disposition` (e.g. `RESTOCK`), `synced_at`. A line can
 have several inspected items; only the **first** inspection's
-condition/disposition is kept, plus the count in `n_inspected`.
+condition/disposition is kept, plus the count in `n_inspected`. A return's
+lines are delete-rewritten each time it is seen, so a shrunk item list leaves
+no stale lines. Flexport sends an empty string for an uninspected condition;
+it is stored as `NULL`.
 
-**`flexport_returns_sync_state`** — `key` / `value` / `updated_at`; key
-`returns_page_info`. Rows and the cursor are committed every 200 returns and
-at the end of the run. Lines are upserted, not delete-rewritten, so if a
-return's item list ever shrank, the old higher-numbered lines would remain.
+**`flexport_returns_walks`** — one row per run, PK `run_id`: `mode`
+(`window`/`full`), `stop_id` (the floor the walk ASKED for; `NULL` = to the
+empty page), `head_id` (newest id seen), `lowest_id` (deepest id reached),
+`pages`, `returns_seen`, `new_returns`, `changed`, `complete`, `status`. This
+is the resume marker: the high-water mark is `MAX(head_id) WHERE complete =
+1`, never inferred from which return rows exist.
+
+**The `/returns` feed is newest-first** (ids descending; the next cursor is
+base64url `{"cursor": <last id>, "direction": "forward"}`, i.e. "ids below
+this"), so the final page is the OLDEST end of the feed. Every run therefore
+starts at the head and walks DOWN:
+
+- **window** (default) — stops at `min(high-water mark, the id that was the
+  head REFRESH_DAYS=180 days ago)`, so every new return is captured and
+  returns still in flight (CREATED → SHIPPED → PROCESSED can take months) are
+  re-read until they settle. Until the walk log is 180 days old, the floor is
+  bounded from the data (the highest id with any activity date before the
+  cutoff, ignoring `0000-00-00` placeholders), which can only make the walk
+  deeper.
+- **full** — to the empty page, automatically every `FULL_WALK_EVERY_DAYS=7`
+  days, on the first run, or with `--full`. Re-checks abandoned RMAs far down
+  the feed, and reports (does not delete) stored ids the feed no longer
+  returns.
+
+A page with no next link is not trusted as the end: the walk crafts a
+"below this id" cursor and stops only on an EMPTY page. A page whose ids are
+not below the previous page's raises `FeedOrderError`. An interrupted walk
+(page cap, outage) keeps the pages it wrote but does not advance the
+high-water mark, so the next run re-walks from the head.
+
+Upgrading from the old oldest-first version: the old `returns_page_info` key
+in `flexport_returns_sync_state` is deleted on startup (nothing reads it),
+and the first run is a full walk, which back-fills every return the old
+cursor missed.
 
 ### `flexport_inbounds_sync.py`
 
@@ -340,11 +378,11 @@ run partway through — this is a resumable pause, not a hard error, and
 matters if you're wiring either script into a scheduler that treats any
 nonzero exit as an alert. On pause the orders crawl flushes what it has and
 saves its cursor; the inbounds crawl keeps already-committed pages and the
-next run re-walks from the top. `flexport_returns_sync.py` doesn't have this
-pause/resume handling — a transient failure there fails the run outright
-(logged `error`) rather than pausing; returns committed at the last
-200-return checkpoint, and the cursor saved with them, survive. Don't assume
-identical resilience across all three crawlers.
+next run re-walks from the top. `flexport_returns_sync.py` pauses the same
+way: pages already written are kept, the walk is recorded incomplete, and the
+next run re-walks from the head. It also exits `75` when a complete walk
+finds nothing new or changed, since a live returns feed that changes nothing
+is more likely a fault than a quiet day.
 
 ### Page-size shrink on 504
 
@@ -412,9 +450,15 @@ its own valid next-cursor with no call-site change needed.
   retried / exhausted → transient, 504 shrink without mutating caller params,
   504 at min page backs off), order-row mapping, skipping stored orders,
   transient pause, `--restart`.
-- `tests/test_flexport_returns_sync.py` — schema, cursor parsing,
-  first-inspection disposition, page walk, cursor save, `--restart`,
-  malformed records skipped.
+- `tests/test_flexport_returns_sync.py` — a fake newest-first feed: new
+  returns at the head are ingested, window walks stop at their floor,
+  in-flight returns are refreshed with their lines replaced wholesale, a
+  short link-less page is confirmed by an empty page, a feed that stops being
+  newest-first fails loudly, page cap / outage / no-progress are `degraded`
+  with the high-water mark held, walk planning (first run full, weekly full,
+  window floor from the walk log or data, never above the high-water mark),
+  vanished ids counted not deleted, named-column upsert, `--help` safe,
+  old cursor retired.
 - `tests/test_flexport_inbounds_sync.py` — schema, walking past short pages
   until empty, 504 shrink and re-raise at min page, line-count roll-ups,
   line delete-rewrite when an item set shrinks, transient pause keeping
