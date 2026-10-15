@@ -78,6 +78,10 @@ the same filter as a rolling window, and is ignored when `--since` is given.
   side effect). This is populated **only when the app holds
   `read_customers`** (or `SHOPIFY_CAPTURE_CUSTOMER` forces it on). Without
   the scope the field isn't requested at all, and the table stays empty.
+- `shopify_order_tags` (one row per order × tag, also a `sync()` side
+  effect) and `shopify_order_tag_coverage` (one row per order whose tags were
+  READ, with `tag_count`, 0 for an untagged order). `tags` needs only
+  `read_orders`, so it is always requested. See "Order tags" below.
 - `shopify_customers`, `shopify_customer_metafields`,
   `shopify_customer_flag_history` (customer dimension, created by
   `shopify_customers_sync.py`'s own `ensure_schema()` rather than
@@ -150,12 +154,51 @@ diff has to run before the snapshot upsert. Keep that ordering if you extend
 the script, and see the module docstring for adding more tracked
 attributes.
 
+### Order tags
+
+Shopify order tags are the merchant's own labels (gift, influencer,
+wholesale, test, resend, claim, ...) and are often the only way to segment or
+exclude orders.
+
+- **Replace semantics.** Each fetch rewrites the order's whole tag set
+  (`db.replace_shopify_order_tags()`: delete the batch's orders' rows, insert
+  the current tags, upsert coverage, in ONE transaction), so a tag removed in
+  Shopify disappears on the next fetch.
+- **Coverage tells "untagged" from "never read".** An untagged order has no
+  `shopify_order_tags` rows but does get a coverage row with `tag_count = 0`.
+  An order with NO coverage row has unknown tags (it was last synced before
+  tag capture was deployed), so an exclusion like "drop orders tagged
+  `test`" is only complete for orders that have a coverage row. Derive that
+  floor from the table; don't hardcode a date.
+- **Late tags need a re-pull.** An order is only re-fetched while its
+  `created_at` is inside a sync window, so tags added days later (claims,
+  resends) are not seen until a wider re-sync.
+- `tag` is `COLLATE NOCASE` (Shopify tags are case-insensitive) and
+  duplicates are dropped ignoring case, keeping the first spelling. A
+  comma-joined string payload (the REST/CSV form) is split too.
+- Orders that share a display name in one batch get the union of their tags.
+- If an order payload has no `tags` key at all, nothing is recorded (that is
+  "not read", not "untagged").
+- No `customAttributes` / note attributes are stored — they carry visitor and
+  session ids.
+
+To backfill tags for older orders, re-run the core sync over a wider window
+(`python run_sync.py --only shopify --days N`); the `orders` rows it rewrites
+are unchanged.
+
 ## Tests
 
 - `tests/test_shopify_connector.py` covers the core connector's `_post()`
   HTTP layer: retries, throttling, and error handling. It does not yet
   cover row building (`_order_rows`, `_discount_rows`) or
   `customer_capture_enabled()`.
+- `tests/test_shopify_order_tags.py` covers `_tag_row()` parsing, that the
+  query requests `tags` with or without the customer scope (and never
+  `customAttributes`), replace semantics, measured zeros vs no coverage row,
+  case-insensitive matching, the shared-name union, named-column inserts on a
+  scrambled table, and an end-to-end `sync()` run.
 - `tests/test_shopify_customers_sync.py` covers schema, the no-PII
   guarantees, JSONL parsing and batching, `record_flag_changes()`, storage,
-  env/scope checks, and the bulk submit/poll flow.
+  env/scope checks, and the bulk submit/poll flow (including finding our own
+  bulk op by id when another job on the same app has displaced
+  `currentBulkOperation`).

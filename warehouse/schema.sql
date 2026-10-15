@@ -123,6 +123,48 @@ CREATE TABLE IF NOT EXISTS shopify_order_customers (
 CREATE INDEX IF NOT EXISTS idx_shopify_ordcust_cust ON shopify_order_customers(customer_id);
 CREATE INDEX IF NOT EXISTS idx_shopify_ordcust_date ON shopify_order_customers(order_date);
 
+-- Shopify ORDER TAGS, one row per order+tag. Tags are the merchant's own order
+-- labels (gift / influencer / wholesale / test / resend / claim ...), often the
+-- only way to identify orders that should be segmented or excluded from revenue.
+-- A SIDE TABLE for the same reasons as shopify_order_customers above
+-- (Shopify-only, ORDER grain not line grain, and no ALTER TABLE on `orders`).
+-- `tag` is COLLATE NOCASE because Shopify treats tags case-insensitively:
+-- WHERE tag = 'gift' also matches 'Gift'.
+-- REPLACE SEMANTICS: every fetch of an order rewrites its whole tag set, so a
+-- tag removed in Shopify disappears here on the next fetch. BUT an order is only
+-- re-fetched while its created_at is inside a sync window (e.g. --days 3), so a
+-- tag added or removed AFTER that is not seen until a re-pull. Tags that ops add
+-- late (claims, resends, stock-outs) need a wider window or a re-pull; tags set
+-- when the order is created are always captured.
+-- Tags are merchant-entered labels, not customer data. No customAttributes /
+-- note attributes are stored: they are app plumbing plus visitor and session
+-- ids, which the no-PII rule keeps out.
+CREATE TABLE IF NOT EXISTS shopify_order_tags (
+    order_id   TEXT NOT NULL,                -- orders.order_id (the order name) at platform='shopify'
+    tag        TEXT NOT NULL COLLATE NOCASE, -- as entered in Shopify, whitespace-trimmed
+    order_date TEXT,                         -- denormalized so time filters need no join
+    synced_at  TEXT NOT NULL,
+    PRIMARY KEY (order_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_shopify_ordtag_tag ON shopify_order_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_shopify_ordtag_date ON shopify_order_tags(order_date);
+
+-- Which orders have had their tags READ, including the ones that had none.
+-- An untagged order has no shopify_order_tags rows, so without this table "no
+-- rows" would mean both "looked, untagged" and "never looked" (a measured zero
+-- is not a blank). A row here with tag_count = 0 is a measured zero. NO row
+-- means the tags are UNKNOWN: the order was last synced before tag capture was
+-- deployed and has not been re-pulled since. So an exclusion such as "drop
+-- orders tagged test" is only complete for orders that HAVE a coverage row.
+-- Derive that floor from this table; don't hardcode a date.
+CREATE TABLE IF NOT EXISTS shopify_order_tag_coverage (
+    order_id   TEXT PRIMARY KEY,  -- orders.order_id at platform='shopify'
+    order_date TEXT,
+    tag_count  INTEGER NOT NULL,  -- tags read on the last fetch; 0 = looked, none
+    synced_at  TEXT NOT NULL      -- when that fetch happened
+);
+CREATE INDEX IF NOT EXISTS idx_shopify_ordtagcov_date ON shopify_order_tag_coverage(order_date);
+
 -- Bookkeeping: track each sync run so you can see when data last refreshed.
 -- The MCP server exposes this as last_sync_status(), which is usually the
 -- fastest way to answer "why does yesterday look empty".

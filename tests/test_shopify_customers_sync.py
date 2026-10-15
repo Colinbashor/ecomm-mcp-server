@@ -426,6 +426,22 @@ class BulkOperationsFlowTests(unittest.TestCase):
             result = sc._wait_for("gid://shopify/BulkOperation/1")
         self.assertEqual(result["status"], "COMPLETED")
 
+    def test_wait_for_finds_our_op_by_id_when_another_job_displaced_it(self) -> None:
+        # currentBulkOperation is only the app's MOST RECENT op; if another job
+        # submitted after ours finished, polling it alone would never see ours.
+        responses = [
+            _FakeHttpResp(200, {"data": {"currentBulkOperation": {
+                "id": "gid://shopify/BulkOperation/2", "status": "RUNNING",
+                "errorCode": None, "objectCount": "0", "url": None}}}),
+            _FakeHttpResp(200, {"data": {"node": {
+                "id": "gid://shopify/BulkOperation/1", "status": "COMPLETED",
+                "errorCode": None, "objectCount": "7", "url": "https://example.test/ours.jsonl"}}}),
+        ]
+        calls = iter(responses)
+        with patch.object(sc.requests, "post", lambda *a, **kw: next(calls)):
+            result = sc._wait_for("gid://shopify/BulkOperation/1")
+        self.assertEqual(result["url"], "https://example.test/ours.jsonl")
+
     def test_current_bulk_returns_none_gracefully_when_absent(self) -> None:
         resp = _FakeHttpResp(200, {"data": {"currentBulkOperation": None}})
         with patch.object(sc.requests, "post", lambda *a, **kw: resp):
