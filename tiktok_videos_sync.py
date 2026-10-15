@@ -40,6 +40,19 @@ GENERIC GOTCHAS (all verified against the live API)
   tagged anything is invisible to this endpoint no matter how much organic
   interest it drove -- that needs a separate affiliate/creator-content feed.
 
+EVERY TAGGED PRODUCT: tiktok_shop_videos keeps only the FIRST tagged product
+(products[0]) per video x window, but a video can tag up to ~10 products.
+Every tagged product also goes to `tiktok_shop_video_products` (video x
+account_type x product, cumulative: first_seen / last_seen are the earliest
+window_start / latest window_end that returned the tag), so a creator's video
+can be linked to its 2nd..Nth product too. The API's product entries carry
+only id + name -- GMV / units / views are VIDEO-level, so NEVER sum a video's
+metrics across its tagged products (a 3-product video would triple-count).
+`tiktok_shop_video_products_coverage` records every window ASKED for and what
+came back (complete / short / empty / out_of_retention / failed), which
+tiktok_video_products_backfill.py resumes from -- never from absent rows,
+since a window can legitimately hold no multi-product video.
+
 USAGE
   python tiktok_videos_sync.py --days 30
   python tiktok_videos_sync.py --start 2026-01-01 --end 2026-02-01
@@ -94,8 +107,84 @@ CREATE TABLE IF NOT EXISTS tiktok_shop_videos (
 """
 
 
+# Every tagged product of a video (tiktok_shop_videos holds only the first).
+# Cumulative across windows, never deleted: a tag seen once stays, and
+# first_seen/last_seen bound the windows that returned it.
+PRODUCTS_DDL = """
+CREATE TABLE IF NOT EXISTS tiktok_shop_video_products (
+    video_id      TEXT NOT NULL,
+    account_type  TEXT NOT NULL,   -- AFFILIATES | LINKED_ACCOUNTS | ALL
+    product_id    TEXT NOT NULL,   -- TikTok Shop product (SPU) id
+    product_name  TEXT,
+    position      INTEGER,         -- 1 = products[0] = tiktok_shop_videos.product_id, in the LATEST window seen
+    first_seen    TEXT NOT NULL,   -- earliest window_start that returned this tag
+    last_seen     TEXT NOT NULL,   -- latest window_end (exclusive) that returned this tag
+    synced_at     TEXT NOT NULL,
+    PRIMARY KEY (video_id, account_type, product_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tsvp_product ON tiktok_shop_video_products(product_id);
+
+CREATE TABLE IF NOT EXISTS tiktok_shop_video_products_coverage (
+    account_type     TEXT NOT NULL,
+    window_start     TEXT NOT NULL,
+    window_end       TEXT NOT NULL,   -- exclusive
+    status           TEXT NOT NULL,   -- complete | short | empty | out_of_retention | failed
+    api_total        INTEGER,         -- total_count the API reported for the window
+    rows_returned    INTEGER,         -- video rows across all pages (incl. any repeats)
+    videos_returned  INTEGER,         -- distinct video ids
+    multi_product_videos INTEGER,     -- videos tagging more than one product
+    product_rows     INTEGER,         -- (video, product) tags written
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    source           TEXT,            -- sync | backfill
+    error            TEXT,
+    first_attempt_at TEXT NOT NULL,
+    last_attempt_at  TEXT NOT NULL,
+    PRIMARY KEY (account_type, window_start, window_end)
+);
+"""
+
+# Named columns throughout, so a migrated table's physical column order can
+# never shift values. The ON CONFLICT keeps the widest seen range, and takes
+# name/position from whichever window is LATEST, so an older backfill window
+# can never overwrite what a newer pull saw.
+_UPSERT_PRODUCT = """
+INSERT INTO tiktok_shop_video_products
+    (video_id, account_type, product_id, product_name, position, first_seen, last_seen, synced_at)
+VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT (video_id, account_type, product_id) DO UPDATE SET
+    product_name = CASE WHEN excluded.last_seen >= last_seen
+                        THEN COALESCE(excluded.product_name, product_name) ELSE product_name END,
+    position     = CASE WHEN excluded.last_seen >= last_seen THEN excluded.position ELSE position END,
+    first_seen   = MIN(first_seen, excluded.first_seen),
+    last_seen    = MAX(last_seen, excluded.last_seen),
+    synced_at    = excluded.synced_at
+"""
+
+_UPSERT_COVERAGE = """
+INSERT INTO tiktok_shop_video_products_coverage
+    (account_type, window_start, window_end, status, api_total, rows_returned, videos_returned,
+     multi_product_videos, product_rows, attempts, source, error, first_attempt_at, last_attempt_at)
+VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?)
+ON CONFLICT (account_type, window_start, window_end) DO UPDATE SET
+    status = excluded.status, api_total = excluded.api_total,
+    rows_returned = excluded.rows_returned, videos_returned = excluded.videos_returned,
+    multi_product_videos = excluded.multi_product_videos, product_rows = excluded.product_rows,
+    attempts = attempts + 1, source = excluded.source, error = excluded.error,
+    last_attempt_at = excluded.last_attempt_at
+"""
+
+# Business error for a window that starts before the API's lookback (roughly
+# six months; the floor advances a day per day).
+OUT_OF_RETENTION_CODE = 28001022
+
+
 def ensure_schema(conn) -> None:
     conn.executescript(DDL)
+    ensure_products_tables(conn)
+
+
+def ensure_products_tables(conn) -> None:
+    conn.executescript(PRODUCTS_DDL)
 
 
 def check_required_env() -> None:
@@ -152,8 +241,51 @@ def _request_page(params: dict) -> dict:
     raise RuntimeError("TikTok video API failed after retries (last attempt exhausted).")
 
 
+def product_tags(video: dict) -> list[tuple]:
+    """(product_id, product_name, position) for EVERY product the video tags,
+    position 1 = products[0]. A product listed twice keeps its first position;
+    an entry with no id is skipped (nothing to key it on)."""
+    out, seen = [], set()
+    for pos, p in enumerate(video.get("products") or [], start=1):
+        pid = p.get("id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        out.append((str(pid), p.get("name"), pos))
+    return out
+
+
+class FetchResult:
+    """One account_type x window pull. `rows` are tiktok_shop_videos row dicts
+    (the same shape fetch() has always returned); `tags` are (video_id,
+    account_type, product_id, product_name, position) for every tagged product."""
+
+    def __init__(self):
+        self.rows: list[dict] = []
+        self.tags: list[tuple] = []
+        self.api_total: int | None = None
+        self.video_ids: set[str] = set()
+        self.multi_product_videos = 0
+        self.stopped_early = False   # winners-only mode stops at the first $0 video
+
+    def coverage_status(self) -> str:
+        """empty = nothing came back (never 'complete'); short = fewer distinct
+        videos than the API's own total_count, so paging lost some."""
+        if not self.video_ids:
+            return "empty"
+        if self.stopped_early or self.api_total is None:
+            return "complete"
+        return "complete" if len(self.video_ids) >= self.api_total else "short"
+
+
 def fetch(account_type: str, start: str, end: str, gmv_positive_only: bool = False) -> list[dict]:
-    rows: list[dict] = []
+    """tiktok_shop_videos rows only (unchanged shape, for existing callers)."""
+    return fetch_full(account_type, start, end, gmv_positive_only).rows
+
+
+def fetch_full(account_type: str, start: str, end: str, gmv_positive_only: bool = False) -> FetchResult:
+    res = FetchResult()
+    rows, tags = res.rows, res.tags
     page_token = ""
     while True:
         params = {
@@ -170,6 +302,8 @@ def fetch(account_type: str, start: str, end: str, gmv_positive_only: bool = Fal
         if page_token:
             params["page_token"] = page_token
         data = _request_page(params).get("data", {}) or {}
+        if res.api_total is None and data.get("total_count") is not None:
+            res.api_total = int(data["total_count"])
         for v in data.get("videos", []):
             gmv_block = v.get("gmv") or {}
             amount = float(gmv_block.get("amount", 0) or 0)
@@ -177,8 +311,14 @@ def fetch(account_type: str, start: str, end: str, gmv_positive_only: bool = Fal
             # winners-only mode we stop here; by default we keep paging to
             # capture the zero-GMV tail (post-rate / dud visibility).
             if amount <= 0 and gmv_positive_only:
-                return rows
+                res.stopped_early = True
+                return res
             products = v.get("products") or []
+            vtags = product_tags(v)
+            if v.get("id"):
+                res.video_ids.add(v["id"])
+                tags.extend((v["id"], account_type, pid, name, pos) for pid, name, pos in vtags)
+                res.multi_product_videos += len(vtags) > 1
             rows.append({
                 "video_id": v.get("id"), "account_type": account_type,
                 "title": v.get("title"), "username": v.get("username"),
@@ -196,14 +336,39 @@ def fetch(account_type: str, start: str, end: str, gmv_positive_only: bool = Fal
         page_token = data.get("next_page_token") or ""
         if not page_token:
             break
-    return rows
+    return res
+
+
+def write_product_tags(conn, tags: list[tuple], start: str, end: str, stamp: str) -> int:
+    """Upsert (video_id, account_type, product_id, product_name, position) tags
+    seen in the window [start, end). Caller owns the transaction."""
+    conn.executemany(_UPSERT_PRODUCT,
+                     [(vid, at, pid, name, pos, start, end, stamp) for vid, at, pid, name, pos in tags])
+    return len(tags)
+
+
+def record_coverage(conn, account_type: str, start: str, end: str, status: str, source: str,
+                    res: FetchResult | None = None, error: str | None = None,
+                    stamp: str | None = None) -> None:
+    """One row per window ASKED for, whatever came back: a window that returned
+    nothing, was refused, or failed is recorded as such, never left absent for
+    a resume to misread. Caller owns the transaction."""
+    stamp = stamp or db.now()
+    conn.execute(_UPSERT_COVERAGE, (
+        account_type, start, end, status,
+        res.api_total if res else None, len(res.rows) if res else None,
+        len(res.video_ids) if res else None, res.multi_product_videos if res else None,
+        len(res.tags) if res else None, source, error, stamp, stamp))
 
 
 def sync(start: str, end: str, account_types: list[str], gmv_positive_only: bool = False) -> int:
     stamp = db.now()
     all_rows: list[dict] = []
+    fetched: list[tuple[str, FetchResult]] = []
     for at in account_types:
-        all_rows += fetch(at, start, end, gmv_positive_only)
+        res = fetch_full(at, start, end, gmv_positive_only)
+        fetched.append((at, res))
+        all_rows += res.rows
     for r in all_rows:
         r["synced_at"] = stamp
 
@@ -223,6 +388,9 @@ def sync(start: str, end: str, account_types: list[str], gmv_positive_only: bool
             """,
             all_rows,
         )
+        for at, res in fetched:
+            write_product_tags(conn, res.tags, start, end, stamp)
+            record_coverage(conn, at, start, end, res.coverage_status(), "sync", res, stamp=stamp)
     conn.close()
     return len(all_rows)
 
