@@ -130,8 +130,8 @@ python google_ads_mutate.py enable-campaign --campaign-id 20593969582 --execute 
 
 # clone a PMax campaign into a new PAUSED one that serves only one custom-label
 # segment, with its own budget + tROAS — ONE atomic mutate (see the prose below)
-python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers"     --source-campaign-id 1234567890 --daily-budget 500 --target-roas 4.0     --dimension custom_label_4 --include "Fast"
-python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers"     --source-campaign-id 1234567890 --source-asset-group-id 9876543210     --daily-budget 500 --target-roas 4.0 --dimension custom_label_4     --include "Fast" --include "Steady" --execute
+python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers" --source-campaign-id 1234567890 --daily-budget 500 --target-roas 4.0 --dimension custom_label_4 --include "Fast"
+python google_ads_mutate.py create-pmax-campaign --name "PMax - Fast Sellers" --source-campaign-id 1234567890 --source-asset-group-id 9876543210 --daily-budget 500 --target-roas 4.0 --dimension custom_label_4 --include "Fast" --include "Steady" --execute
 
 # copy an existing ENABLED responsive search ad into a new ad group
 python google_ads_mutate.py copy-rsa --source-ad-group-id 118472772345 \
@@ -175,6 +175,11 @@ done. It also creates no ad: a Search campaign can't serve without one, and
 requiring a human to add ad copy (via the UI, or `copy-rsa` from an existing
 ad group) is both a safety interlock and honest about who owns ad content.
 `create-search-campaign` sets **no** geo or language targeting.
+Both `create-search-campaign` and `create-pmax-campaign` hardcode
+`contains_eu_political_advertising = DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING`
+(the field is required on create since API v24). If your account does run EU
+political ads, change that line in `google_ads_mutate.py` before you use either
+command.
 `set-campaign-geo`/`set-campaign-language` exist because an unset geo or
 language target means "target literally everywhere / every language," not
 "inherit a sensible default." Run both before `enable-campaign`.
@@ -194,7 +199,12 @@ and the listing tree, which becomes a SUBDIVISION on `--dimension` with one
 `ADVERTISER`-source links are taken: Google rejects automatically created
 assets on create and regenerates its own. The source must have exactly one
 enabled asset group, or you pass `--source-asset-group-id`. The new campaign
-is always created **paused**; use `enable-campaign` to go live. A common use
+is always created **paused**; use `enable-campaign` to go live. Inside it, the
+new asset group takes the campaign's `--name` and is created `ENABLED`, so it
+serves as soon as the campaign does. Brand-guidelines assets are cloned only
+when the source campaign has brand guidelines turned on. `--target-roas` is a
+ratio (`4.0` = 400%), and `--dimension` accepts `custom_label_0` to
+`custom_label_4`. A common use
 is splitting a segment your feed already labels (sell-through pace, margin
 tier, season) into its own campaign so it can get a different budget and
 return target from the rest of the catalog.
@@ -435,7 +445,10 @@ client with canned GAQL rows. It pins the single validate-only mutate, the
 operation order (budget → campaign → criteria → brand assets → shared sets →
 asset group → asset links → signals → listing tree), the PAUSED status and
 non-shared budget, the `ADVERTISER`-only asset filters, the include /
-everything-else leaves, and the exits on a non-PMax or ambiguous source.
+everything-else leaves, and the exits on a non-PMax or ambiguous source. It
+also covers `--execute` turning validate-only off, brand assets being skipped
+when the source has brand guidelines off, and `--source-asset-group-id`
+choosing between several enabled asset groups.
 
 `tests/test_google_ads_detail_sync.py` pins the `LAGGING_GRAINS` floors:
 `google_paid_organic` widens a one-day run back 10 days, the

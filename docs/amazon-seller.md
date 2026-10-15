@@ -256,10 +256,12 @@ a partial week can never be mistaken for a finished one. It reuses
 `amazon_traffic_sync`'s report request/poll/download helpers and `coverage()`
 validation, so it needs the same SP-API credentials (`SPAPI_CLIENT_ID`,
 `SPAPI_CLIENT_SECRET`, `SPAPI_REFRESH_TOKEN`, optional `SPAPI_REGION`) and
-Sales & Traffic report access.
+Sales & Traffic report access. `SPAPI_MARKETPLACE_ID` is also required: the
+startup check doesn't test for it, so if it's unset the report request fails
+with a `KeyError`.
 
 ```bash
-python amazon_event_pull.py --event-id spring_sale_2026 --name "Spring Sale"     --start 2026-03-10 --end 2026-03-11
+python amazon_event_pull.py --event-id spring_sale_2026 --name "Spring Sale" --start 2026-03-10 --end 2026-03-11
 ```
 
 | Flag | Default | Meaning |
@@ -293,17 +295,27 @@ Tables written (all in one transaction):
   `mechanic='deal'`) so event windows can be joined to any channel's data.
 
 Completeness and exit codes: the same two checks as the weekly pull apply
-(every day present; byDate vs byAsin sales within 2%). A complete pull logs
-`ok` and exits `0`; a short pull logs `degraded` (sync log platform
-`amazon_event`) and exits `1`. Amazon publishes the latest day late, so a pull
+(every day present; byDate vs byAsin sales within 2%). A complete pull with
+data logs `ok` and exits `0`; a short pull logs `degraded` (sync log platform
+`amazon_event`) and exits `1`. A pull that passes both checks but returned
+zero ASIN rows and zero daily rows also logs `degraded`, yet exits `0`. If a
+report request itself fails, the script raises before anything is logged, so
+that case shows only as a traceback and a non-zero exit, with no `sync_log` row. Amazon publishes the latest day late, so a pull
 made while the event is still current is often short and the final day may
 restate upward — re-run until `is_complete = 1`. The weekly pull after the
 week closes is authoritative.
 
 ## Tests
 
-`tests/test_amazon_inventory_sync.py`, `tests/test_amazon_awd_sync.py`,
+`tests/test_amazon_inventory_sync.py` (field mapping, `nextToken` read from
+the top level, 429 retried, a hard error raising, and the expired-`nextToken`
+restart: crawl restarted from page 1 with partial rows discarded, restarts
+bounded, any other 400 still failing on the first attempt),
+`tests/test_amazon_event_pull.py` (row shaping with missing report sections,
+event tables written without touching the weekly coverage table, an
+incomplete window recorded rather than hidden, a re-run with the same
+`--event-id` replacing its rows), `tests/test_amazon_awd_sync.py`,
 `tests/test_amazon_awd.py`, `tests/test_amazon_returns_sync.py`,
 `tests/test_amazon_rank_sync.py`, `tests/test_amazon_fees_sync.py`,
-`tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`, `tests/test_amazon_event_pull.py`,
+`tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`,
 `tests/test_amazon_listing_quality_sync.py`, `tests/test_voc_import.py`

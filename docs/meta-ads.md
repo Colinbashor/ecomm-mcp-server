@@ -291,7 +291,17 @@ conditions (all wanted found, consecutive barren pages, known videos not
 re-stored, unresolved ids reported), and `run()` / `main()` behaviour
 (`--only insights`, spend-bounded creative targeting,
 `--refresh-creatives`, video crawl of new references, skipped days and the
-`degraded` vs `ok` status).
+`degraded` vs `ok` status), plus the funnel side: only ad sets that spent in
+the window are looked up, their stages land in `meta_adset_funnel` with
+`unknown` ones counted (`stage_unknown`), and `fetch_adset_funnel` classifies
+from targeting (no custom audience → `cold`, a lookalike → `unknown`).
+
+`tests/test_meta_funnel.py` — hermetic `classify_targeting` cases: no
+included audience is `cold` even when exclusions exist, stacked site-visitor
+and engager audiences are `retargeting`, PDP / video-viewer audiences are
+`warm_product`, a customer list is `retention` and outranks retargeting, an
+unrecognised included audience (e.g. a lookalike) or missing targeting is
+`unknown`, and a `META_FUNNEL_*_PATTERN` env override replaces the default.
 
 ## Standalone extra: write-capable `meta_ads_mutate.py`
 

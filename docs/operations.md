@@ -99,7 +99,9 @@ HTML, both UTF-8); `cc` addresses get a `Cc:` header and receive the message.
 text/html alternative part first, then each file as a base64
 `application/octet-stream` part whose filename is the file's basename. Every
 file is read before any SMTP connection is opened, so an unreadable or
-missing path **raises** (`OSError`) rather than returning `False`. No MIME
+missing path **raises** (`OSError`) rather than returning `False`. The
+exception is when SMTP isn't configured or `to` is empty: those checks run
+first and return `False` before any attachment is read. No MIME
 type guessing or size limit is applied — keep attachments within your SMTP
 provider's message-size cap (about 25 MB for Gmail). Without `attachments`
 the message shape is unchanged.
@@ -198,8 +200,10 @@ anything is logged, so that case shows only as a traceback / nonzero exit.
 
 - `tests/test_notify.py` — `to_chat_markdown`, per-dest target lookup,
   email subject derivation, `to_email_html`, SMTP config defaults,
-  `send_email()` (multipart shape, cc, retry, exhausted retries return
-  `False`), and `send()` (skips unconfigured dests, never raises, one failing
+  `send_email()` (multipart shape, attachments turning the message
+  `multipart/mixed` while no attachments keeps it `multipart/alternative`,
+  cc, retry, exhausted retries return `False`), and `send()` (skips
+  unconfigured dests, never raises, one failing
   platform doesn't block others, truncation).
 - `tests/test_backup_db.py` — backup + verification, rejecting an empty
   source database, rotation (keeps newest N, removes `-wal`/`-shm` crumbs),
