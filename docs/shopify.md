@@ -139,7 +139,12 @@ allows **one bulk query per app at a time**. If another bulk query is
 already running on the same app (for example, one left over from a killed
 run), the script does not cancel it. It **waits for that job to finish**,
 then resubmits its own. If the other job ends `FAILED` or `CANCELED`, this
-run errors out. The bulk query itself has no pagination: results stream
+run errors out. While polling, the script tracks **its own** operation by id.
+Shopify's `currentBulkOperation` only returns the app's most recent job, so
+if another job starts on the same app mid-run, the script looks its own job
+up with `node(id:)` instead of waiting for a job that isn't its own. Polling
+gives up with a `RuntimeError` after `POLL_MAX_MIN` (120) minutes. The bulk
+query itself has no pagination: results stream
 back as JSONL, are regrouped by `__parentId`, and batches are only cut at a
 root-line boundary.
 

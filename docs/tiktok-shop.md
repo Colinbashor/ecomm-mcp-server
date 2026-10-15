@@ -58,7 +58,9 @@ python tiktok_videos_sync.py --account-types AFFILIATES     # default is AFFILIA
 python tiktok_videos_sync.py --gmv-positive-only   # cheaper: stop paging at the first zero-GMV video
 
 python tiktok_video_products_backfill.py           # video x product history back to the API's lookback floor
-python tiktok_video_products_backfill.py --status  # coverage per window, read-only
+python tiktok_video_products_backfill.py --status  # coverage per window (writes no data; creates the tables if absent)
+python tiktok_video_products_backfill.py --start 2026-05-01 --end 2026-07-01   # explicit range (--end is exclusive)
+python tiktok_video_products_backfill.py --account-types AFFILIATES --force    # re-pull windows already `complete`
 
 python tiktok_live_sync.py                         # both lives + per-product funnel, trailing 30 days
 python tiktok_live_sync.py --only lives             # or `products` -- skip the other half
@@ -70,7 +72,8 @@ python tiktok_creators_sync.py import --dir exports/   # import every .xlsx/.csv
 python tiktok_creators_sync.py api --dry-run        # fetch + report, write nothing (also on `import`)
 
 python tiktok_creator_marketplace_sync.py --handles creator_one,creator_two
-python tiktok_creator_marketplace_sync.py --from-table tiktok_creators --handle-column handle     --group footwear=601352 --group bags=824584 --max-age-days 14
+python tiktok_creator_marketplace_sync.py --handles-file handles.txt --limit 200   # cap this run at 200 lookups
+python tiktok_creator_marketplace_sync.py --from-table tiktok_creators --handle-column handle --group footwear=601352 --group bags=824584 --max-age-days 14
 
 python tiktok_analytics_sync.py                     # trailing 30 days (default)
 python tiktok_analytics_sync.py --start 2026-01-01 --end 2026-01-31
@@ -86,7 +89,14 @@ python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
 python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit 400   # smoke test: first 400 ids
 ```
 
-`tiktok_videos_sync.py` retries each page up to 6 times: it refreshes an expired access token once, and backs off exponentially (1, 2, 4, 8, 16s) on connection resets, timeouts, non-JSON bodies, HTTP 429/5xx and API codes 105050 / 105051 / 429000. A month of videos is hundreds of pages, so without this one transient failure would abort the whole pull; any other non-zero API code still fails immediately.
+`tiktok_videos_sync.py` makes up to 6 attempts per page. One of them may be
+spent refreshing an expired access token (once per page; a second expired-token
+code fails immediately). Connection resets, timeouts, non-JSON bodies, HTTP
+429/5xx and API codes 105050 / 105051 / 429000 sleep `2**attempt` seconds
+(1, 2, 4, 8, 16, 32s; the last sleep happens even though no attempt follows)
+and try again. A month of videos is hundreds of pages, so without this one
+transient failure would abort the whole pull; any other non-zero API code still
+fails immediately.
 
 The orders connector (`warehouse/connectors/tiktok_shop.py`, driven by
 `run_sync.py`) keeps two independent retry budgets per page request: the access
@@ -95,13 +105,19 @@ faults are retried up to 5 times with a growing sleep (15s, 30s, 45s, 60s, 60s).
 Transient means business codes 98001021 / 36009003 (returned inside an HTTP 200),
 connection resets, timeouts and non-JSON bodies. Every attempt rebuilds and
 re-signs the request so the timestamp is fresh. Any other non-zero code raises
-immediately, so a bad request is never masked as a hiccup.
+immediately, so a bad request is never masked as a hiccup. The retry keys on
+the **body**, not the HTTP status: an HTTP 429/5xx that still returns a JSON
+body is retried only if that body carries one of the transient codes above.
 
 ## Tables
 
 - `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
 - `tiktok_shop_videos` — one row per video x account_type x window, holding
-  only the FIRST tagged product (`product_id`) plus `product_count`
+  only the FIRST tagged product (`product_id`) plus `product_count`. Written
+  with `INSERT OR REPLACE`, so re-running the same window overwrites that
+  window's metrics. That is intended: GMV and views for recent days keep
+  climbing until TikTok finalizes them, which is why `--current-window` exists.
+  Only `tiktok_videos_sync.py` writes this table; the backfill never does.
 - `tiktok_shop_video_products` — EVERY product a video tags (PK `video_id`,
   `account_type`, `product_id`; `position` 1 = first; `first_seen` /
   `last_seen` = the earliest window_start / latest window_end that returned
@@ -113,9 +129,10 @@ immediately, so a bad request is never masked as a hiccup.
   ASKED for: `status` (`complete` / `short` = fewer distinct videos than the
   API's `total_count` / `empty` / `out_of_retention` = business code 28001022
   / `failed`), counts, `attempts`, `source` (`sync` / `backfill`). Written by
-  both the daily sync and the backfill; the backfill resumes from it, never
-  from absent tag rows (a window can legitimately have no multi-product
-  video).
+  both the daily sync and the backfill, but the daily sync only ever records
+  `complete` / `short` / `empty`; `failed` and `out_of_retention` rows come
+  from the backfill alone. The backfill resumes from this table, never from
+  absent tag rows (a window can legitimately have no multi-product video).
 - `tiktok_shop_lives`, `tiktok_shop_live_products`
 - `tiktok_creators`
 - `tiktok_creator_marketplace`, `tiktok_category_top`
@@ -135,6 +152,56 @@ immediately, so a bad request is never masked as a hiccup.
   sent one)
 
 ## Notes
+
+### Video sync and video-products backfill: run behaviour
+
+`tiktok_videos_sync.py`:
+
+- Fetches **every** account type first and writes only afterwards, in one
+  transaction. A failure in any account type therefore writes nothing (no
+  video rows, no tag rows, not even a `failed` coverage row), logs `sync_log`
+  `status='error'` (platform `tiktok_videos`) and exits `1` with the traceback.
+- A successful run always logs `ok` with `rows_written` = video rows, even if a
+  window's coverage came back `short` or `empty`. Check
+  `tiktok_shop_video_products_coverage` (or the backfill's `--status`), not
+  `sync_log`, to see whether a window was really complete.
+- **`--gmv-positive-only` gotcha.** A winners-only run stops paging at the
+  first zero-GMV video and still records that window as `complete`. The
+  backfill treats any `complete` window as done, so it will never fill in that
+  window's zero-GMV tail unless you pass `--force`. Don't use
+  `--gmv-positive-only` on windows you later want full product-tag history for.
+
+`tiktok_video_products_backfill.py`:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--start` | today − 178 days (the API's approximate lookback floor) | first day pulled |
+| `--end` | tomorrow | **exclusive** end |
+| `--account-types` | `AFFILIATES,LINKED_ACCOUNTS` | comma list |
+| `--force` | off | re-pull windows already `complete` (also skips the floor stepping below) |
+| `--status` | off | print the coverage table and per-account tag totals, then exit `0`. Needs no TikTok credentials. Writes no data, but does run `init_db` and creates the tables if they are missing. |
+
+- The range is cut into calendar-month windows, oldest first, one pull per
+  window x account type. A window is skipped when a `complete` coverage row
+  (from either script) already spans it.
+- **Retention floor.** TikTok refuses start dates older than its lookback
+  (business code 28001022, stored as `out_of_retention`). Only the **first**
+  window handles this: it steps its start forward one day at a time, at most
+  10 days (`FLOOR_STEP_LIMIT`), and on later runs it starts past days already
+  refused. An `out_of_retention` on any later window is final and never
+  retried.
+- **Poison guard.** A window that keeps coming back `short`, `empty` or
+  `failed` is retried on later runs, up to 4 attempts (`MAX_ATTEMPTS`). After
+  that it is skipped until you `--force` it.
+- **Status and exit code** (`sync_log` platform
+  `tiktok_video_products_backfill`): any `failed` window → `error` (exit `1`);
+  otherwise any `short` / `empty` window → `degraded` (exit `75`); a run that
+  neither completed nor skipped anything → `degraded`; else `ok` (exit `0`).
+  Windows blocked by the poison guard count as "skipped", so a run where every
+  remaining window is poisoned reports `ok`; read `--status` to spot them.
+  `rows_written` is the **total** row count of `tiktok_shop_video_products`
+  after the run, not the rows this run added. An uncaught exception logs
+  `error` and re-raises.
 
 `tiktok_creators_sync.py` exists because TikTok's video API and order API
 expose different halves of a creator's identity with no shared join key — the
@@ -167,9 +234,22 @@ authorisation and is not used). Things to know before trusting the numbers:
 - `gmv_band` / `units_band` are bands (`$150K+`), not numbers, and an empty
   category list usually means the creator has not authorised data sharing —
   not that they are a poor fit.
-- Five consecutive request errors stop the run with exit code 75 and a
-  `degraded` `sync_log` row (platform `tiktok_creator_marketplace`); a run
-  where no handle matched at all is also `degraded`, never `ok`.
+- `--max-age-days` (default 30) skips handles asked within that many days,
+  found or not. `--limit N` caps the lookups in one run (0 = no cap).
+- The top-level category list (`tiktok_category_top`) is refreshed **before**
+  any lookup. If that call fails the script raises (exit `1`) and writes no
+  `sync_log` row.
+- There is no dedicated 429/transient retry. Any exception on a handle counts
+  as an error: the script sleeps 5s and moves to the next handle, and one
+  success resets the count. Five consecutive errors stop the run with exit
+  code `75` and a `degraded` `sync_log` row (platform
+  `tiktok_creator_marketplace`). Rerun later; handles already asked are
+  skipped by `--max-age-days`.
+- A run where no handle matched at all is logged `degraded`, never `ok`, but
+  still exits `0`. Only the error stop exits `75`.
+- Rows are written with `INSERT OR REPLACE` on the handle, so a later lookup
+  that finds nothing (`found = 0`) **replaces** an earlier `found = 1` profile
+  for that handle. Rows are committed every 25 handles.
 
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction. It chunks
@@ -265,20 +345,26 @@ there is no fallback id list.
 
 ## Tests
 
-`tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_video_products.py` (every
+`tests/test_tiktok_videos_sync.py` (token refresh and a hard API error; the
+transient-retry path has no dedicated test), `tests/test_tiktok_video_products.py` (every
 tagged product fanned out with positions, coverage statuses, an older window
 never overwriting a newer position, named-column upsert, month windows, the
-backfill stepping past the retention floor, resuming from coverage not tag
-rows, the poison guard, and never touching `tiktok_shop_videos`),
+backfill stepping past the retention floor, `out_of_retention` after the first
+window being final, resuming from coverage not tag rows, the poison guard,
+`run_status`, and never touching `tiktok_shop_videos`),
 `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
 `tests/test_tiktok_creator_marketplace_sync.py` (handle parsing/dedupe, exact-match
 only lookup rejecting fuzzy hits, not-found rows still written, group-share sums,
-resume by `--max-age-days`, consecutive-error stop),
+resume by `--max-age-days`, consecutive-error stop, a success resetting the
+error streak),
 `tests/test_tiktok_shop_connector.py` (per-sku summing of `seller_discount`/
 `platform_discount` across unit-lines, and that `upsert_orders()` stores them
-while leaving them `NULL` for connectors that never set them),
+while leaving them `NULL` for connectors that never set them; `FetchPageRetryTests`:
+a transient code or a connection error retried then succeeding, the transient
+budget exhausting and raising, a non-transient code failing fast, and the token
+refreshed only once),
 `tests/test_tiktok_net_sales_view.py` (the `tiktok_weekly_product` precedence:
 line-level `platform_discount` wins, then the settlement pro-rata split, then
 raw `total` — never zero by default)

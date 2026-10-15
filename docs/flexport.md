@@ -120,7 +120,9 @@ as a backstop for orders whose external id has some other shape.
 | Clean run | `0` | `ok` | inventory rows / new orders / returns / shipments |
 | Transient pause (orders, inbounds, returns) | `75` | `degraded` (message `paused, resumable` / `paused (transient)`) | rows committed before the pause |
 | Returns walk incomplete (page cap) or found no new/changed return | `75` | `degraded` (message `INCOMPLETE` / `NO PROGRESS`) | new + changed returns |
-| Any other exception | non-zero (traceback re-raised) | `error` (message = exception text, truncated to 500 chars) | `0` |
+| `--from-shopify` with `FLEXPORT_SHOPIFY_LOCATION` unset | `1` | (no row) | — |
+| `--from-shopify` empty pull, >5% 404s on ≥20 ids, or >`max(5, 1%)` fetch errors | `75` | `degraded` under `flexport_orders_direct` (message prefixed `EMPTY:` / `EXTERNAL-ID RULE MAY HAVE CHANGED:` for the first two) | orders fetched |
+| Any other exception | non-zero (traceback re-raised) | `error` (message = exception text, truncated to 500 chars; returns appends its walk summary) | `0` (returns: new + changed rows committed before the failure) |
 
 `flexport_sync.py` has no degraded/75 path: retry exhaustion there raises
 `RuntimeError` and the run is logged `error`. For `flexport_returns_sync.py`,
@@ -305,9 +307,9 @@ run just converges the snapshot.
 Request timeout is 60s in `flexport_sync.py` and 90s in the other three.
 In `flexport_orders_sync.py` a 400 from `/events` is treated as possible
 load-shedding and retried with backoff; only once the whole budget is spent
-does it raise `FlexportBadCursor`. Retry exhaustion in the orders and
-inbounds scripts raises `FlexportTransient`, which triggers the graceful
-pause (exit 75); in the other two it is a plain `RuntimeError`.
+does it raise `FlexportBadCursor`. Retry exhaustion in the orders, inbounds
+and returns scripts raises `FlexportTransient`, which triggers the graceful
+pause (exit 75); in `flexport_sync.py` it is a plain `RuntimeError`.
 
 `flexport_sync.py`'s `--catalog` crawl also retries a `database is locked`
 error on a page commit up to 10 times with exponential backoff (capped at
@@ -450,6 +452,14 @@ its own valid next-cursor with no call-site change needed.
   retried / exhausted → transient, 504 shrink without mutating caller params,
   504 at min page backs off), order-row mapping, skipping stored orders,
   transient pause, `--restart`.
+- `tests/test_flexport_orders_direct.py` — the `--from-shopify` mode: external
+  id built from order name + split marker + numeric fulfillment-order id (bare
+  name when no marker), other locations / cancelled / not-yet-accepted
+  fulfillment orders skipped, `/` percent-encoded in the path, a 404 raising
+  `FlexportNotFound` (a `RuntimeError` subclass) and counted rather than
+  failing, fetched orders stored and logged `ok`, an empty pull and a high
+  404 rate on accepted orders both `degraded`, and a missing
+  `FLEXPORT_SHOPIFY_LOCATION` refusing to run.
 - `tests/test_flexport_returns_sync.py` — a fake newest-first feed: new
   returns at the head are ingested, window walks stop at their floor,
   in-flight returns are refreshed with their lines replaced wholesale, a
