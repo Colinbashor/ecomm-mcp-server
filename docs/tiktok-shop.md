@@ -1,6 +1,6 @@
 # TikTok Shop
 
-Order ground truth (core), plus seven standalone scripts for video
+Order ground truth (core), plus seven standalone scripts (and a one-off video-products backfill) for video
 performance, LIVE-shopping, creator identity and Marketplace profiles, sales-source attribution,
 settlement/fee data, and listing-quality diagnostics.
 
@@ -9,7 +9,8 @@ settlement/fee data, and listing-quality diagnostics.
 | Script | Type | Covers |
 |---|---|---|
 | `warehouse/connectors/tiktok_shop.py` | core, via `run_sync.py --only tiktok` | orders into `orders` |
-| `tiktok_videos_sync.py` | standalone | video performance |
+| `tiktok_videos_sync.py` | standalone | video performance + every product each video tags |
+| `tiktok_video_products_backfill.py` | standalone, one-off | month-by-month history of every product each video tags |
 | `tiktok_live_sync.py` | standalone | LIVE-shopping broadcast + product funnel |
 | `tiktok_creators_sync.py` | standalone | handle ↔ display-name ↔ user-id creator/affiliate identity bridge |
 | `tiktok_creator_marketplace_sync.py` | standalone | per-creator Marketplace profile (whole-shop category split, GMV/units bands, rating, commission) for handles you supply |
@@ -38,7 +39,7 @@ settlement/fee data, and listing-quality diagnostics.
    | `TIKTOK_LIVE_OWN_ACCOUNT_TYPE` | which `tiktok_shop_lives.account_type` counts as your own broadcasts vs. affiliate/creator or paid-marketing lives (default `OFFICIAL_ACCOUNTS`) |
    | `TIKTOK_SHOP_TIMEZONE` | IANA timezone for bucketing LIVE broadcasts into calendar days (default `UTC`) |
 
-All six extras reuse the core `TIKTOK_*` credentials — nothing new to
+All the extras reuse the core `TIKTOK_*` credentials — nothing new to
 configure, except `tiktok_listing_quality_sync.py`, which additionally needs
 the `seller.product.optimize` scope granted on your Partner Center app
 (separate from the product-read scopes the other scripts use — check
@@ -55,6 +56,9 @@ python tiktok_videos_sync.py --start 2026-01-01 --end 2026-01-31
 python tiktok_videos_sync.py --current-window      # trailing 30 days ending tomorrow -- for a daily cron
 python tiktok_videos_sync.py --account-types AFFILIATES     # default is AFFILIATES,LINKED_ACCOUNTS; also accepts ALL
 python tiktok_videos_sync.py --gmv-positive-only   # cheaper: stop paging at the first zero-GMV video
+
+python tiktok_video_products_backfill.py           # video x product history back to the API's lookback floor
+python tiktok_video_products_backfill.py --status  # coverage per window, read-only
 
 python tiktok_live_sync.py                         # both lives + per-product funnel, trailing 30 days
 python tiktok_live_sync.py --only lives             # or `products` -- skip the other half
@@ -96,7 +100,22 @@ immediately, so a bad request is never masked as a hiccup.
 ## Tables
 
 - `orders` (core, shared across platforms — see the main [README](../README.md#mcp-tools))
-- `tiktok_shop_videos`
+- `tiktok_shop_videos` — one row per video x account_type x window, holding
+  only the FIRST tagged product (`product_id`) plus `product_count`
+- `tiktok_shop_video_products` — EVERY product a video tags (PK `video_id`,
+  `account_type`, `product_id`; `position` 1 = first; `first_seen` /
+  `last_seen` = the earliest window_start / latest window_end that returned
+  the tag). Cumulative, never deleted; name/position come from the LATEST
+  window seen, so an older backfill window never overwrites a newer pull.
+  Product entries carry only id + name: GMV / units / views are VIDEO-level,
+  so never sum a video's metrics across its tagged products.
+- `tiktok_shop_video_products_coverage` — one row per account_type x window
+  ASKED for: `status` (`complete` / `short` = fewer distinct videos than the
+  API's `total_count` / `empty` / `out_of_retention` = business code 28001022
+  / `failed`), counts, `attempts`, `source` (`sync` / `backfill`). Written by
+  both the daily sync and the backfill; the backfill resumes from it, never
+  from absent tag rows (a window can legitimately have no multi-product
+  video).
 - `tiktok_shop_lives`, `tiktok_shop_live_products`
 - `tiktok_creators`
 - `tiktok_creator_marketplace`, `tiktok_category_top`
@@ -246,7 +265,12 @@ there is no fallback id list.
 
 ## Tests
 
-`tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_live_sync.py`,
+`tests/test_tiktok_videos_sync.py`, `tests/test_tiktok_video_products.py` (every
+tagged product fanned out with positions, coverage statuses, an older window
+never overwriting a newer position, named-column upsert, month windows, the
+backfill stepping past the retention floor, resuming from coverage not tag
+rows, the poison guard, and never touching `tiktok_shop_videos`),
+`tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
 `tests/test_tiktok_creator_marketplace_sync.py` (handle parsing/dedupe, exact-match
