@@ -240,6 +240,70 @@ def upsert_shopify_order_customers(rows: list[dict]) -> int:
     return len(rows)
 
 
+def replace_shopify_order_tags(orders: list[dict]) -> int:
+    """Replace the whole tag set of each order, and record that it was read.
+
+    `orders` is one dict per order: {order_id, order_date, tags: [str, ...]},
+    from shopify._tag_row(). Written as a side effect by the Shopify connector,
+    like the two upserts above.
+
+    REPLACE, not upsert: a tag removed in Shopify must disappear here, so each
+    order's existing rows are deleted before its current tags go in. All the
+    deletes run before any insert, in ONE transaction, so a reader never sees an
+    order half-rewritten. An order with no tags still gets a
+    shopify_order_tag_coverage row (tag_count 0); that row is what tells a
+    measured "untagged" apart from "never looked".
+
+    Returns the number of tag rows written."""
+    if not orders:
+        return 0
+    # order_id is the display NAME, which is not guaranteed unique (a store can
+    # change its order-name format, and imported orders can reuse names). If two
+    # orders sharing a name land in one batch, take the union of their tags: the
+    # coverage count then matches the rows, and the second order can't erase the
+    # first's tags. Dedupe ignores case because the tag column is COLLATE NOCASE.
+    merged: dict[str, dict] = {}
+    for o in orders:
+        m = merged.setdefault(o["order_id"], {"order_id": o["order_id"],
+                                              "order_date": o["order_date"], "tags": []})
+        seen = {t.lower() for t in m["tags"]}
+        for t in o["tags"]:
+            if t.lower() not in seen:
+                seen.add(t.lower())
+                m["tags"].append(t)
+    orders = list(merged.values())
+    stamp = now()
+    tag_rows = [
+        {"order_id": o["order_id"], "tag": t, "order_date": o["order_date"], "synced_at": stamp}
+        for o in orders for t in o["tags"]
+    ]
+    conn = connect()
+    with conn:
+        conn.executemany("DELETE FROM shopify_order_tags WHERE order_id = ?",
+                         [(o["order_id"],) for o in orders])
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO shopify_order_tags
+              (order_id, tag, order_date, synced_at)
+            VALUES
+              (:order_id, :tag, :order_date, :synced_at)
+            """,
+            tag_rows,
+        )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO shopify_order_tag_coverage
+              (order_id, order_date, tag_count, synced_at)
+            VALUES
+              (:order_id, :order_date, :tag_count, :synced_at)
+            """,
+            [{"order_id": o["order_id"], "order_date": o["order_date"],
+              "tag_count": len(o["tags"]), "synced_at": stamp} for o in orders],
+        )
+    conn.close()
+    return len(tag_rows)
+
+
 def log_sync(platform: str, started_at: str, rows_written: int, status: str, message: str = "") -> None:
     conn = connect()
     with conn:

@@ -87,6 +87,7 @@ query($n: Int!, $cursor: String, $q: String!) {
       createdAt
       displayFinancialStatus
       sourceName
+      tags
       %s
       lineItems(first: 50) {
         nodes {
@@ -283,7 +284,12 @@ def sync(start_date: str, end_date: str) -> list[dict]:
     SECOND SIDE EFFECT, same reason: the Shopify customer id goes to
     shopify_order_customers, but ONLY when the app holds read_customers (see
     customer_capture_enabled). Without the scope the field is not even requested,
-    so this stays a no-op and the order sync is untouched."""
+    so this stays a no-op and the order sync is untouched.
+
+    THIRD SIDE EFFECT: each order's tag set replaces its rows in
+    shopify_order_tags, and shopify_order_tag_coverage records that it was read.
+    `tags` needs only read_orders, which this sync can't run without, so it is
+    requested unconditionally."""
     q = f"created_at:>='{start_date}T00:00:00Z' AND created_at:<='{end_date}T23:59:59Z'"
     want_customer = customer_capture_enabled()
     doc = _build_query(want_customer)
@@ -291,6 +297,7 @@ def sync(start_date: str, end_date: str) -> list[dict]:
     rows: list[dict] = []
     disc: list[dict] = []
     cust: list[dict] = []
+    tags: list[dict] = []
     cursor = None
     while True:
         data = _post({"n": PAGE_SIZE, "cursor": cursor, "q": q}, doc)
@@ -304,6 +311,8 @@ def sync(start_date: str, end_date: str) -> list[dict]:
             disc.extend(_discount_rows(name, day, items))
             if want_customer:
                 cust.append(_customer_row(name, day, o.get("customer")))
+            if "tags" in o:  # absent = not read, so record nothing (not "untagged")
+                tags.append(_tag_row(name, day, o["tags"]))
         if not block["pageInfo"]["hasNextPage"]:
             break
         cursor = block["pageInfo"]["endCursor"]
@@ -313,6 +322,8 @@ def sync(start_date: str, end_date: str) -> list[dict]:
         db.upsert_shopify_discounts(disc)
     if cust:
         db.upsert_shopify_order_customers(cust)
+    if tags:
+        db.replace_shopify_order_tags(tags)
     return rows
 
 
@@ -325,6 +336,27 @@ def _customer_row(order_id: str, order_date: str, customer: dict | None) -> dict
         "customer_id": numeric_id((customer or {}).get("id")),
         "order_date": order_date,
     }
+
+
+def _tag_row(order_id: str, order_date: str, tags: list[str] | str | None) -> dict:
+    """One order's tag set for db.replace_shopify_order_tags().
+
+    GraphQL returns `tags` as a list. A comma-joined string, which is the REST
+    and CSV-export form, is split too, so a payload in that shape can't land as
+    one giant tag. Whitespace is trimmed and empties dropped. Duplicates are
+    dropped ignoring case, keeping the first spelling, because
+    shopify_order_tags.tag is COLLATE NOCASE. An order with no tags returns an
+    empty list, which is still written as a coverage row."""
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in tags or []:
+        t = str(raw).strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return {"order_id": order_id, "order_date": order_date, "tags": out}
 
 
 # DiscountApplication is an interface; __typename is the only unambiguous way to

@@ -464,13 +464,28 @@ def _current_bulk() -> dict | None:
                 "{ id status errorCode objectCount url } }")["currentBulkOperation"]
 
 
+def _op_by_id(op_id: str) -> dict | None:
+    """Look one bulk op up by its own gid (BulkOperation implements Node)."""
+    return _gql("{ node(id: %s) { ... on BulkOperation "
+                "{ id status errorCode objectCount url } } }" % json.dumps(op_id))["node"]
+
+
 def _wait_for(op_id: str) -> dict:
-    """Poll currentBulkOperation until it terminates."""
+    """Poll until OUR op terminates.
+
+    currentBulkOperation is only the app's MOST RECENT op. If another job on the
+    same app (an order backfill, another sync) submits in the gap between ours
+    finishing and our next poll, the current op is theirs, and polling it alone
+    would never see ours complete: it would run out the POLL_MAX_MIN clock and
+    fail a crawl that actually finished. So when the current op isn't ours, ask
+    for ours by id."""
     deadline = POLL_MAX_MIN * 60 / POLL_SECONDS
     tries = 0
     while True:
         time.sleep(POLL_SECONDS)
         cur = _current_bulk()
+        if not (cur and cur.get("id") == op_id):
+            cur = _op_by_id(op_id)
         if cur and cur.get("id") == op_id:
             st = cur.get("status")
             if st == "COMPLETED":
