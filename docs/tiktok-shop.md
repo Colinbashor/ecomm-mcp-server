@@ -14,6 +14,7 @@ settlement/fee data, and listing-quality diagnostics.
 | `tiktok_live_sync.py` | standalone | LIVE-shopping broadcast + product funnel |
 | `tiktok_creators_sync.py` | standalone | handle ↔ display-name ↔ user-id creator/affiliate identity bridge |
 | `tiktok_creator_marketplace_sync.py` | standalone | per-creator Marketplace profile (whole-shop category split, GMV/units bands, rating, commission) for handles you supply |
+| `tiktok_affiliate_sync.py` | standalone | seller Affiliate API: per-SKU-line creator commission, sample applications, and a `creator_open_id` ↔ `orders.creator_id` crosswalk built through sample orders |
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
 | `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
 | `tiktok_listing_quality_sync.py` | standalone | per-product content-quality tier + issues (Listings Diagnosis API) |
@@ -79,6 +80,13 @@ python tiktok_analytics_sync.py                     # trailing 30 days (default)
 python tiktok_analytics_sync.py --start 2026-01-01 --end 2026-01-31
 python tiktok_analytics_sync.py --dry-run           # fetch and report, write nothing
 
+python tiktok_affiliate_sync.py orders --days 14            # trailing re-pull of affiliate order lines
+python tiktok_affiliate_sync.py orders --start 2024-01-01   # backfill; skips windows already complete
+python tiktok_affiliate_sync.py samples --list --lookup     # application statuses + per-order lookups
+python tiktok_affiliate_sync.py samples --by-product --since 2024-01-01   # needs catalog_tiktok, or --product-ids
+python tiktok_affiliate_sync.py xwalk                       # rebuild the crosswalk only
+python tiktok_affiliate_sync.py report --split 2025-01-01   # read-only coverage numbers
+
 python tiktok_finance_sync.py                 # settlements, last 30 days
 python tiktok_finance_sync.py --backfill      # 365-day window
 python tiktok_finance_sync.py --no-components # statements only, fast
@@ -136,6 +144,27 @@ body is retried only if that body carries one of the transient codes above.
 - `tiktok_shop_lives`, `tiktok_shop_live_products`
 - `tiktok_creators`
 - `tiktok_creator_marketplace`, `tiktok_category_top`
+- `tiktok_affiliate_order_lines` (PK `order_id`, `line_no`) — one row per
+  affiliate order SKU line: `creator_username` (handle at pull time),
+  `content_type` / `content_id`, `commission_rate_pct`,
+  `shop_ads_commission_rate_pct`, `est_*` / `act_*` commission base, paid
+  commission, Shop Ads, partner and co-funded bonus amounts (NULL until
+  TikTok computes them, never 0), `settlement_status`, `fully_return`,
+  `raw_json`. Each order is replaced whole on every pull.
+- `tiktok_affiliate_order_coverage` — every 7-day orders window asked:
+  `total_count` (SKU lines), `orders_returned`, `lines_written`, `status`
+  `complete` / `short` / `failed`
+- `tiktok_affiliate_sample_applications` (PK `application_id`) — sample
+  `order_id` (NULL until approved), `status`, product / SKU, creator
+  `creator_open_id` / `username` / `nickname`, `commission_rate_frac`
+  (a FRACTION here), `source` (`list:<STATUS>` / `order_lookup`)
+- `tiktok_affiliate_sample_coverage` (PK `kind`, `key`) — every status,
+  product slice or order id asked, with `capped` (hit the 10k list
+  ceiling), `found` and `attempts`
+- `tiktok_creator_handle_history` — every (creator_open_id, handle) pair
+  seen, with our own first/last-seen times
+- `tiktok_sample_order_creator`, `tiktok_creator_xwalk` — derived, rebuilt
+  every `samples` / `xwalk` run (see the note below)
 - `tiktok_shop_performance`
 - `tiktok_settlements`, `tiktok_settlement_components`, `tiktok_settlement_orders`
 - `tiktok_weekly_product` (VIEW, rebuilt by `tiktok_finance_sync.py`) — weekly
@@ -251,6 +280,60 @@ authorisation and is not used). Things to know before trusting the numbers:
   that finds nothing (`found = 0`) **replaces** an earlier `found = 1` profile
   for that handle. Rows are committed every 25 handles.
 
+`tiktok_affiliate_sync.py` fills two gaps the Order API leaves. First,
+per-line affiliate attribution: which creator handle and which content
+earned each SKU line, at what commission rate, and the estimated and
+actual commission. Second, a stable creator id for sample orders. The
+Order API gives a sample order's creator only as a display name plus a
+buyer `user_id` (`orders.creator_id`), while the affiliate endpoints key
+creators by an opaque per-app `creator_open_id` — a different id space
+that never compares equal. The sample order is the bridge: each sample
+application carries the `order_id` it produced, so
+`tiktok_sample_order_creator` maps order → application → `creator_open_id`
+→ `orders.creator_id`, and `tiktok_creator_xwalk` keeps one row per
+`creator_open_id` with the latest handle, the modal user id
+(`tiktok_user_id_count > 1` is a conflict to investigate, not hidden),
+handle count and sample-order dates. Things to know:
+
+- Orders: TikTok caps a request at a 3-month `create_time` window, so the
+  script tiles time into 7-day windows on ONE fixed grid anchored at
+  `TIKTOK_SHOP_FLOOR` (default 2023-09-01). A daily `--days 14` run lands
+  on the same windows as a backfill, so its coverage rows match and
+  completed windows are skipped; windows ending within `--refresh-days`
+  (60) are always re-pulled because commission and settlement keep
+  changing for weeks (`--force` re-pulls everything). A window reporting
+  at least `SPLIT_AT` lines is split in half before paging, and the parent
+  window still gets its own coverage row.
+- `page_size` and `total_count` count **SKU lines, not orders**, so one
+  order can straddle two pages (lines are merged per order id) and
+  coverage compares `total_count` with lines written. Paging stops on an
+  empty page or a missing token, never on a short page.
+- Units: the orders endpoint's commission rates are hundredths of a
+  percent (`"800"` = 8%, stored as `*_pct`); the samples endpoint's is a
+  fraction (`"0.10"`, stored as `commission_rate_frac`).
+- Samples: the list has no date filter and only reaches the newest 10,000
+  applications per query (offset 10,000 errors with 98001004; that is
+  recorded as `capped`). `--list` pages each order-bearing status
+  (`--all-statuses` adds the ones that never had an order). For older
+  history, `--by-product` slices COMPLETED per product — it needs an
+  optional `catalog_tiktok (seller_sku, product_id)` table to turn the
+  sample orders' seller SKUs into product ids, or explicit
+  `--product-ids` — and `--lookup` asks for the application behind each
+  unresolved sample order by `order_id` (one call each, newest first).
+  Without `--since` both cover the last 30 days.
+- An unfound sample order is re-asked at most 3 times, 7 days apart; a few
+  genuinely have no application (samples sent outside the flow), so a run
+  only turns `degraded` when misses exceed both 3 and 10% of lookups.
+- The samples endpoint rate-limits (36009037) at roughly 35-45 calls/min,
+  so calls are paced to ~25/min. A limit that survives every backoff
+  pauses the run with exit `75` and a `degraded` `sync_log` row
+  (`tiktok_affiliate_orders` / `tiktok_affiliate_samples`); re-running
+  resumes from the coverage tables. A run that writes nothing is
+  `degraded`, never `ok`.
+- Suggested schedule: daily `orders --days 14` and `samples --lookup`
+  (after the order sync that writes `orders`); weekly `orders --days 60`
+  and `samples --list --lookup`.
+
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction. It chunks
 requests by a fixed window length (`CHUNK_DAYS`) to stay under the
@@ -355,6 +438,14 @@ window being final, resuming from coverage not tag rows, the poison guard,
 `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
+`tests/test_tiktok_affiliate_sync.py` (paging past a short page and stopping
+on an empty one, an order split across pages keeping every line, the 10k
+sample ceiling recorded as capped, window splitting and the fixed grid,
+lines-not-orders coverage, `{}` money stored NULL, the two commission
+units, a renamed handle replacing rather than duplicating a line, lookup
+retry/give-up, the crosswalk bridge and its conflicts, product slices
+with and without `catalog_tiktok`, status/exit-75 handling, and the
+signed request path),
 `tests/test_tiktok_creator_marketplace_sync.py` (handle parsing/dedupe, exact-match
 only lookup rejecting fuzzy hits, not-found rows still written, group-share sums,
 resume by `--max-age-days`, consecutive-error stop, a success resetting the
