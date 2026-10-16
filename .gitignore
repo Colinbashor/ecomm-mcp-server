@@ -3,6 +3,8 @@
 *.pem
 *.key
 credentials.json
+# your Meta targeting rules carry real audience ids — keep them local
+meta_targeting_rules.json
 *service-account*.json
 certs/
 

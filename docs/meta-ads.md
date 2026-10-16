@@ -17,6 +17,8 @@ Fill in `.env` (both variables are listed in `.env.example`):
 | `META_ACCESS_TOKEN` | a long-lived system-user token. This is the only variable `run_sync.py` checks before attempting `meta` — if it is empty, `meta` is printed as `SKIPPED (no credentials in .env)`. |
 | `META_AD_ACCOUNT_ID` | looks like `act_1234567890` (include the `act_` prefix — it is used verbatim in the URL path). Not pre-checked: if the token is set but this is missing, the run fails with a `KeyError` and is logged as an error. |
 | `META_PIXEL_ID` | optional; only `meta_ads_mutate.py create-pdp-audience` needs it (the site pixel the audience is built from). |
+| `META_PAGE_ID` | optional; only `meta_ads_mutate.py create-vv-audience` needs it (the Facebook Page the ad videos belong to). |
+| `META_TARGETING_RULES` | optional; path to the targeting-rules JSON for `meta_ads_mutate.py`'s guard (default `meta_targeting_rules.json` in the repo root — see [Targeting guard](#targeting-guard)). |
 
 Optional, shared with every script: `WAREHOUSE_DB` overrides the SQLite path
 (default `warehouse.db` in the repo root).
@@ -320,6 +322,10 @@ same pinned Graph API version as the core connector; it writes nothing to
 | `copy-adset --adset-id ID --dest-campaign-id ID [--go-live] --execute` | deep-copy an ad set and its ads into another campaign |
 | `create-pdp-audience --name NAME --url-keyword HANDLE [--execute]` | create a product-page-visitors website audience (URL contains the keyword, 180 days, pixel from `META_PIXEL_ID`); idempotent by name, dry run by default |
 | `copy-ads --source-adset-id ID --dest-adset-id ID [--limit N] [--execute]` | copy the ads of one ad set into another **existing** ad set, created `PAUSED`; the dry run only lists |
+| `create-vv-audience --name NAME --video-ids ID... [--event video_view_25_percent] [--retention-days 365] [--execute]` | create a video-viewers engagement audience (reached `--event` on any of the ad videos); page from `META_PAGE_ID`; idempotent by name, dry run by default |
+| `edit-adset-audiences --adset-id ID [--include ID...] [--exclude ID...] [--remove-include ID...] [--remove-exclude ID...] [--advantage-off] [--execute]` | change only an ad set's include/exclude custom audiences and Advantage+ audience; validate-only by default (alias `adset-audience-edit`) |
+| `check-targeting --adset-id ID...` | read-only: print each ad set's targeting and its rule breaks; exit 1 on any HARD break |
+| `audience-info --ids ID...` | read-only: custom audience name, subtype, retention, size bounds, last update / content refresh, delivery status |
 | `rename --object-id ID --name NAME [--execute]` | rename one campaign / ad set / ad (validate-only by default) |
 | `rename-from-csv --csv PLAN.csv [--delay 2] [--execute]` | apply a rename plan, skipping rows whose live name drifted (see [Usage](#usage)) |
 
@@ -359,8 +365,67 @@ same pinned Graph API version as the core connector; it writes nothing to
   `EXECUTED` or `FAILED` with Meta's response; a failed create does **not**
   exit non-zero, so check the output in scripts. It exits early if
   `META_PIXEL_ID` is unset or the audience list call errors.
+- `create-vv-audience` follows the same pattern as `create-pdp-audience`
+  (one read-only list call, `EXISTS` on a duplicate name, nothing posted
+  without `--execute`). Its rule is one video-engagement entry per unique
+  video id with `META_PAGE_ID` as context. Pass the Facebook video ids from
+  the ad account's own library (`act_<id>/advideos`), not Instagram media
+  ids; each creative usually also has a copy published on the Page that a
+  token without `pages_read_engagement` cannot read. Non-numeric ids are
+  refused before any call is made.
+- `edit-adset-audiences` reads the live targeting and sends it back with
+  ONLY `custom_audiences`, `excluded_custom_audiences` and
+  `targeting_automation` changed — Meta replaces the whole `targeting`
+  object on write, so a partial payload would wipe geo, age and
+  placements. It prints before → after with audience names (resolved in
+  one `?ids=` call), refuses an audience that would be both included and
+  excluded, and prints `NO CHANGE` and sends nothing when the live
+  targeting already matches. With `--advantage-off` on an ad set that was
+  created with Advantage+ audience on, Meta rejects
+  `advantage_audience=0` (subcode 1487079, "targeting_automation must be
+  enabled to use age_range") unless `individual_setting` is present, so
+  the editor adds `individual_setting={"age":1,"gender":1}` when the
+  targeting has `age_range` and no setting.
 - Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
-  with Meta's message, type, code and subcode.
+  with Meta's message, type, code, subcode and `error_user_msg`.
+
+### Targeting guard
+
+`resume-adset`, `resume-campaign` (every ACTIVE ad set under it) and
+`copy-adset` (the SOURCE ad set) first read the live targeting and check
+it; on a HARD break they print the reason and exit 1 without writing,
+unless `--force-targeting` is passed. The failure this catches is quiet:
+a "warm" ad set that lost (or never had) its include audience delivers
+broad, and copying it multiplies the problem. `check-targeting` runs the
+same check read-only, and `edit-adset-audiences` prints it for the
+edited targeting.
+
+The rules are yours, in a JSON file (`META_TARGETING_RULES`, default
+`meta_targeting_rules.json`, git-ignored because it holds real audience
+ids). Start from `meta_targeting_rules.example.json`. Each entry in
+`stages` has a `name`, a case-insensitive `pattern` matched against the
+ad set name and then the campaign name (first match wins, so a warm ad
+set inside a cold campaign is judged as warm), and any of:
+
+| Key | Break |
+|---|---|
+| `advantage_audience_off: true` | HARD if `targeting_automation.advantage_audience` is not 0 |
+| `require_include: true` | HARD if there is no non-lookalike include audience ("runs broad") |
+| `forbid_include: true` | HARD if there is a non-lookalike include (prospecting should be broad or lookalike) |
+| `required_exclusions: {label: [ids]}` | HARD if none of a label's ids is excluded |
+| `recommended_inclusions: {label: [ids]}` | WARN if none of a label's ids is included |
+| `include_name_regex: "pdp"` | WARN if no included audience name matches |
+
+One check needs no rules: an audience that is both included and excluded
+is always HARD. An ad set no stage matches (or every ad set, with no rules
+file) gets a WARN, never a refusal. A rules file that exists but does not
+parse exits rather than silently guarding nothing.
+
+A useful prospecting rule: exclude your customer-list audiences (recent
+purchasers, lapsed customers) from cold ad sets. Without them a
+meaningful share of "cold" spend reaches existing customers and
+inflates cold ROAS. `audience-info` shows whether such a list is still
+refreshing (`content=` date) — a stale list is not a real exclusion.
 
 ### Permissions — two independent axes
 
@@ -375,7 +440,8 @@ same pinned Graph API version as the core connector; it writes nothing to
 Environment: every subcommand reuses `META_ACCESS_TOKEN`.
 `create-pdp-audience` additionally reads `META_AD_ACCOUNT_ID` (the `act_`
 prefix is optional) and `META_PIXEL_ID` (the site pixel the audience is
-built from); nothing else needs them.
+built from); `create-vv-audience` reads `META_AD_ACCOUNT_ID` and
+`META_PAGE_ID`; the targeting guard reads `META_TARGETING_RULES` (optional).
 
 ### Usage
 
@@ -430,4 +496,13 @@ an API error (including an error body on HTTP 200), `rename` validate-only,
 deleted/already-present ads, `--limit`, aborting on a list error and the
 rate-limit retry. `PdpAudienceTests` cover the post-free dry run, an existing
 name not being recreated, the executed rule carrying the pixel id, and the
-exit when `META_PIXEL_ID` is missing.
+exit when `META_PIXEL_ID` is missing. `TargetingRulesTests` cover stage
+matching (ad set name before campaign), each rule key, lookalikes not
+counting as a real include, the rule-free overlap check, and loading
+(missing file = no rules, malformed file exits, the example parses).
+`GuardAndEditorTests` cover resume/copy refusing on a HARD break,
+`--force-targeting`, `check-targeting`'s exit code, the editor keeping
+every other targeting key, the `individual_setting` fix, the overlap
+refusal and the no-change short-circuit. `VideoViewersAudienceTests`
+cover the dry run, de-duplicated rule entries with the page context,
+the duplicate-name check, non-numeric ids and a missing `META_PAGE_ID`.
