@@ -70,6 +70,7 @@ python amazon_returns_sync.py --start 2026-01-01 --end 2026-01-31   # or no args
 python amazon_rank_sync.py --asins-file asins.txt   # or --asins B0FOO,B0BAR
 python amazon_fees_sync.py                          # or --week YYYY-MM-DD
 python amazon_fees_sync.py --only fee_preview,storage,reimbursements,promotions,shipments
+python amazon_fees_sync.py --week 2026-06-22 --only shipments --no-heal   # just that week, no self-heal
 python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --weeks N to backfill
 python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
 python amazon_traffic_sync.py --repair               # re-pull only weeks recorded incomplete
@@ -93,7 +94,7 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 - `amazon_returns`
 - `amazon_sales_rank`
 - `amazon_fee_preview`, `amazon_fba_storage_fees`, `amazon_fba_reimbursements`,
-  `amazon_fba_promotions`, `amazon_fulfilled_shipments`
+  `amazon_fba_promotions`, `amazon_fulfilled_shipments`, `amazon_fees_coverage`
 - `amazon_economics`
 - `amazon_traffic_weekly`, `amazon_traffic_monthly`, `amazon_traffic_daily`,
   `amazon_traffic_monthly_account`, `amazon_traffic_coverage`
@@ -195,6 +196,23 @@ next run) should not be allowed to fail steps that already succeeded and
 don't depend on it — that asymmetry (loud on a plain short pull, quiet on an
 expected repair/early-pass one) is the point of `exit_code()` existing as its
 own function rather than inline logic in `main()`.
+
+`amazon_fees_sync.py` self-heals its dated reports. Reimbursements,
+promotions and fulfilled shipments are requested one Mon-Sun week per run,
+so a report that times out in Amazon's queue used to lose its week for
+good. Every week-mode request now lands in `amazon_fees_coverage`
+(`report`, `week_start` PK; `status` complete / empty / failed,
+`rows_written`, `attempts`, `last_error`), and each run first re-requests
+weeks in the previous `HEAL_LOOKBACK_WEEKS` (6) whose last attempt
+**failed**, up to `MAX_HEAL_ATTEMPTS` (4) each. The heal keys on what was
+asked, never on missing data rows: a quiet week legitimately returns
+nothing (`empty`) and is not re-asked. Weeks with no coverage row, i.e.
+from before the table existed, are not healed. Data rows and their
+coverage row commit in one transaction, and one week failing never stops
+the others. The poll budget per report is 60 minutes
+(`AMAZON_FEES_REPORT_TIMEOUT_MIN` overrides) — the flat-file queue can run
+well past 20 minutes when congested. `--no-heal` requests only the target
+week (manual backfills).
 
 `amazon_fulfilled_shipments` (written by `amazon_fees_sync.py`) carries
 `sales_channel` and `shopify_order_name` columns, letting you join Amazon's
