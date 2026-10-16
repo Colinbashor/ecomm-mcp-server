@@ -372,7 +372,20 @@ same pinned Graph API version as the core connector; it writes nothing to
   the ad account's own library (`act_<id>/advideos`), not Instagram media
   ids; each creative usually also has a copy published on the Page that a
   token without `pages_read_engagement` cannot read. Non-numeric ids are
-  refused before any call is made.
+  refused before any call is made, but numeric ids are **not** checked
+  against `advideos` (listing a large library on every call trips the
+  account's read rate limit), so filter the list once yourself. `--event`
+  is one of `video_watched`, `video_view_10s`, `video_view_15s`,
+  `video_view_25_percent` (default), `video_view_50_percent`,
+  `video_view_75_percent`, `video_completed`. The audience is created with
+  `prefill=true`, so it back-fills viewers within the retention window
+  rather than starting empty. Like `create-pdp-audience`, a failed create
+  prints `FAILED` and still exits 0.
+- Both audience creators check for an existing name with a single
+  `customaudiences?limit=500` call that does not follow paging. On an
+  account with more than 500 custom audiences an existing name can be
+  missed and a duplicate created — check Ads Manager first on large
+  accounts.
 - `edit-adset-audiences` reads the live targeting and sends it back with
   ONLY `custom_audiences`, `excluded_custom_audiences` and
   `targeting_automation` changed — Meta replaces the whole `targeting`
@@ -386,6 +399,18 @@ same pinned Graph API version as the core connector; it writes nothing to
   enabled to use age_range") unless `individual_setting` is present, so
   the editor adds `individual_setting={"age":1,"gender":1}` when the
   targeting has `age_range` and no setting.
+- The editor only edits the top-level `custom_audiences` /
+  `excluded_custom_audiences` lists. Includes nested inside
+  `flexible_spec` are counted by the targeting guard (and shown as
+  includes) but cannot be added or removed here — change those in Ads
+  Manager. `--remove-*` of an id that is not in the list prints a `NOTE`
+  and is otherwise ignored.
+- The editor's "after the edit" rule check is informational: it refuses
+  only on an include/exclude overlap, never on another HARD break, so you
+  can use it to *fix* a broken ad set one step at a time.
+- Every guard and editor read is fail-closed: if Meta returns an error
+  reading the ad set or its audiences, the command prints `FAILED reading`
+  and exits 1 before any write.
 - Any API error (HTTP non-200, or an `error` object in a 200 body) exits 1
   with Meta's message, type, code, subcode and `error_user_msg`.
 
@@ -456,6 +481,16 @@ python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 
 python meta_ads_mutate.py copy-ads --source-adset-id 1234567890 --dest-adset-id 1122334455 --limit 1 --execute
 python meta_ads_mutate.py create-pdp-audience --name "PDP - Ruffle Mini Dress" --url-keyword ruffle-mini-dress            # dry run
 python meta_ads_mutate.py create-pdp-audience --name "PDP - Ruffle Mini Dress" --url-keyword ruffle-mini-dress --execute
+python meta_ads_mutate.py create-vv-audience --name "VV25 - Spring UGC" --video-ids 1111111111 2222222222             # dry run
+python meta_ads_mutate.py create-vv-audience --name "VV50 - Spring UGC" --video-ids 1111111111 2222222222 \
+    --event video_view_50_percent --retention-days 180 --execute
+python meta_ads_mutate.py check-targeting --adset-id 1234567890 1122334455   # read-only; exit 1 on a HARD break
+python meta_ads_mutate.py audience-info --ids 2222222222 3333333333          # read-only: size, refresh dates
+python meta_ads_mutate.py edit-adset-audiences --adset-id 1234567890 --include 4444444444 \
+    --exclude 3333333333 --advantage-off                                    # validate-only; add --execute
+python meta_ads_mutate.py edit-adset-audiences --adset-id 1234567890 --remove-include 4444444444 --execute
+python meta_ads_mutate.py resume-adset --adset-id 1234567890 --execute      # refuses on a HARD targeting break
+python meta_ads_mutate.py resume-adset --adset-id 1234567890 --force-targeting --execute   # override the guard
 python meta_ads_mutate.py rename --object-id 1234567890 --name "New name"   # dry run; add --execute
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv             # dry run of the whole plan
 python meta_ads_mutate.py rename-from-csv --csv rename_plan.csv --execute --delay 2

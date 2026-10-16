@@ -84,6 +84,8 @@ python tiktok_affiliate_sync.py orders --days 14            # trailing re-pull o
 python tiktok_affiliate_sync.py orders --start 2024-01-01   # backfill; skips windows already complete
 python tiktok_affiliate_sync.py samples --list --lookup     # application statuses + per-order lookups
 python tiktok_affiliate_sync.py samples --by-product --since 2024-01-01   # needs catalog_tiktok, or --product-ids
+python tiktok_affiliate_sync.py samples --by-product --product-ids 1729000000001,1729000000002
+python tiktok_affiliate_sync.py samples --lookup --since 2025-01-01 --max-lookups 500   # capped backfill chunk
 python tiktok_affiliate_sync.py xwalk                       # rebuild the crosswalk only
 python tiktok_affiliate_sync.py report --split 2025-01-01   # read-only coverage numbers
 
@@ -333,6 +335,59 @@ handle count and sample-order dates. Things to know:
 - Suggested schedule: daily `orders --days 14` and `samples --lookup`
   (after the order sync that writes `orders`); weekly `orders --days 60`
   and `samples --list --lookup`.
+
+`tiktok_affiliate_sync.py` flag reference (subcommand first, then flags):
+
+| Subcommand / flag | Default | Meaning |
+|---|---|---|
+| `orders --days N` | 30 | trailing range ending today, used when `--start` is absent |
+| `orders --start` / `--end` | — / today | `YYYY-MM-DD`; `--end` is inclusive. Both are widened outward to whole 7-day grid windows, so the range actually pulled is usually a little wider than asked |
+| `orders --refresh-days N` | 60 | windows ending within the last N days are re-pulled even if `complete` |
+| `orders --force` | off | re-pull every window in range |
+| `samples --list` | — | page every order-bearing status (ignores `--since` / `--until`) |
+| `samples --all-statuses` | off | with `--list`, also page `PENDING` and the three `*_CANCELLED` statuses |
+| `samples --by-product` | — | COMPLETED slice per product id behind unresolved sample orders; a product already sliced once is never sliced again |
+| `samples --product-ids A,B` | — | slice exactly these product ids instead of resolving them from `catalog_tiktok` |
+| `samples --lookup` | — | one `order_id` lookup per unresolved sample order, newest first |
+| `samples --since` / `--until` | 30 days ago / none | sample-order date range for `--by-product` / `--lookup`; `--until` is exclusive |
+| `samples --max-products N` / `--max-lookups N` | 0 (no cap) | cap this run's slices / lookups (resume next run) |
+| `xwalk` | — | rebuild `tiktok_sample_order_creator` + `tiktok_creator_xwalk` only; no API calls, no credentials needed |
+| `report --split DATE` | 90 days ago | print coverage numbers as JSON; read-only, no credentials needed |
+
+`samples` needs at least one of `--list`, `--by-product`, `--lookup`
+(argparse error otherwise); when several are given they run in that order,
+and every `samples` run ends by rebuilding the crosswalk. Products for
+`--by-product` are asked newest unresolved sample order first. Optional
+`tiktok_creator_marketplace` rows (exact-handle matches from
+`tiktok_creator_marketplace_sync.py`) are folded into
+`tiktok_creator_handle_history` on every rebuild.
+
+Run behaviour, for schedulers and `sync_log` readers:
+
+- Missing credentials: `orders` and `samples` exit immediately with
+  "Missing required env var(s): ..." (exit 1) instead of being skipped
+  quietly like the `run_sync.py` connectors. `xwalk` and `report` need none.
+- Exit codes: `0` for a finished run, **including** `degraded` ones; `75`
+  for a rate-limit pause; any other exception is logged `error` and
+  re-raised (non-zero, traceback).
+- `sync_log` platforms: `tiktok_affiliate_orders` (rows = lines written;
+  `degraded` when any window came back `short` or nothing was written —
+  including a run where every window was already complete, whose message
+  says "nothing due"), `tiktok_affiliate_samples` (`degraded` when nothing
+  was written, a `--by-product` slice hit the 10k cap, or lookup misses
+  exceed the tolerance — a capped `--list` status alone does **not**
+  degrade the run), and `tiktok_creator_xwalk` from `xwalk` (`degraded`
+  when the crosswalk has zero creators).
+- Window splitting only applies to windows longer than 6 hours that report
+  at least `SPLIT_AT` (9,000) lines; halves are split recursively.
+- `report` keys: `sample_lines_*`, `sample_orders_*`,
+  `sample_lines_resolved_*` and `sample_line_open_id_share_*` (split
+  `since_<date>` / `before_<date>` / `all`); `xwalk_sample_orders`,
+  `user_id_present`, `user_id_eq_open_id` (must be 0 — non-zero means the
+  two id spaces were mixed), `open_ids_per_user_id_gt1`,
+  `user_ids_per_open_id_gt1`; and `affiliate_gmv_*` with the share that has
+  a handle and the share whose handle the history knows, on both an
+  `est_commission_base` and a `price * quantity` basis.
 
 `tiktok_shop_performance` (from `tiktok_analytics_sync.py`) is a cleaner
 alternative to estimating "unattributed" sales by subtraction. It chunks

@@ -214,6 +214,31 @@ the others. The poll budget per report is 60 minutes
 well past 20 minutes when congested. `--no-heal` requests only the target
 week (manual backfills).
 
+Run behaviour of `amazon_fees_sync.py`, for schedulers and anyone reading
+`sync_log` (platform `amazon_fees`):
+
+- `--week` must be a Monday (anything else exits with "Report weeks start
+  on Monday."); without it the target is the prior complete Mon-Sun week.
+  An unknown `--only` name exits before any request.
+- Heal weeks are requested **before** the target week, oldest first, each
+  with its own 60-minute poll budget. On a congested day a run with several
+  failed weeks across three week-mode reports can take hours; use
+  `--no-heal` when you need one week quickly.
+- A heal attempt that fails again counts as a failed report exactly like the
+  target week: it is listed in the `sync_log` message, and keeps the run
+  `degraded` until it succeeds or uses up its 4 attempts. After that the
+  week stays `failed` in `amazon_fees_coverage` and is no longer asked — query
+  `status = 'failed' AND attempts >= 4` to find weeks that need a manual
+  `--week ... --no-heal` re-pull.
+- `attempts` counts every request for a (report, week), successful ones
+  included, and `status` / `last_error` always reflect the latest try.
+- `fee_preview` and `storage` are not week-mode (a snapshot, and a
+  month-by-month walk back up to three months) and have no coverage rows.
+- Status: `ok` with no failures; `degraded` when some report failed but rows
+  were written; `error` when something failed and nothing was written. Only
+  `error` exits 1 — `degraded` exits 0, so read `sync_log` for partial
+  failures.
+
 `amazon_fulfilled_shipments` (written by `amazon_fees_sync.py`) carries
 `sales_channel` and `shopify_order_name` columns, letting you join Amazon's
 Multi-Channel Fulfillment (MCF) shipments back to the Shopify order they
