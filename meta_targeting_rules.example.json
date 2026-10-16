@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy to meta_targeting_rules.json (or point META_TARGETING_RULES at it) and replace the placeholder audience ids with your own. Each stage's pattern is a case-insensitive regex matched against the ad set name, then the campaign name; the first matching stage wins. required_exclusions / recommended_inclusions map a label to a list of audience ids, any one of which satisfies it.",
+  "stages": [
+    {
+      "name": "cold",
+      "pattern": "^\\s*COLD\\s*\\|",
+      "advantage_audience_off": true,
+      "forbid_include": true,
+      "required_exclusions": {
+        "Website visitors 180d": ["111111111111"],
+        "Customer list": ["222222222222"]
+      }
+    },
+    {
+      "name": "warm_product",
+      "pattern": "^\\s*WARM-PRODUCT\\s*\\|",
+      "advantage_audience_off": true,
+      "require_include": true,
+      "required_exclusions": {"Purchasers 14d": ["333333333333"]},
+      "include_name_regex": "pdp"
+    },
+    {
+      "name": "retargeting",
+      "pattern": "^\\s*RETARGETING\\s*\\|",
+      "advantage_audience_off": true,
+      "require_include": true,
+      "required_exclusions": {"Purchasers 14d": ["333333333333"]},
+      "recommended_inclusions": {"Website visitors 180d": ["111111111111"]}
+    }
+  ]
+}
