@@ -63,6 +63,19 @@ USAGE:
   python amazon_fees_sync.py                       # prior full Mon-Sun week
   python amazon_fees_sync.py --week 2026-06-22
   python amazon_fees_sync.py --only fee_preview,storage
+  python amazon_fees_sync.py --week 2026-06-22 --only shipments --no-heal
+
+SELF-HEAL: every week-mode request (reimbursements, promotions, shipments) is
+recorded in `amazon_fees_coverage` — what was ASKED and what came back
+(complete / empty / failed). Each run then also re-requests up to
+HEAL_LOOKBACK_WEEKS of recent weeks whose last attempt FAILED (at most
+MAX_HEAL_ATTEMPTS each). Without this, a report that times out in Amazon's
+queue loses its week permanently, because every run only asks for one week.
+The heal keys on the coverage table, never on missing data rows: a quiet week
+can legitimately return nothing and must not be re-requested forever. Weeks
+with no coverage row (from before the table existed) are deliberately NOT
+healed, so the first run after upgrading does not re-request all of history.
+Pass --no-heal to request only the target week.
 """
 from __future__ import annotations
 
@@ -163,7 +176,33 @@ CREATE TABLE IF NOT EXISTS amazon_fulfilled_shipments (
                                -- joins your `orders` table's order_id. NULL otherwise.
     synced_at        TEXT NOT NULL
 );
+-- What was ASKED for each dated (week-mode) report, and what came back. The
+-- self-heal keys on this, never on missing data rows: a quiet week can
+-- legitimately return nothing, and that must not be re-requested forever.
+CREATE TABLE IF NOT EXISTS amazon_fees_coverage (
+    report          TEXT NOT NULL,  -- REPORTS key: shipments, promotions, ...
+    week_start      TEXT NOT NULL,  -- Monday
+    week_end        TEXT NOT NULL,  -- Sunday
+    status          TEXT NOT NULL,  -- complete | empty (CANCELLED) | failed
+    rows_written    INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    last_attempt_at TEXT NOT NULL,
+    PRIMARY KEY (report, week_start)
+);
 """
+
+# Flat-file reports (the fulfilled-shipments report especially) can sit in
+# Amazon's queue far longer than 20 minutes when it is congested — the same
+# behaviour as the Ads v3 reports. Override with AMAZON_FEES_REPORT_TIMEOUT_MIN.
+REPORT_TIMEOUT_MIN = float(os.environ.get("AMAZON_FEES_REPORT_TIMEOUT_MIN", "60"))
+POLL_SECONDS = 15
+
+# Each run also re-requests recent weeks whose last attempt FAILED (timeout /
+# FATAL / exception). Weeks with no coverage row predate the table and are not
+# healed — re-requesting all history on first run is not the intent.
+HEAL_LOOKBACK_WEEKS = 6
+MAX_HEAL_ATTEMPTS = 4
 
 
 def require_env() -> None:
@@ -205,8 +244,8 @@ def _create_and_download(host: str, report_type: str, start: str | None,
     report_id = r.json()["reportId"]
 
     doc_id = None
-    for _ in range(80):
-        time.sleep(15)
+    for _ in range(max(1, int(REPORT_TIMEOUT_MIN * 60 / POLL_SECONDS))):
+        time.sleep(POLL_SECONDS)
         headers["x-amz-access-token"] = _access_token()
         st = requests.get(f"{host}/reports/2021-06-30/reports/{report_id}",
                           headers=headers, timeout=60).json()
@@ -219,7 +258,7 @@ def _create_and_download(host: str, report_type: str, start: str | None,
         if status == "FATAL":
             raise RuntimeError(f"{report_type} failed: FATAL")
     if not doc_id:
-        raise TimeoutError(f"{report_type} did not finish in time")
+        raise TimeoutError(f"{report_type} did not finish in {REPORT_TIMEOUT_MIN:g} min")
 
     doc = requests.get(f"{host}/reports/2021-06-30/documents/{doc_id}",
                        headers=headers, timeout=60).json()
@@ -404,6 +443,36 @@ REPORTS = {
 }
 
 
+def record_coverage(conn: sqlite3.Connection, report: str, week_start: str,
+                    week_end: str, status: str, rows: int, error: str | None,
+                    stamp: str) -> None:
+    """Upsert what one week-mode request returned; `attempts` counts every try."""
+    conn.execute(
+        "INSERT INTO amazon_fees_coverage (report, week_start, week_end, status, "
+        "rows_written, attempts, last_error, last_attempt_at) VALUES (?,?,?,?,?,1,?,?) "
+        "ON CONFLICT(report, week_start) DO UPDATE SET week_end=excluded.week_end, "
+        "status=excluded.status, rows_written=excluded.rows_written, "
+        "attempts=amazon_fees_coverage.attempts + 1, last_error=excluded.last_error, "
+        "last_attempt_at=excluded.last_attempt_at",
+        (report, week_start, week_end, status, rows, error, stamp),
+    )
+
+
+def heal_weeks(conn: sqlite3.Connection, report: str, monday: date,
+               lookback: int = HEAL_LOOKBACK_WEEKS,
+               max_attempts: int = MAX_HEAL_ATTEMPTS) -> list[date]:
+    """Mondays in the `lookback` weeks before `monday` whose last request for
+    `report` FAILED and that have not used up their attempts. `monday` itself is
+    excluded — the run requests it anyway."""
+    floor = (monday - timedelta(weeks=lookback)).isoformat()
+    rows = conn.execute(
+        "SELECT week_start FROM amazon_fees_coverage WHERE report = ? AND status = 'failed' "
+        "AND attempts < ? AND week_start >= ? AND week_start < ? ORDER BY week_start",
+        (report, max_attempts, floor, monday.isoformat()),
+    ).fetchall()
+    return [date.fromisoformat(r[0]) for r in rows]
+
+
 def _month_windows(monday: date, back: int = 3) -> list[tuple[str, str]]:
     """Calendar-month (start, end) windows: the report week's month, then earlier."""
     windows = []
@@ -417,10 +486,14 @@ def _month_windows(monday: date, back: int = 3) -> list[tuple[str, str]]:
     return windows
 
 
-def sync(conn: sqlite3.Connection, monday: date, which: list[str]) -> tuple[int, list[str]]:
+def sync(conn: sqlite3.Connection, monday: date, which: list[str],
+         heal: bool = True) -> tuple[int, list[str]]:
     """Run the chosen report(s) for the Mon-Sun week starting `monday`.
-    Returns (rows_written, error_messages)."""
-    start, end = monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+    Week-mode reports also re-request recent FAILED weeks (see heal_weeks)
+    unless `heal` is False. Each week is requested in its own try, so one
+    timeout cannot kill the batch, and every attempt lands in
+    amazon_fees_coverage. Returns (rows_written, error_messages)."""
     snapshot_date = date.today().isoformat()
     host = HOSTS[os.environ.get("SPAPI_REGION", "NA").upper()]
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -429,13 +502,35 @@ def sync(conn: sqlite3.Connection, monday: date, which: list[str]) -> tuple[int,
     errors: list[str] = []
     for k in which:
         report_type, mode, parser = REPORTS[k]
+        if mode == "week":
+            mondays = heal_weeks(conn, k, monday) + [monday] if heal else [monday]
+            for wk in mondays:
+                ws, we = wk.isoformat(), (wk + timedelta(days=6)).isoformat()
+                label = k if wk == monday else f"{k} (heal)"
+                try:
+                    text = _create_and_download(host, report_type, ws, we)
+                    n = 0
+                    with conn:  # rows + coverage commit together
+                        if text is not None:
+                            n = parser(conn, text, stamp, snapshot_date=snapshot_date)
+                        record_coverage(conn, k, ws, we,
+                                        "complete" if text is not None else "empty",
+                                        n, None, stamp)
+                    total += n
+                    print(f"    {label} ({report_type}): {n} rows [{ws}..{we}]", flush=True)
+                except Exception as e:  # noqa: BLE001 — one report must not kill the batch
+                    with conn:
+                        record_coverage(conn, k, ws, we, "failed", 0, str(e)[:300], stamp)
+                    errors.append(f"{k} {ws}: {str(e)[:120]}")
+                    print(f"    {label} ({report_type}): FAILED [{ws}..{we}] {str(e)[:150]}",
+                          flush=True)
+            continue
+
         try:
             if mode == "snapshot":
                 windows = [(None, None)]
-            elif mode == "monthly":
-                windows = _month_windows(monday)
             else:
-                windows = [(start, end)]
+                windows = _month_windows(monday)  # month of the week, then earlier
 
             n, used = 0, None
             for ws, we in windows:
@@ -462,6 +557,8 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--week", help="Monday of the report week (default: prior complete week)")
     p.add_argument("--only", help="comma list: " + ",".join(REPORTS))
+    p.add_argument("--no-heal", action="store_true",
+                   help="skip re-requesting recent weeks whose last attempt failed")
     args = p.parse_args()
 
     require_env()
@@ -484,7 +581,7 @@ def main() -> int:
     conn = sqlite3.connect(DB, timeout=warehouse_db.BUSY_TIMEOUT_SECONDS)
     ensure_schema(conn)
 
-    total, errors = sync(conn, monday, which)
+    total, errors = sync(conn, monday, which, heal=not args.no_heal)
     conn.close()
 
     status = "ok" if not errors else ("error" if total == 0 else "degraded")

@@ -24,14 +24,14 @@ def _tsv(header: list[str], *data_rows: list[str]) -> str:
 
 
 class SchemaTests(unittest.TestCase):
-    def test_ensure_schema_creates_all_five_tables(self) -> None:
+    def test_ensure_schema_creates_all_tables(self) -> None:
         conn = sqlite3.connect(":memory:")
         fees.ensure_schema(conn)
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("amazon_fee_preview", "amazon_fba_storage_fees",
                   "amazon_fba_reimbursements", "amazon_fba_promotions",
-                  "amazon_fulfilled_shipments"):
+                  "amazon_fulfilled_shipments", "amazon_fees_coverage"):
             self.assertIn(t, tables)
 
 
@@ -156,6 +156,92 @@ class SyncTests(unittest.TestCase):
             for k, v in saved.items():
                 if v is not None:
                     os.environ[k] = v
+
+
+class CoverageAndHealTests(unittest.TestCase):
+    """A timed-out week-mode report used to lose its week for good: each run
+    asked for one week and nothing re-asked. Coverage records what was asked;
+    the heal re-asks recent FAILED weeks, never weeks that merely lack rows."""
+
+    def setUp(self) -> None:
+        os.environ["SPAPI_MARKETPLACE_ID"] = "ATVPDKIKX0DER"
+        os.environ["SPAPI_REGION"] = "NA"
+        self.conn = sqlite3.connect(":memory:")
+        fees.ensure_schema(self.conn)
+
+    def _cov(self, report: str, week: str):
+        return self.conn.execute(
+            "SELECT status, rows_written, attempts FROM amazon_fees_coverage "
+            "WHERE report=? AND week_start=?", (report, week)).fetchone()
+
+    def _record(self, week: str, status: str, times: int = 1, report: str = "shipments") -> None:
+        for _ in range(times):
+            fees.record_coverage(self.conn, report, week, week, status, 0, None, "t")
+
+    def test_attempts_accumulate_and_status_is_overwritten(self) -> None:
+        fees.record_coverage(self.conn, "shipments", "2026-08-31", "2026-09-06",
+                             "failed", 0, "timeout", "t1")
+        fees.record_coverage(self.conn, "shipments", "2026-08-31", "2026-09-06",
+                             "complete", 12, None, "t2")
+        self.assertEqual(self._cov("shipments", "2026-08-31"), ("complete", 12, 2))
+
+    def test_heal_picks_only_recent_failed_weeks_under_the_attempt_cap(self) -> None:
+        self._record("2026-08-24", "failed")                          # outside lookback
+        self._record("2026-09-14", "failed")                          # heal
+        self._record("2026-09-21", "complete")                        # fine
+        self._record("2026-09-28", "empty")                           # measured empty
+        self._record("2026-10-05", "failed", fees.MAX_HEAL_ATTEMPTS)  # gave up
+        self._record("2026-10-12", "failed")                          # current week
+        self._record("2026-09-21", "failed", report="promotions")     # other report
+        got = fees.heal_weeks(self.conn, "shipments", date(2026, 10, 12))
+        self.assertEqual(got, [date(2026, 9, 14)])
+
+    def test_missing_coverage_row_is_never_healed(self) -> None:
+        self.assertEqual(fees.heal_weeks(self.conn, "shipments", date(2026, 10, 12)), [])
+
+    def _shipments_tsv(self, sii: str) -> str:
+        return _tsv(["shipment-item-id", "shipment-date", "quantity-shipped", "item-price"],
+                    [sii, "2026-09-01T10:00:00+00:00", "1", "50"])
+
+    def test_failed_week_is_re_requested_on_the_next_run(self) -> None:
+        with patch.object(fees, "_create_and_download",
+                          side_effect=TimeoutError("did not finish")):
+            total, errors = fees.sync(self.conn, date(2026, 8, 31), ["shipments"])
+        self.assertEqual((total, len(errors)), (0, 1))
+        self.assertEqual(self._cov("shipments", "2026-08-31"), ("failed", 0, 1))
+
+        calls: list[str] = []
+
+        def ok(host, rt, ws, we):
+            calls.append(ws)
+            return self._shipments_tsv(f"S-{ws}")
+
+        with patch.object(fees, "_create_and_download", side_effect=ok):
+            total, errors = fees.sync(self.conn, date(2026, 9, 7), ["shipments"])
+        self.assertEqual(calls, ["2026-08-31", "2026-09-07"])  # heal first, then current
+        self.assertEqual((total, errors), (2, []))
+        self.assertEqual(self._cov("shipments", "2026-08-31"), ("complete", 1, 2))
+
+    def test_no_heal_requests_only_the_target_week(self) -> None:
+        self._record("2026-08-31", "failed")
+        calls: list[str] = []
+        with patch.object(fees, "_create_and_download",
+                          side_effect=lambda h, rt, ws, we: calls.append(ws)):
+            fees.sync(self.conn, date(2026, 9, 7), ["shipments"], heal=False)
+        self.assertEqual(calls, ["2026-09-07"])
+        self.assertEqual(self._cov("shipments", "2026-09-07"), ("empty", 0, 1))
+
+    def test_complete_week_costs_no_extra_request(self) -> None:
+        calls: list[str] = []
+
+        def ok(host, rt, ws, we):
+            calls.append(ws)
+            return self._shipments_tsv(f"S-{ws}")
+
+        with patch.object(fees, "_create_and_download", side_effect=ok):
+            fees.sync(self.conn, date(2026, 9, 7), ["shipments"])
+            fees.sync(self.conn, date(2026, 9, 14), ["shipments"])
+        self.assertEqual(calls, ["2026-09-07", "2026-09-14"])
 
 
 if __name__ == "__main__":
