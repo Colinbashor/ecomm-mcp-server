@@ -357,13 +357,21 @@ def create_vv_audience(args):
     one entry per video with your Facebook Page (META_PAGE_ID) as context.
 
     Video ids are the Facebook video ids on the product's ad creatives
-    (`video_id` / `video_data.video_id` / `asset_feed_spec` videos) that live in
-    the ad account's own library (`act_<id>/advideos`) — NOT Instagram media
-    ids. Each creative usually also has a copy published on the Page; a token
-    without `pages_read_engagement` cannot read those copies, so pass the
-    ad-account ids. Ids are not validated against `advideos` here: listing a
-    large video library on every call trips the account's read rate limit, so
-    filter once when building the list.
+    (`video_id` / `video_data.video_id` / `asset_feed_spec` videos) — NOT
+    Instagram media ids — and must be the copy OWNED BY YOUR PAGE
+    (`GET <video_id>?fields=from` returns META_PAGE_ID). Meta rejects:
+      - the ad account's library copy (`act_<id>/advideos`) with (#2654)
+        "video isn't associated with a Page" (subcode 1713216);
+      - videos from creator/partnership ads, which live on the creator's
+        Page, with (#2654) subcode 1713080 ("no permission to advertise for
+        the engagement object").
+    The token's user (or system user) also needs a role on the Page with the
+    Advertise task; `pages_read_engagement` alone is not enough.
+
+    Ownership is not checked here — Meta checks it on create. Filter the id
+    list once when building it (`?fields=from`); do not list the whole
+    `advideos` library per call, which trips the account-wide read rate limit
+    and blocks every other command, writes included, for a while.
 
     Dry run by default (prints the plan, posts nothing); an audience with the
     same name is reported as EXISTS, never duplicated."""

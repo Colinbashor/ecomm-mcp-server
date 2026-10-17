@@ -368,13 +368,19 @@ same pinned Graph API version as the core connector; it writes nothing to
 - `create-vv-audience` follows the same pattern as `create-pdp-audience`
   (one read-only list call, `EXISTS` on a duplicate name, nothing posted
   without `--execute`). Its rule is one video-engagement entry per unique
-  video id with `META_PAGE_ID` as context. Pass the Facebook video ids from
-  the ad account's own library (`act_<id>/advideos`), not Instagram media
-  ids; each creative usually also has a copy published on the Page that a
-  token without `pages_read_engagement` cannot read. Non-numeric ids are
-  refused before any call is made, but numeric ids are **not** checked
-  against `advideos` (listing a large library on every call trips the
-  account's read rate limit), so filter the list once yourself. `--event`
+  video id with `META_PAGE_ID` as context. Pass the Facebook video ids (not
+  Instagram media ids) of the copy **owned by your Page** —
+  `GET <video_id>?fields=from` must return `META_PAGE_ID`. The ad account's
+  library copy (`act_<id>/advideos`) is rejected with (#2654) "video isn't
+  associated with a Page" (subcode 1713216), and videos from creator /
+  partnership ads live on the creator's Page and fail with (#2654) subcode
+  1713080. The token's user or system user needs a role on the Page with the
+  **Advertise** task; `pages_read_engagement` alone still gets (#10) on the
+  Page. Non-numeric ids are refused before any call is made, but ownership is
+  **not** checked here (Meta checks it on create): filter the list once
+  yourself with `?fields=from`, and do not list the whole `advideos` library
+  per call — that trips the account-wide read limit and blocks every command,
+  writes included, for a while. `--event`
   is one of `video_watched`, `video_view_10s`, `video_view_15s`,
   `video_view_25_percent` (default), `video_view_50_percent`,
   `video_view_75_percent`, `video_completed`. The audience is created with
