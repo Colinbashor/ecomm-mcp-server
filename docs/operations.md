@@ -215,6 +215,13 @@ python bq_mirror_sync.py --set all --dry-run       # export + plan, write nothin
 python bq_mirror_sync.py --only orders --since 2026-01-01   # backfill a window table
 ```
 
+One of `--set` or `--only` is required. `--set` takes a set name from the
+registry or `all`; `--only` takes a comma-separated list of registry tables,
+overrides `--set`, and exits before doing anything if a name is not in the
+registry. `--since YYYY-MM-DD` only affects `window` tables. A missing
+`BQ_PROJECT` / `BQ_DATASET` exits immediately with the variable names, before
+any BigQuery call.
+
 ### Setup
 
 ```bash
@@ -241,6 +248,21 @@ the core tables from `warehouse/schema.sql` (`facts`: `orders`,
 `sync_log`). Add any standalone connector's tables you want in BigQuery.
 `--set all` runs every set in order; keep `log` last so it carries the rows
 the other sets just logged.
+
+The shipped defaults:
+
+| Set | Table | Mode | Notes |
+|---|---|---|---|
+| `facts` | `orders` | `window` on `order_date`, 14 days | `create_if_missing=True` |
+| `facts` | `shopify_order_discounts` | `window` on `order_date`, 14 days | `create_if_missing=True` |
+| `facts` | `shopify_order_customers` | `window` on `order_date`, 14 days | `create_if_missing=True` |
+| `facts` | `ad_metrics` | `full` | `create_if_missing=True` |
+| `log` | `sync_log` | `full` | `create_if_missing=True` |
+
+The field *default* for `create_if_missing` is `False`, but every shipped
+entry turns it on so a fresh dataset fills on the first run. Entries you add
+stay opt-in unless you pass it. An entry with `mode="window"` and no `column`,
+or an unknown mode, raises when the registry is imported.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -283,6 +305,11 @@ added to SQLite later cannot drift from a copied DDL.
   readers never see the days missing. A table partitioned on a different
   column than the registry's `column` is refused.
 
+  First run into an empty BigQuery table: without `--since`, the plan is the
+  trailing window plus every day in the reconcile range that SQLite has
+  (BigQuery's count is 0 there, so each one counts as drift) — about 90 days
+  with the defaults. The run note says to pass `--since` for older history.
+
   Tip: setting `reconcile_days` to span a table's whole history (e.g. `1200`)
   makes the first load and any later historical re-pull heal through the
   count-drift pass, with no manual `--since`. A table created by
@@ -305,6 +332,12 @@ One `sync_log` row per table, platform `mirror_<table>_bq` (none on
 One table failing never stops the rest. The process exits `1` if any table is
 `error`; `degraded` alone exits `0`. Run each set as its own scheduled job
 after the nightly syncs.
+
+Each table prints one line (`table  status  rows  seconds  message [notes]`)
+and the run ends with `done: N ok, N degraded, N error -> <tables>`. The
+notes carry the plan (day range, BigQuery's newest day, how many days had
+count drift), columns added to BigQuery, and BigQuery columns loaded as NULL;
+the same text, cut to 480 characters, is the `sync_log` message.
 
 ## Tests
 

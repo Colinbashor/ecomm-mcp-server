@@ -30,12 +30,15 @@ warehouse/
 server.py              MCP server (6 read-only tools + opt-in Sheets write set; stdio, or --http)
 *_mutate.py            WRITE-capable ad-account scripts (google, meta); dry-run unless --execute
 google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
+backup_db.py           rotating, verified local backups of warehouse.db
+bq_mirror_sync.py      optional: mirror SQLite tables into BigQuery (registry in
+                       bq_mirror_registry.py; needs google-cloud-bigquery)
 make_cert.py           self-signed TLS cert for --http (writes certs/)
 serve_mcp.bat          Windows keep-alive loop for the team --http server
 SHARING.md             team/HTTP setup: token, HostGuard, certs, mcp-remote
 *_auth.py              one-time OAuth helpers (google, google_sheets, amazon, tiktok, klaviyo)
 docs/<platform>.md     per-platform setup + traps  <- READ BEFORE EDITING
-docs/operations.md     notify.py + backup_db.py (non-connector utilities)
+docs/operations.md     notify.py, backup_db.py, bq_mirror_sync.py (non-connector utilities)
 tests/                 hermetic; no network, no database file
 ```
 
