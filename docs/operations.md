@@ -1,7 +1,7 @@
 # Operations
 
-Two standalone utilities that aren't connectors — no platform credentials,
-no data pulled from anywhere. Both are optional.
+Three standalone utilities that aren't connectors — no platform credentials,
+no data pulled from any platform. All are optional.
 
 ## Notifications — `warehouse/notify.py`
 
@@ -196,6 +196,116 @@ The partial file is removed on every failure path. One gap: if the source
 database file doesn't exist, the script fails on its size check before
 anything is logged, so that case shows only as a traceback / nonzero exit.
 
+## BigQuery mirror — `bq_mirror_sync.py`
+
+Copies warehouse tables from SQLite into a BigQuery dataset on a schedule.
+Use it if something reads the warehouse from BigQuery as well as (or instead
+of) the MCP server: a BI tool, a hosted MCP connector, a notebook. Nothing
+else in the repo needs it.
+
+Why a job and not a one-time export: a BigQuery table with no scheduled
+writer looks healthy for weeks. It answers queries; it has just stopped at
+the day it was copied, and nothing errors. `bq_mirror_registry.py` is the
+explicit list of the tables this job owns, so "who keeps this table fresh?"
+always has an answer.
+
+```bash
+python bq_mirror_sync.py --set facts               # one set
+python bq_mirror_sync.py --set all --dry-run       # export + plan, write nothing
+python bq_mirror_sync.py --only orders --since 2026-01-01   # backfill a window table
+```
+
+### Setup
+
+```bash
+pip install google-cloud-bigquery
+gcloud auth application-default login     # or GOOGLE_APPLICATION_CREDENTIALS=<service-account key>
+```
+
+| Variable | Notes |
+|---|---|
+| `BQ_PROJECT` | GCP project id. Required. |
+| `BQ_DATASET` | Destination dataset. Required; must already exist. |
+| `BQ_LOCATION` | Dataset location for load/query jobs. Default `US`. |
+
+Auth is Google Application Default Credentials. For an unattended scheduled
+task, point `GOOGLE_APPLICATION_CREDENTIALS` at a service-account key. The
+principal needs **BigQuery Data Editor** on the dataset and **BigQuery Job
+User** on the project.
+
+### The registry — `bq_mirror_registry.py`
+
+`SETS` maps a set name to a list of `Mirror(...)` entries. The defaults cover
+the core tables from `warehouse/schema.sql` (`facts`: `orders`,
+`shopify_order_discounts`, `shopify_order_customers`, `ad_metrics`; `log`:
+`sync_log`). Add any standalone connector's tables you want in BigQuery.
+`--set all` runs every set in order; keep `log` last so it carries the rows
+the other sets just logged.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `table` | — | Same name in SQLite and BigQuery. |
+| `mode` | `full` | `full` or `window` (below). |
+| `column` | — | `window` only: the date column (TEXT starting `YYYY-MM-DD`). |
+| `window_days` | `7` | `window`: trailing days rewritten every run. |
+| `reconcile_days` | `90` | `window`: how far back to compare per-day counts. |
+| `allow_empty` | `False` | An empty SQLite table is legitimate (`ok`), not `degraded`. |
+| `create_if_missing` | `False` | Create a missing BigQuery table from the SQLite schema. Off by default so a registry typo cannot create junk tables. |
+
+Give every BigQuery table exactly **one** writer. If another job (a per-feed
+export, a scheduled query) already writes a table, leave it out of the
+registry; two writers on one table end up overwriting each other.
+
+### How a table is written
+
+The BigQuery table's **live schema is the contract**. Columns SQLite has and
+BigQuery lacks are added (nullable) before the load, typed TEXT → STRING,
+INTEGER → INTEGER, REAL → FLOAT. Columns BigQuery has and SQLite lacks load as
+NULL and are reported in the run note. Nothing is hand-declared, so a column
+added to SQLite later cannot drift from a copied DDL.
+
+- **`full`** — one `WRITE_TRUNCATE` load of the whole table. Atomic, and
+  self-healing: a row deleted in SQLite disappears from BigQuery too. Right
+  for tables up to a few million rows.
+- **`window`** — rewrites a set of days:
+  - the trailing `window_days`;
+  - any day within `reconcile_days` whose row count differs between SQLite and
+    BigQuery (a historical re-pull or a deleted day heals on its own);
+  - the gap since BigQuery's newest day, so a missed night heals on the next
+    run. The catch-up is capped at 60 days (`MAX_CATCHUP_DAYS`) unless
+    `--since` is given — loading older history is a deliberate act.
+
+  A day-**partitioned** BigQuery table (partitioned on the same column) gets one
+  `WRITE_TRUNCATE` load per day into `table$YYYYMMDD`, including an empty load
+  for a day SQLite no longer has, and no DML. An **unpartitioned** table gets
+  the rows loaded into a temporary staging table (expires after 2 h, deleted
+  in any case) and then one transaction, `DELETE <days>; INSERT <staging>`, so
+  readers never see the days missing. A table partitioned on a different
+  column than the registry's `column` is refused.
+
+  Tip: setting `reconcile_days` to span a table's whole history (e.g. `1200`)
+  makes the first load and any later historical re-pull heal through the
+  count-drift pass, with no manual `--since`. A table created by
+  `create_if_missing` is unpartitioned.
+
+SQLite is opened **read-only**, so the mirror never takes the writer lock and
+can run while a sync is writing.
+
+### Outcomes and `sync_log`
+
+One `sync_log` row per table, platform `mirror_<table>_bq` (none on
+`--dry-run`), so `last_sync_status` shows the mirror's freshness too.
+
+| Outcome | `status` |
+|---|---|
+| Loaded, and BigQuery's count (job `output_rows`, or per-day counts after a window load) matches what was exported | `ok` |
+| SQLite table (or the window) is empty and the entry is not `allow_empty` — BigQuery is left untouched | `degraded` |
+| Count mismatch after the load, BigQuery table missing without `create_if_missing`, a value that cannot convert (e.g. `3.5` into an INTEGER column), or any other exception | `error` |
+
+One table failing never stops the rest. The process exits `1` if any table is
+`error`; `degraded` alone exits `0`. Run each set as its own scheduled job
+after the nightly syncs.
+
 ## Tests
 
 - `tests/test_notify.py` — `to_chat_markdown`, per-dest target lookup,
@@ -209,3 +319,12 @@ anything is logged, so that case shows only as a traceback / nonzero exit.
   source database, rotation (keeps newest N, removes `-wal`/`-shm` crumbs),
   partial sweeping, and the disk guard (refuses to start, drops to `KEEP-1`,
   rotation happens before any copy).
+- `tests/test_bq_mirror_sync.py` (skipped without `google-cloud-bigquery`;
+  uses the in-memory fake in `tests/bq_fakes.py`) — value conversion, the
+  day planner (window, gap catch-up and its cap, `--since`, count drift and
+  the reconcile range), full replace with a column SQLite gained, empty
+  sources staying `degraded` without wiping BigQuery, count mismatches as
+  `error`, `create_if_missing` (and that it stays opt-in and never fires on a
+  dry run), the one-transaction window replace, per-day partition loads,
+  partition-column mismatch, one `sync_log` row per table, the default
+  registry against `warehouse/schema.sql`, and the env checks.

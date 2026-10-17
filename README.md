@@ -142,9 +142,12 @@ writes, and its test coverage.
 | Factory production tracking | [docs/factory-production.md](docs/factory-production.md) | — | manual-drop vendor spreadsheets, header-matched into one table |
 | Google Sheets / Apps Script (opt-in MCP **write** tools, not a connector) | [docs/google-sheets.md](docs/google-sheets.md) | — | add tabs, write values, checkboxes; create/push/deploy a bound Apps Script web app — registered only with `WAREHOUSE_MCP_ENABLE_WRITES=1` |
 
-Two more standalone utilities aren't connectors at all — no credentials, no
-data pulled from anywhere: pushing a "sync finished" notification to
-Slack/Chat/email, and rotating local backups of `warehouse.db`. See
+Three more standalone utilities aren't connectors at all — no platform
+credentials, no data pulled from any platform: pushing a "sync finished"
+notification to Slack/Chat/email, rotating local backups of `warehouse.db`, and
+`bq_mirror_sync.py`, which mirrors warehouse tables into a BigQuery dataset on
+a schedule (full replace or a self-healing trailing-days window, verified by
+row counts; optional `google-cloud-bigquery` dependency). See
 [docs/operations.md](docs/operations.md).
 
 ## Running the server
@@ -345,7 +348,9 @@ particular gotchas, all hermetic (mocked HTTP, no network). Each platform's doc 
 own tests. A few files don't follow the one-script naming: `tests/test_brand_analytics.py`
 covers the shared `warehouse/brand_analytics.py` report runner, and
 `tests/test_meta_ads_landing_page_views.py` covers the `landing_page_views` column in the core
-Meta connector. The one-time OAuth helpers (`google_auth.py`, `google_sheets_auth.py`,
+Meta connector. `tests/test_bq_mirror_sync.py` covers the BigQuery mirror against an in-memory
+fake client (`tests/bq_fakes.py`) and is skipped when the optional `google-cloud-bigquery`
+package is not installed. The one-time OAuth helpers (`google_auth.py`, `google_sheets_auth.py`,
 `amazon_auth.py`, `tiktok_auth.py`) and `make_cert.py` have no tests; `klaviyo_auth.py` does
 (`tests/test_klaviyo_auth.py`).
 
