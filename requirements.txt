@@ -41,3 +41,7 @@ PyYAML
 # without this — install it everywhere for portability, it's a no-op where
 # the OS already provides the data.
 tzdata
+
+# Only needed for bq_mirror_sync.py (mirroring warehouse tables into
+# BigQuery). Its tests are skipped when this is not installed.
+google-cloud-bigquery
