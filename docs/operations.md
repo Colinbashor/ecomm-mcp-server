@@ -218,7 +218,8 @@ python bq_mirror_sync.py --only orders --since 2026-01-01   # backfill a window 
 One of `--set` or `--only` is required. `--set` takes a set name from the
 registry or `all`; `--only` takes a comma-separated list of registry tables,
 overrides `--set`, and exits before doing anything if a name is not in the
-registry. `--since YYYY-MM-DD` only affects `window` tables. A missing
+registry. An unknown `--set` name exits the same way, listing the valid set
+names. `--since YYYY-MM-DD` only affects `window` tables. A missing
 `BQ_PROJECT` / `BQ_DATASET` exits immediately with the variable names, before
 any BigQuery call.
 

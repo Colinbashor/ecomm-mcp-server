@@ -467,6 +467,11 @@ refreshing (`content=` date) — a stale list is not a real exclusion.
    (or higher) role on the ad account in Business Manager. A token with
    `ads_management` but a read-level role fails every write, validate-only
    ones included. Fix the role, not the scope.
+3. `create-vv-audience` only: the same user or system user also needs a role
+   on the Facebook **Page** (`META_PAGE_ID`) with the **Advertise** task, and
+   the video ids must be the Page-owned copies (see the subcommand above).
+   `pages_read_engagement` on the token is not a substitute — without the Page
+   task the create fails with (#10).
 
 Environment: every subcommand reuses `META_ACCESS_TOKEN`.
 `create-pdp-audience` additionally reads `META_AD_ACCOUNT_ID` (the `act_`
