@@ -138,6 +138,7 @@ writes, and its test coverage.
 | Flexport | [docs/flexport.md](docs/flexport.md) | — | catalog/inventory, order shipping cost, returns (newest-first head walk with a walk log), inbounds |
 | Purple Dot | [docs/purple-dot.md](docs/purple-dot.md) | — | pre-order/waitlist bookings, waitlist inventory |
 | Reacher (TikTok Shop affiliate platform) | [docs/reacher.md](docs/reacher.md) | — | creator/sample/GMV Max ad-spend history, affiliate funnel metrics; **write-capable** `reacher_sample_limits.py` for capping/clearing per-product sample auto-approval |
+| Product catalog + cross-channel identity | [docs/catalog.md](docs/catalog.md) | — | Shopify / TikTok Shop / Amazon catalogs (`catalog_*`), Shopify price change-log and optional market pricing, and `product_xref`, which translates product ids between channels (read by the `product_lookup` MCP tool) |
 | Algolia (on-site search/browse) | [docs/algolia.md](docs/algolia.md) | — | collection-grid placement, search/browse engagement |
 | Factory production tracking | [docs/factory-production.md](docs/factory-production.md) | — | manual-drop vendor spreadsheets, header-matched into one table |
 | Google Sheets / Apps Script (opt-in MCP **write** tools, not a connector) | [docs/google-sheets.md](docs/google-sheets.md) | — | add tabs, write values, checkboxes; create/push/deploy a bound Apps Script web app — registered only with `WAREHOUSE_MCP_ENABLE_WRITES=1` |
@@ -214,8 +215,8 @@ server running across reboots with `serve_mcp.bat` (Windows), and the
 
 ## MCP tools
 
-`server.py` exposes six read-only tools (plus an opt-in write set, [below](#optional-write-tools-google-sheets--apps-script)) (MCP server name `ecommerce-warehouse`) — the
-same six over stdio or `--http`, though `run_sql`'s column redaction only kicks in over
+`server.py` exposes seven read-only tools (plus an opt-in write set, [below](#optional-write-tools-google-sheets--apps-script)) (MCP server name `ecommerce-warehouse`) — the
+same seven over stdio or `--http`, though `run_sql`'s column redaction only kicks in over
 HTTP (see below). All annotate `readOnlyHint=True`/`destructiveHint=False`/
 `idempotentHint=True`/`openWorldHint=False`, so clients don't prompt for write-style
 approval. Every tool returns a JSON string (a list of row objects, except `list_tables`).
@@ -227,6 +228,7 @@ approval. Every tool returns a JSON string (a list of row objects, except `list_
 | `spend_summary` | Ad spend by platform | `(start_date: str, end_date: str)` | per platform from `ad_metrics`: `spend`, `revenue`, `clicks`, `impressions`, `conversions`, `roas` (= revenue / spend, `NULL` at zero spend), ordered by spend |
 | `top_campaigns` | Top campaigns by spend | `(start_date: str, end_date: str, limit: int = 15)` | `platform`, `campaign_name`, `spend`, `revenue`, `clicks`, grouped by platform + `campaign_id`, highest spend first |
 | `sales_summary` | Sales by platform | `(start_date: str, end_date: str)` | per platform from `orders`: `orders` (distinct `order_id`), `units` (sum of `quantity`), `sales` (sum of `total`), filtered on `order_date` |
+| `product_lookup` | Translate a product id across channels | `(identifier: str)` | JSON object: the `product_xref` rows the id matched, the SKU keys they resolve to, every channel's ids for those SKUs, and the live Shopify variants (see [docs/catalog.md](docs/catalog.md#mcp-tool-product_lookup)) |
 | `last_sync_status` | Data freshness by platform | `()` | latest `sync_log` row per platform: `platform`, `last_run` (its `finished_at`), `status`, `rows_written`, `message` |
 
 - **`list_tables`** — the schema explorer. Narrow it with `table_pattern`
@@ -266,6 +268,13 @@ the data rules in [AGENTS.md](AGENTS.md) before comparing ad-platform
 revenue across rows. Anything these three don't answer, reach for
   `run_sql` — `list_tables` shows what else is available, including every
   table a platform page under [Connectors, by platform](#connectors-by-platform) adds.
+- **`product_lookup`** — pass any SKU, ASIN, TikTok Shop product id,
+  Shopify product or variant id, or GA4 item id and get every other
+  channel's ids for the same product, resolved through the SKU in
+  `product_xref` (built by `catalog_sync.py`). Archived Shopify duplicates
+  are excluded, since a SKU is not unique in Shopify; rows that share only
+  the title-derived style key come back separately as `same_style_fuzzy`.
+  With no exact match it returns capped title-substring `candidates`.
 - **`last_sync_status`** — one row per platform from `sync_log`: last run
   time, status, rows written, and any error message. The first thing to
   check if a summary tool looks stale or empty.

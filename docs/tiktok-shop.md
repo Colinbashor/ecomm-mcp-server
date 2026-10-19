@@ -318,7 +318,8 @@ handle count and sample-order dates. Things to know:
   recorded as `capped`). `--list` pages each order-bearing status
   (`--all-statuses` adds the ones that never had an order). For older
   history, `--by-product` slices COMPLETED per product — it needs an
-  optional `catalog_tiktok (seller_sku, product_id)` table to turn the
+  optional `catalog_tiktok (seller_sku, product_id)` table (built by
+  `catalog_sync.py`, see [catalog.md](catalog.md)) to turn the
   sample orders' seller SKUs into product ids, or explicit
   `--product-ids` — and `--lookup` asks for the application behind each
   unresolved sample order by `order_id` (one call each, newest first).

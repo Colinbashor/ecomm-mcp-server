@@ -50,6 +50,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from warehouse import db
+from warehouse.product_keys import norm_sku, norm_style
 
 load_dotenv()
 
@@ -886,6 +887,154 @@ def sales_summary(start_date: str, end_date: str) -> str:
     return _rows_to_json(rows)
 
 
+# Per-section row cap for product_lookup. A style-level product can carry
+# dozens of sizes on several channels; past this, narrow the identifier.
+PRODUCT_LOOKUP_CAP = 50
+
+
+def _like_escape(text: str) -> str:
+    """Make user text literal inside a LIKE pattern (backslash is the ESCAPE char)."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def product_lookup(identifier: str) -> str:
+    """
+    Translate one product identifier into every other channel's ids.
+
+    Pass ANY of: a SKU (any channel's spelling -- case and configured channel
+    suffixes like '-FBA' are normalized), an Amazon ASIN, a TikTok Shop
+    product id, a Shopify product id or variant id, or a GA4 item id. You do
+    not need to say which channel it came from.
+
+    Returns JSON with:
+      matched           the product_xref rows the identifier hit directly
+      sku_keys          the normalized SKU(s) those rows resolve to
+      by_channel        every channel's ids sharing those SKUs (exact identity)
+      shopify_variants  the live Shopify variants for those SKUs (ARCHIVED
+                        duplicates excluded -- a SKU is not unique in Shopify)
+      same_style_fuzzy  rows sharing only the title-derived style key, when
+                        any; a hint, not an identity match
+    If nothing matches exactly, falls back to a title substring search and
+    returns `candidates` instead. Built from product_xref, which
+    catalog_sync.py rebuilds; a channel missing here usually means the product
+    is not listed there (or that channel's catalog sync is not configured).
+    """
+    ident = (identifier or "").strip()
+    if not ident:
+        return "Error: pass a non-empty identifier (SKU, ASIN, or a channel product id)."
+    conn = db.connect_readonly()
+    _protect_remote_connection(conn)
+    try:
+        def has(name: str) -> bool:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?",
+                (name,)).fetchone() is not None
+
+        if not has("product_xref"):
+            return ("product_xref does not exist yet. Run `python catalog_sync.py` "
+                    "(or `--xref-only` once catalog tables exist) to build it.")
+        cap = PRODUCT_LOOKUP_CAP
+        notes: list[str] = []
+        cols = "channel, channel_id, channel_sku, sku_key, match_key, title"
+        hits = [dict(r) for r in conn.execute(
+            f"SELECT {cols} FROM product_xref WHERE channel_id = ? OR sku_key = ? "
+            f"ORDER BY channel LIMIT ?", (ident, norm_sku(ident), cap + 1))]
+        sku_keys = {h["sku_key"] for h in hits if h["sku_key"]}
+        if has("catalog_shopify"):
+            # A Shopify product id is not a product_xref key (xref is variant
+            # grain), and an ARCHIVED variant is not in product_xref at all --
+            # resolve both through the catalog to their SKU.
+            for r in conn.execute(
+                    "SELECT DISTINCT sku FROM catalog_shopify "
+                    "WHERE (product_id = ? OR variant_id = ?) AND COALESCE(sku,'') != '' "
+                    "LIMIT ?", (ident, ident, cap + 1)):
+                sku_keys.add(norm_sku(r["sku"]))
+        sku_keys.discard("")
+
+        if not hits and not sku_keys:
+            if len(ident) < 3:
+                return f"No product_xref row matches {identifier!r}."
+            pat = f"%{_like_escape(ident)}%"
+            style_key = norm_style(ident)
+            # An identifier that normalizes to nothing ('%%%') must not turn
+            # into a match-everything '%%' pattern on match_key.
+            style = f"%{_like_escape(style_key)}%" if style_key else None
+            candidates = [dict(r) for r in conn.execute(
+                f"SELECT {cols} FROM product_xref "
+                f"WHERE title LIKE ? ESCAPE '\\' "
+                f"OR (? IS NOT NULL AND match_key LIKE ? ESCAPE '\\') "
+                f"ORDER BY channel LIMIT 25", (pat, style, style))]
+            if not candidates:
+                return f"No product_xref row matches {identifier!r} (exact or substring)."
+            return json.dumps({
+                "identifier": ident, "matched": [], "candidates": candidates,
+                "notes": ["No exact id/SKU match; these are title substring candidates "
+                          "(capped at 25). Re-run with one of their ids or SKUs."],
+            }, default=str, indent=2)
+
+        if len(hits) > cap:
+            hits = hits[:cap]
+            notes.append(f"matched capped at {cap} rows")
+        keys = sorted(sku_keys)[:200]
+        by_channel: dict[str, list[dict]] = {}
+        shopify_variants: list[dict] = []
+        if keys:
+            ph = ",".join("?" * len(keys))
+            related = conn.execute(
+                f"SELECT channel, channel_id, channel_sku, title FROM product_xref "
+                f"WHERE sku_key IN ({ph}) ORDER BY channel, channel_sku, channel_id LIMIT ?",
+                (*keys, cap * 4 + 1)).fetchall()
+            if len(related) > cap * 4:
+                related = related[:cap * 4]
+                notes.append(f"by_channel capped at {cap * 4} rows")
+            for r in related:
+                by_channel.setdefault(r["channel"], []).append(
+                    {"channel_id": r["channel_id"], "channel_sku": r["channel_sku"],
+                     "title": r["title"]})
+            if has("catalog_shopify"):
+                shopify_variants = [dict(r) for r in conn.execute(
+                    f"SELECT cs.product_id, cs.variant_id, cs.sku, cs.title, cs.variant_title, "
+                    f"cs.status, cs.price, cs.compare_at_price, cs.unit_cost "
+                    f"FROM product_xref x JOIN catalog_shopify cs ON cs.variant_id = x.channel_id "
+                    f"WHERE x.channel = 'shopify' AND x.sku_key IN ({ph}) "
+                    f"ORDER BY cs.product_id, cs.variant_id LIMIT ?", (*keys, cap + 1))]
+                if len(shopify_variants) > cap:
+                    shopify_variants = shopify_variants[:cap]
+                    notes.append(f"shopify_variants capped at {cap} rows")
+
+        out: dict[str, Any] = {
+            "identifier": ident,
+            "matched": [{k: h[k] for k in ("channel", "channel_id", "channel_sku", "title")}
+                        for h in hits],
+            "sku_keys": keys,
+            "by_channel": by_channel,
+            "shopify_variants": shopify_variants,
+        }
+        styles = sorted({h["match_key"] for h in hits if h["match_key"]})[:20]
+        if styles:
+            ph_s = ",".join("?" * len(styles))
+            exclude = f"AND sku_key NOT IN ({','.join('?' * len(keys))})" if keys else ""
+            fuzzy = [dict(r) for r in conn.execute(
+                f"SELECT channel, channel_id, channel_sku, title FROM product_xref "
+                f"WHERE match_key IN ({ph_s}) {exclude} "
+                f"ORDER BY channel LIMIT 25", (*styles, *keys))]
+            # Rows that matched directly are already in `matched`.
+            direct = {(h["channel"], h["channel_id"], h["channel_sku"]) for h in hits}
+            fuzzy = [f for f in fuzzy
+                     if (f["channel"], f["channel_id"], f["channel_sku"]) not in direct]
+            if fuzzy:
+                out["same_style_fuzzy"] = fuzzy
+                notes.append("same_style_fuzzy shares only a title-derived style key "
+                             "(capped at 25): verify before treating it as the same product")
+        if notes:
+            out["notes"] = notes
+        return json.dumps(out, default=str, indent=2)
+    except sqlite3.DatabaseError as e:
+        return f"SQL error: {e}"
+    finally:
+        conn.close()
+
+
 def last_sync_status() -> str:
     """Show the most recent sync run for each platform (to check freshness)."""
     conn = db.connect_readonly()
@@ -924,6 +1073,7 @@ _TOOLS = (
     (spend_summary, "Ad spend by platform"),
     (top_campaigns, "Top campaigns by spend"),
     (sales_summary, "Sales by platform"),
+    (product_lookup, "Translate a product id across channels"),
     (last_sync_status, "Data freshness by platform"),
 )
 

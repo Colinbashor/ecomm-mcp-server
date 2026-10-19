@@ -26,8 +26,9 @@ warehouse/
   schema.sql           the shared core tables
   connectors/          the 6 that write shared `orders` / `ad_metrics`
   brand_analytics.py   shared Amazon report runner
+  product_keys.py      sku_key / match_key normalization (catalog_sync.py + product_lookup)
   notify.py            optional Slack / Google Chat / email notifications
-server.py              MCP server (6 read-only tools + opt-in Sheets write set; stdio, or --http)
+server.py              MCP server (7 read-only tools + opt-in Sheets write set; stdio, or --http)
 *_mutate.py            WRITE-capable ad-account scripts (google, meta); dry-run unless --execute
 google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
 backup_db.py           rotating, verified local backups of warehouse.db
@@ -182,8 +183,8 @@ costs what fetching 1 costs, so page at the maximum the API allows.
 
 ## The MCP server
 
-Six read-only tools: `list_tables`, `run_sql`, `spend_summary`,
-`sales_summary`, `top_campaigns`, `last_sync_status`. Plus seven OPT-IN Google
+Seven read-only tools: `list_tables`, `run_sql`, `spend_summary`,
+`sales_summary`, `top_campaigns`, `product_lookup`, `last_sync_status`. Plus seven OPT-IN Google
 Sheets / Apps Script write tools (`register_write_tools`), registered only
 when `WAREHOUSE_MCP_ENABLE_WRITES` is exactly `1` at startup — keep that gate
 exact-match, keep `google_sheets_script` imported lazily inside it, and keep
