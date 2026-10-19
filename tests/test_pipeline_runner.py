@@ -181,10 +181,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_only_resumable_example_steps_tolerate_a_pause(self) -> None:
         """Keep the list closed so tolerance cannot spread by copy-paste:
-        each of these checkpoints its progress and exits 75 by design."""
+        each of these exits 75 by design on an upstream fault (most also
+        checkpoint progress; catalog_sync isolates channels and pauses on an
+        empty channel or a report that never finished)."""
         allowed = {"flexport_orders_sync.py", "flexport_returns_sync.py",
                    "flexport_inbounds_sync.py", "merchant_center_sync.py",
-                   "tiktok_affiliate_sync.py"}
+                   "tiktok_affiliate_sync.py", "catalog_sync.py"}
         for pipeline in pipeline_runner.load_config(
                 pipeline_runner.EXAMPLE_CONFIG).values():
             for step in pipeline.steps:

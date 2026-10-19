@@ -197,6 +197,9 @@ DEFAULT_STATUS_PLATFORMS: dict[str, int] = {
     "search_console_pages": STALE_RUN_DAYS,
     "search_console_query_pages": STALE_RUN_DAYS,
     "shopify_customers": STALE_RUN_DAYS,
+    # catalog_sync.py: run cadence only, deliberately not in the volume check
+    # -- an incremental --days window on a quiet store can legitimately be empty.
+    "catalog": STALE_RUN_DAYS,
     "tiktok_finance": STALE_RUN_DAYS,
     "warehouse_backup": STALE_RUN_DAYS,
     # weekly

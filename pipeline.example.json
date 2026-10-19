@@ -24,6 +24,13 @@
           ]
         },
         {
+          "description": "After the pulls: catalog_sync rebuilds product_xref, which also reads the order tables run_sync.py just refreshed.",
+          "steps": [
+            {"script": "catalog_sync.py", "args": ["--days", "3"], "tolerate_pause": true,
+             "timeout_minutes": 120}
+          ]
+        },
+        {
           "description": "Back up only after every writer above has finished.",
           "steps": [
             {"script": "backup_db.py", "timeout_minutes": 120}
