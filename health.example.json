@@ -1,0 +1,24 @@
+{
+  "_comment": "Example overrides for warehouse_health.py. Copy to health.json (gitignored). Each top-level key REPLACES its built-in default wholesale; run `python warehouse_health.py --print-config` for the full defaults to start from. See docs/health.md.",
+  "escalate_after_days": 7,
+  "only_seen_platforms": false,
+  "status_platforms": {
+    "shopify": 3,
+    "meta": 3,
+    "google": 3,
+    "ga4": 3
+  },
+  "freshness": [
+    {"name": "shopify_orders", "platform": "shopify", "max_age_days": 4,
+     "description": "A low-volume store: a quiet weekend is not an outage.",
+     "sql": "SELECT MAX(substr(order_date,1,10)) FROM orders WHERE platform='shopify'"},
+    {"name": "meta_ads", "platform": "meta", "max_age_days": 2,
+     "sql": "SELECT MAX(date) FROM ad_metrics WHERE platform='meta'"},
+    {"name": "google_ads", "platform": "google", "max_age_days": 2,
+     "sql": "SELECT MAX(date) FROM ad_metrics WHERE platform='google'"}
+  ],
+  "verified_empty_dates": {
+    "google_ads": ["2025-12-25"]
+  },
+  "disable": ["historical_gaps:ga4"]
+}
