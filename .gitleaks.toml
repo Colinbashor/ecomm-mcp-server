@@ -1,0 +1,15 @@
+# gitleaks configuration: the default rule set, plus allowlisted public
+# constants that the generic-api-key rule mistakes for secrets.
+#
+# ATVPDKIKX0DER is Amazon's published US marketplace id (.env.example ships it
+# as the SPAPI_MARKETPLACE_ID default). It is not a credential, but its entropy
+# trips generic-api-key, which failed the weekly full-history scan every week.
+# Allowlist the exact value rather than the file, so a real key added to
+# .env.example is still caught.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public constants, not credentials"
+regexes = ['''ATVPDKIKX0DER''']

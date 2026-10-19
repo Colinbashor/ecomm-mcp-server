@@ -1,6 +1,6 @@
 name: ci
 
-# The suite is hermetic — no network, no warehouse.db, ~6s — so it runs on
+# The suite is hermetic — no network, no warehouse.db, ~20s — so it runs on
 # every push and PR rather than on a schedule.
 on:
   push:
