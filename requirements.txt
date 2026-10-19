@@ -22,6 +22,15 @@ google-analytics-data
 # service-account credential (server-to-server auth, no browser consent step).
 google-auth
 
+# Only needed for the browser-consent OAuth helpers google_auth.py and
+# google_sheets_auth.py. Listed explicitly: google-ads happens to pull it in,
+# so dropping google-ads above would otherwise silently break these helpers.
+google-auth-oauthlib
+
+# Only needed by factory_status_import.py for legacy .xls files (.xlsx goes
+# through openpyxl). The import is guarded, so everything else runs without it.
+xlrd
+
 # Only needed for tiktok_creators_sync.py's `import` subcommand (loading a
 # manually-exported .xlsx creator roster). The `api` subcommand and every
 # other script here work without it.

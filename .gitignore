@@ -7,6 +7,10 @@ credentials.json
 meta_targeting_rules.json
 *service-account*.json
 certs/
+# local state written at runtime: allowed_hosts.txt names your internal
+# hostnames; the overrides file is per-deployment sample-limit state
+allowed_hosts.txt
+reacher_sample_limit_overrides.json
 
 # local data - a warehouse DB is not source code
 *.db
