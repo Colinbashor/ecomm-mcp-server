@@ -1,0 +1,45 @@
+{
+  "_comment": "Example pipeline for pipeline_runner.py. Copy to pipeline.json (gitignored) and delete the steps for platforms you do not use: a standalone script without credentials fails rather than skipping, unlike run_sync.py. Script paths are relative to the repo root. See docs/health.md.",
+  "pipelines": {
+    "daily": {
+      "description": "Nightly refresh: independent API pulls, then a backup.",
+      "lock_wait_minutes": 360,
+      "max_concurrent": 4,
+      "waves": [
+        {
+          "description": "Independent pulls. None reads another's output, so they overlap; SQLite still serialises their writes behind db.BUSY_TIMEOUT_SECONDS.",
+          "steps": [
+            {"script": "run_sync.py", "args": ["--days", "3"], "timeout_minutes": 240,
+             "description": "The six shared-table connectors; skips any without credentials."},
+            {"script": "ga4_sync.py", "args": ["--days", "3"]},
+            {"script": "merchant_center_sync.py", "args": ["--days", "3"], "tolerate_pause": true},
+            {"script": "search_console_sync.py", "args": ["--days", "5"], "timeout_minutes": 90},
+            {"script": "amazon_inventory_sync.py",
+             "description": "Current-state snapshot with no backfill: a missed day is lost for good."},
+            {"script": "flexport_sync.py"},
+            {"script": "flexport_orders_sync.py", "tolerate_pause": true, "timeout_minutes": 240},
+            {"script": "flexport_returns_sync.py", "tolerate_pause": true},
+            {"script": "flexport_inbounds_sync.py", "tolerate_pause": true},
+            {"script": "klaviyo_sync.py"}
+          ]
+        },
+        {
+          "description": "Back up only after every writer above has finished.",
+          "steps": [
+            {"script": "backup_db.py", "timeout_minutes": 120}
+          ]
+        }
+      ]
+    },
+    "weekly": {
+      "description": "Slower, heavier pulls that do not need a daily cadence.",
+      "lock_wait_minutes": 360,
+      "waves": [
+        [
+          {"script": "tiktok_affiliate_sync.py", "args": ["orders", "--days", "60"],
+           "tolerate_pause": true, "timeout_minutes": 120}
+        ]
+      ]
+    }
+  }
+}
