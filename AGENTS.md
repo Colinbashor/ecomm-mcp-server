@@ -31,6 +31,10 @@ server.py              MCP server (6 read-only tools + opt-in Sheets write set; 
 *_mutate.py            WRITE-capable ad-account scripts (google, meta); dry-run unless --execute
 google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
 backup_db.py           rotating, verified local backups of warehouse.db
+pipeline_runner.py     runs the scheduled steps from pipeline.json (template:
+                       pipeline.example.json): waves, per-step tree-kill timeouts
+warehouse_health.py    read-only ERROR / DEGRADED / WARN checks (config: health.json)
+health_alerts.py       notifies via notify.py only when health CHANGES
 bq_mirror_sync.py      optional: mirror SQLite tables into BigQuery (registry in
                        bq_mirror_registry.py; needs google-cloud-bigquery)
 make_cert.py           self-signed TLS cert for --http (writes certs/)
@@ -39,6 +43,7 @@ SHARING.md             team/HTTP setup: token, HostGuard, certs, mcp-remote
 *_auth.py              one-time OAuth helpers (google, google_sheets, amazon, tiktok, klaviyo)
 docs/<platform>.md     per-platform setup + traps  <- READ BEFORE EDITING
 docs/operations.md     notify.py, backup_db.py, bq_mirror_sync.py (non-connector utilities)
+docs/health.md         pipeline_runner, warehouse_health, health_alerts, scheduling
 tests/                 hermetic; no network, no database file
 ```
 
@@ -140,8 +145,9 @@ apart will dominate a naive `SUM`. Filter to one currency or convert explicitly.
 **1. A run that achieved nothing must never log `ok`.** This is the most
 expensive lesson in this codebase. A "graceful pause" that logged success once
 hid 29 consecutive no-op runs across 13 days, because the health check stayed
-green. If a run cannot make progress, log `degraded` and exit non-zero. A
-resumable design without this fails silently forever.
+green. If a run cannot make progress, log `degraded` and exit non-zero (75 for
+a deliberate pause — see [Statuses, exit codes and health](#statuses-exit-codes-and-health)).
+A resumable design without this fails silently forever.
 
 **2. Never persist an unproven cursor.** Save a pagination cursor only after a
 page actually returns data. A seeded or crafted cursor that turns out to be dead
@@ -177,6 +183,44 @@ store partial data for months.
 
 **8. Latency is usually per-request, not per-row.** Fetching 100 items often
 costs what fetching 1 costs, so page at the maximum the API allows.
+
+---
+
+## Statuses, exit codes and health
+
+Three outcomes, never two. Conflating a deliberate pause with a crash is how a
+status ends up red on every run — and a light that is always red hides the
+real outage behind it.
+
+| `sync_log.status` | Use it for | Script exit |
+|---|---|---|
+| `ok` | the run delivered data | 0 |
+| `degraded` | a deliberate pause on an upstream fault (5xx window outlasting retries, unpublished report, a rate limit that never cleared) with state checkpointed for the next run — **or** a run that achieved nothing (empty pull) | 75 for a pause |
+| `error` | ours: an exception, bad credentials, a schema problem | non-zero (not 75) |
+
+- **Exit 75 means "paused, resume next run"** and only for a script built to
+  checkpoint and resume. `pipeline_runner.py` tolerates it only for steps that
+  declare `"tolerate_pause": true`; from any other step it is a failure. A
+  step timeout (exit 124) is never tolerated — a hang is not a pause.
+- **`warehouse_health.py` is ERROR / DEGRADED / WARN, and only ERROR drives its
+  exit code.** `degraded` is DEGRADED until the platform has gone
+  `escalate_after_days` (default 7) without an `ok` run, then ERROR again:
+  classification, not suppression. Measure that clock as days since the last
+  `ok`, never as a consecutive-failure count, which an intermittent feed resets
+  on every lucky run.
+- **`health_alerts.py` notifies on change only** (new, escalated, recovered,
+  plus a weekly digest of standing DEGRADED). Don't add a code path that
+  notifies on standing state.
+- **Never alarm on `rows_written` with a floor.** The volume check looks for a
+  streak of successful runs that all wrote 0 rows; a fixed minimum both
+  false-positives on sparse healthy feeds and misses a broken small one.
+- **Health defaults must stay quiet for unconfigured connectors.**
+  `only_seen_platforms` skips a declared platform that has never logged a row,
+  so a new default must name the `platform` that activates it. Freshness specs
+  read the data's own date, not `synced_at`, and never get an `owner_platform`
+  whose sync can log `ok` while writing nothing.
+
+Details, config formats and scheduling: [docs/health.md](docs/health.md).
 
 ---
 
@@ -236,8 +280,11 @@ Follow an existing standalone sync; they share a shape.
 4. Log to `sync_log` (`db.log_sync(platform, started_at, rows_written,
    status, message)`) with `ok` / `degraded` / `error` and a message naming
    what was actually covered — especially for a partial run. `run_sync.py`
-   itself only ever logs `ok` or `error`; `last_sync_status` surfaces the
-   latest row per platform, so this is what a human sees first.
+   logs `ok`, `degraded` for an empty pull, and `error` on an exception;
+   `last_sync_status` surfaces the latest row per platform, so this is what
+   a human sees first. Keep the platform name stable: `warehouse_health.py`
+   keys its checks on it, and add the new platform (and its tables) to its
+   defaults — see [Statuses, exit codes and health](#statuses-exit-codes-and-health).
 5. Support `--dry-run` (or `--probe`), a date window, and resume.
 6. Write `docs/<platform>.md`: auth steps, retention floor, pagination style,
    rate limits, and every trap you hit. **This is a deliverable, not an
