@@ -90,7 +90,9 @@ How a run behaves:
   window refreshes those rows in place.
 - **One failure doesn't stop the rest.** Each connector's exception is caught, logged to
   `sync_log` with status `error` and the exception text as `message`, and the loop moves on.
-  Successes log status `ok` with the row count.
+  Successes log status `ok` with the row count; a connector that returns **zero rows** logs
+  `degraded` instead, because an empty pull (expired scope, wrong account, an unpublished
+  window) must not keep the feed looking healthy.
 - **Exit code.** If any connector failed, the process exits non-zero with
   `Connector failures: <names>` — so a scheduler can alert on it.
 
@@ -150,6 +152,32 @@ notification to Slack/Chat/email, rotating local backups of `warehouse.db`, and
 a schedule (full replace or a self-healing trailing-days window, verified by
 row counts; optional `google-cloud-bigquery` dependency). See
 [docs/operations.md](docs/operations.md).
+
+The scripts that keep it all running unattended — a scheduled pipeline, health
+checks and change-only alerts — are covered next.
+
+## Keeping it healthy
+
+Once more than one sync is scheduled, the hard part stops being "does it run" and
+becomes "would I notice if it stopped". An empty pull, a stalled feed and a broken one
+can all look fine at a glance, and an alarm that is red every day gets ignored. Three
+scripts, none needing credentials of their own:
+
+| Script | What it does |
+|---|---|
+| `pipeline_runner.py` | Runs your steps (from `pipeline.json`, or the checked-in `pipeline.example.json`) as child processes in ordered waves, one pipeline at a time. Per-step timeouts kill the step's whole process tree; exit 75 from a step marked `tolerate_pause` is a tolerated pause. Writes a `sync_log` row per step and per run: `ok`, `degraded` (only tolerated pauses, exit 0) or `error` (exit 1) |
+| `warehouse_health.py` | Read-only checks over `sync_log` and the tables, at three severities: **ERROR** (ours, exit 1), **DEGRADED** (a known upstream pause, exit 0), **WARN** (historical gaps, exit 0). A platform that stays `degraded` past 7 days without a successful run escalates to ERROR. Also catches stale tables, feeds that stopped running, and runs logged `ok` that wrote 0 rows. Defaults cover every public connector, skip ones you never ran, and are overridable in `health.json` |
+| `health_alerts.py` | Pushes to Slack / Google Chat / email via `warehouse/notify.py` **only when health changes** — a new problem, an escalation, a recovery — plus a weekly digest of standing DEGRADED conditions. Recipients come from `WAREHOUSE_HEALTH_*` env vars |
+
+```bash
+python pipeline_runner.py daily --dry-run   # print the plan
+python pipeline_runner.py daily             # run it (schedule this)
+python warehouse_health.py                  # report; exit 1 on any ERROR
+python health_alerts.py --dry-run           # what would be sent
+```
+
+[docs/health.md](docs/health.md) covers the config formats, what each state means, the
+escalation clock, alerts, and scheduling with Task Scheduler, cron or launchd.
 
 ## Running the server
 
@@ -349,6 +377,9 @@ Hermetic — no network access, no `warehouse.db` required — and a full run ta
 | `tests/test_db_journal_mode.py` | A fresh database comes up in WAL mode (not SQLite's default `delete` journal) and `init_db()` stays idempotent |
 | `tests/test_shopify_connector.py` | Network-blip retry/backoff, honoring `Retry-After` on a 429, GraphQL throttling, and that a hard error (5xx, a real GraphQL error) fails immediately instead of retrying |
 | `tests/test_google_ads_connector.py` | `search_impression_share` and its lost-share siblings stay `NULL` only on non-auction campaign types, keep a real `0.0` on Search/Shopping, and a Google-side `0.0/0.0/0.0` placeholder response is detected and nulled rather than stored as a fabricated zero |
+| `tests/test_pipeline_runner.py` | Tolerated pauses vs. failures vs. timeouts, per-step and per-run `sync_log` rows, a real cross-platform pipeline lock (busy lock logs `degraded`, exits 75), strict config validation, that `pipeline.example.json` only references scripts in this repo, and a real timeout that must kill a step's grandchild process too |
+| `tests/test_warehouse_health.py` | DEGRADED inside the escalation clock and ERROR past it, per-platform staleness, stopped and vanished platforms, zero-row streaks, owner-softened freshness and its cap, snapshot/series gaps, `only_seen_platforms`, `disable`, config validation, ERROR-only exit code, and that every default freshness table is one this repo creates |
+| `tests/test_health_alerts.py` | Change-only delivery over a persisted `health_state`: the same state twice sends once, new/recovered/recurring each send exactly once, escalations send once, the digest repeats standing DEGRADED only on its weekday, dry-run records nothing, and state is written before the push |
 | `tests/test_notify.py` | Chat-markdown/HTML rendering, per-`dest` target resolution, that a missing/unconfigured/failing target is skipped rather than raised, that `send(dest=...)`'s email target calls `send_email()` (so it shares the same retry behavior rather than a separate weaker path), `_smtp_config()` reading `SMTP_*` from the environment at call time, and `send_email()`'s own retry-then-report-failure behavior for a standalone HTML report send |
 
 Every standalone sync/import script under [Connectors, by platform](#connectors-by-platform)
@@ -376,6 +407,8 @@ tied to any one platform:
 | `WAREHOUSE_MCP_TOKEN` | Bearer token required in `--http` mode | unset |
 | `WAREHOUSE_MCP_ALLOWED_HOSTS` | Comma- or semicolon-separated Host/Origin allowlist for `--http` (see also `allowed_hosts.txt`) | unset |
 | `WAREHOUSE_MCP_ENABLE_WRITES` | Exactly `1` registers the optional Google Sheets / Apps Script write tools (see [Optional write tools](#optional-write-tools-google-sheets--apps-script)); read once at startup | unset (off) |
+| `WAREHOUSE_HEALTH_CONFIG` | Path to the `warehouse_health.py` / `health_alerts.py` config (see [docs/health.md](docs/health.md)) | `health.json` beside the code; built-in defaults if absent |
+| `WAREHOUSE_TIMEZONE` | IANA time zone for "today" in the health checks' staleness math | this machine's local time |
 | `CERT_ORG_NAME` | Organization field on the self-signed cert `make_cert.py` generates. `make_cert.py` does **not** load `.env`, so set this in the shell environment when you run it | `ecommerce-warehouse MCP` |
 
 Set `WAREHOUSE_DB` the same way for both `run_sync.py` and `server.py`. If they disagree,

@@ -174,6 +174,6 @@ CREATE TABLE IF NOT EXISTS sync_log (
     started_at TEXT NOT NULL,
     finished_at TEXT,
     rows_written INTEGER DEFAULT 0,
-    status     TEXT,                   -- 'ok' or 'error'
+    status     TEXT,                   -- 'ok', 'degraded' or 'error'
     message    TEXT
 );

@@ -1,7 +1,10 @@
 # Operations
 
 Three standalone utilities that aren't connectors — no platform credentials,
-no data pulled from any platform. All are optional.
+no data pulled from any platform. All are optional. The scheduled pipeline,
+health checks and change-only alerts (`pipeline_runner.py`,
+`warehouse_health.py`, `health_alerts.py`) have their own page:
+[health.md](health.md).
 
 ## Notifications — `warehouse/notify.py`
 

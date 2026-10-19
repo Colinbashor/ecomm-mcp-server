@@ -36,3 +36,10 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# your own pipeline / health config (pipeline.example.json is the template;
+# warehouse_health.py --print-config prints the health defaults) and the
+# runner's lock file, which lives beside the database
+pipeline.json
+health.json
+*.pipeline.lock
