@@ -66,8 +66,17 @@ def run(platforms: list[str], start_date: str, end_date: str) -> list[str]:
         try:
             rows = module.sync(start_date, end_date)
             written = db.upsert_ad_metrics(rows) if kind == "ads" else db.upsert_orders(rows)
-            db.log_sync(name, started, written, "ok")
-            print(f"  - {name:7s}  OK     {written} rows")
+            # An empty pull is not a success: a connector that silently returns
+            # nothing (expired scope, wrong account, a window the API has not
+            # published yet) must not keep the feed green. Not a failure
+            # either — the exit code still reflects exceptions only.
+            if written:
+                db.log_sync(name, started, written, "ok")
+                print(f"  - {name:7s}  OK     {written} rows")
+            else:
+                db.log_sync(name, started, 0, "degraded",
+                            f"0 rows returned for {start_date}..{end_date}")
+                print(f"  - {name:7s}  DEGRADED  0 rows returned")
         except Exception as e:  # noqa: BLE001
             failures.append(name)
             db.log_sync(name, started, 0, "error", str(e))
