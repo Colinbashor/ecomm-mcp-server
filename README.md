@@ -29,11 +29,17 @@ so pointing it at a fresh path yields an empty-but-valid warehouse rather than a
 
 ## Setup
 
+**Step-by-step guides:** [docs/setup-manual.md](docs/setup-manual.md) if you're setting it
+up yourself, or [docs/setup-with-ai.md](docs/setup-with-ai.md) if you'd like an AI
+assistant (Claude, ChatGPT, a coding agent) to walk you through it. The assistant's own
+instructions are in [SETUP_AGENT.md](SETUP_AGENT.md). The short version:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env             # then fill in the platforms you use
+python env_check.py              # which keys are set / empty / missing (never prints values)
 ```
 
 `mcp[cli]` is pinned to `>=1.29,<2` on purpose. SDK 2.0.0 renames `FastMCP` to

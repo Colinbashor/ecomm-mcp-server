@@ -14,6 +14,10 @@ If you only read one thing: **an empty result and a broken pull look identical,
 and so do a partial period and a genuinely bad week.** Most rules here exist to
 tell those apart.
 
+**Setting this up for someone rather than changing the code?** Follow
+[SETUP_AGENT.md](SETUP_AGENT.md) instead — it covers the secrets rules, the
+setup phases and the checks for each.
+
 ---
 
 ## Layout
@@ -36,6 +40,8 @@ pipeline_runner.py     runs the scheduled steps from pipeline.json (template:
                        pipeline.example.json): waves, per-step tree-kill timeouts
 warehouse_health.py    read-only ERROR / DEGRADED / WARN checks (config: health.json)
 health_alerts.py       notifies via notify.py only when health CHANGES
+env_check.py           which .env keys are set/empty/missing; NEVER prints a value
+SETUP_AGENT.md         instructions for an AI assistant doing a first-time setup
 bq_mirror_sync.py      optional: mirror SQLite tables into BigQuery (registry in
                        bq_mirror_registry.py; needs google-cloud-bigquery)
 make_cert.py           self-signed TLS cert for --http (writes certs/)
