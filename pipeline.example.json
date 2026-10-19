@@ -2,7 +2,7 @@
   "_comment": "Example pipeline for pipeline_runner.py. Copy to pipeline.json (gitignored) and delete the steps for platforms you do not use: a standalone script without credentials fails rather than skipping, unlike run_sync.py. Script paths are relative to the repo root. See docs/health.md.",
   "pipelines": {
     "daily": {
-      "description": "Nightly refresh: independent API pulls, then a backup.",
+      "description": "Nightly refresh: independent API pulls, then a backup, then the health check and change-only alert.",
       "lock_wait_minutes": 360,
       "max_concurrent": 4,
       "waves": [
@@ -27,6 +27,13 @@
           "description": "Back up only after every writer above has finished.",
           "steps": [
             {"script": "backup_db.py", "timeout_minutes": 120}
+          ]
+        },
+        {
+          "description": "Strictly last: both read everything. warehouse_health exits 1 on any ERROR; health_alerts is what reaches a person, and only when something changed.",
+          "steps": [
+            {"script": "warehouse_health.py", "timeout_minutes": 15},
+            {"script": "health_alerts.py", "timeout_minutes": 15}
           ]
         }
       ]

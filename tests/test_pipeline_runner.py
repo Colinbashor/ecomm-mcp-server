@@ -173,6 +173,12 @@ class ConfigTests(unittest.TestCase):
                     self.assertTrue(step.path.is_file())
                     self.assertFalse(Path(step.script).is_absolute())
 
+    def test_example_daily_ends_with_health_then_alerts(self) -> None:
+        daily = pipeline_runner.load_config(
+            pipeline_runner.EXAMPLE_CONFIG)["daily"]
+        self.assertEqual([s.script for s in daily.waves[-1]],
+                         ["warehouse_health.py", "health_alerts.py"])
+
     def test_only_resumable_example_steps_tolerate_a_pause(self) -> None:
         """Keep the list closed so tolerance cannot spread by copy-paste:
         each of these checkpoints its progress and exits 75 by design."""
