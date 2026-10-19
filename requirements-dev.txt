@@ -6,6 +6,6 @@
 #     pip install -r requirements-dev.txt
 #     pytest -q
 #
-# The suite is fast (~2s, no network, no warehouse.db) — hermetic by design.
+# Hermetic by design (no network, no warehouse.db); a full run takes ~15-20s.
 
 pytest>=8.0
