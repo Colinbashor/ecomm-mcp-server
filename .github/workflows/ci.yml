@@ -35,9 +35,9 @@ jobs:
             python: "3.11"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0        # full history: a secret in an OLD commit still leaks
 
@@ -80,7 +80,9 @@ jobs:
           fi
           echo "no credential-shaped paths tracked"
 
-      - uses: gitleaks/gitleaks-action@v2
+      # v3 = the Node 24 runtime; v2 ran on Node 20, which GitHub removed from
+      # hosted runners on 2026-09-16. Inputs and behaviour are unchanged.
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Free for public repos on personal accounts. If this repo ever moves
@@ -95,8 +97,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       - run: pip install pip-audit
