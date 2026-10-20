@@ -24,6 +24,8 @@ requires brand registry.
 | `amazon_traffic_sync.py` | standalone | per-ASIN Sales & Traffic: sessions, page views, Buy Box %, units/sales, weekly and monthly grain |
 | `amazon_event_pull.py` | standalone | Sales & Traffic for an arbitrary date window (a sale event inside the current week), stored apart from the weekly tables with its own coverage record |
 | `amazon_listing_quality_sync.py` | standalone | per-SKU content-quality issues (Listings Items API) — the same checks behind Seller Central's Listing Quality Dashboard |
+| `amazon_listing_quality_priority.py` | standalone, reads only | ranks penalized ASINs by volume at risk (units × severity) and writes a quick-wins CSV |
+| `amazon_listing_quality_material_fix.py` | standalone, **writes to Amazon with `--execute`** | fills the "missing material" issue (code `18448`) from `catalog_shopify.material` |
 | `voc_import.py` | standalone, manual CSV | per-ASIN/SKU Voice of the Customer health |
 
 ## Setup
@@ -362,3 +364,32 @@ incomplete window recorded rather than hidden, a re-run with the same
 `tests/test_amazon_rank_sync.py`, `tests/test_amazon_fees_sync.py`,
 `tests/test_amazon_economics_sync.py`, `tests/test_amazon_traffic_sync.py`,
 `tests/test_amazon_listing_quality_sync.py`, `tests/test_voc_import.py`
+
+### Listing-quality triage and the material fix
+
+`amazon_listing_quality_priority.py` reads `amazon_listing_quality`,
+`amazon_listing_quality_issues` and `amazon_traffic_weekly` and writes two
+CSVs (`--out-dir`, default the current directory): every penalized ASIN ranked
+by `max(units, units in the prior window) × severity`, and a quick-wins cut
+(two issues or fewer, above the median volume, not suppressed). It rolls up to
+ASIN first, picking each ASIN's worst offer, so an FBA and an MFN SKU of one
+product are not counted twice. Set `AMAZON_MIRROR_SKU_PREFIX` if some SKUs
+mirror a primary offer; the primary then always represents the ASIN. The
+`api_fixable` column is a triage hint from the issue codes, not a tested claim.
+
+`amazon_listing_quality_material_fix.py` is a **dry run by default**: it writes
+`amazon_listing_quality_material_fix_review.csv` and calls nothing. `--execute`
+PATCHes `/attributes/material` for each SKU, so try `--execute --limit 1`,
+confirm with `amazon_listing_quality_sync.py`, then run the rest. It needs
+`catalog_sync.py` data. Traps:
+
+- Your store's material field is usually a composition string
+  (`95% Polyester, 5% Elastane`); Amazon wants a material name. The script
+  submits only the highest-percentage component, mapped through a small
+  synonym table. A word not in the table is **dropped, not guessed**: a wrong
+  enum value fails the PATCH, and a skipped SKU is cheaper than a wrong one.
+- `catalog_shopify.sku` is not unique. Archived duplicates are ignored, or a
+  stale duplicate's value could be pushed.
+- If your Amazon SKUs carry fulfilment suffixes the store SKU lacks, list them
+  in `AMAZON_SKU_SUFFIXES` (e.g. `-FBA,-FBM`); the default strips nothing.
+- A `--execute` run logs `amazon_listing_material_fix` to `sync_log`.
