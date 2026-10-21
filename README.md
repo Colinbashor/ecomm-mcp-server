@@ -371,7 +371,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Hermetic — no network access, no `warehouse.db` required — and a full run takes ~15-20 seconds. `pytest.ini` limits collection to `tests/test_*.py` and puts the repo root on the import path, so `pytest`, `pytest tests/test_x.py` and `python -m pytest` all behave the same.
+Hermetic — no network access, no `warehouse.db` required — and a full run takes under a minute. `pytest.ini` limits collection to `tests/test_*.py` and puts the repo root on the import path, so `pytest`, `pytest tests/test_x.py` and `python -m pytest` all behave the same.
 
 | File | Covers |
 |---|---|
