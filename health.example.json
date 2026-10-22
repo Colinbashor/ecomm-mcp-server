@@ -20,5 +20,10 @@
   "verified_empty_dates": {
     "google_ads": ["2025-12-25"]
   },
+  "scheduled_jobs": [
+    {"platform": "weekly_replen", "max_age_days": 8,
+     "expected_statuses": ["ok", "degraded"],
+     "description": "Runs Tuesdays; degraded (warnings for review) is its normal result."}
+  ],
   "disable": ["historical_gaps:ga4"]
 }

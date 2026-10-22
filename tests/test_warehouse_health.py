@@ -418,6 +418,85 @@ class CollectIssuesTests(_Conn):
         self.assertEqual([i.severity for i in issues], [wh.ERROR, wh.DEGRADED])
 
 
+class ScheduledJobTests(_Conn):
+    TODAY = date(2026, 7, 30)  # a Thursday
+    WEEKLY = wh.ScheduledJobSpec("weekly_job", 8)
+    DESIGNED_DEGRADED = wh.ScheduledJobSpec(
+        "review_job", 4, frozenset({"ok", "degraded"}))
+
+    def check(self, *specs):
+        return wh.check_scheduled_jobs(self.conn, self.TODAY, specs)
+
+    def test_never_ran_is_error(self) -> None:
+        issues = self.check(self.WEEKLY)
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("ever been written", issues[0].message)
+
+    def test_recent_ok_is_silent_even_days_after_the_run(self) -> None:
+        # Six days without a run would be a daily feed's outage, not a weekly one.
+        _log(self.conn, [_run("weekly_job", "2026-07-24")])
+        self.assertEqual(self.check(self.WEEKLY), [])
+
+    def test_too_old_is_error(self) -> None:
+        _log(self.conn, [_run("weekly_job", "2026-07-20")])
+        issues = self.check(self.WEEKLY)
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("no run in 10 days", issues[0].message)
+
+    def test_unexpected_status_is_error(self) -> None:
+        _log(self.conn, [_run("weekly_job", "2026-07-24", "error",
+                              message="boom")])
+        issues = self.check(self.WEEKLY)
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("boom", issues[0].message)
+
+    def test_degraded_is_error_unless_it_is_the_designed_output(self) -> None:
+        _log(self.conn, [_run("weekly_job", "2026-07-28", "degraded"),
+                         _run("review_job", "2026-07-28", "degraded")])
+        issues = self.check(self.WEEKLY, self.DESIGNED_DEGRADED)
+        self.assertEqual([i.check for i in issues], ["sync_status:weekly_job"])
+
+    def test_designed_degraded_never_escalates_with_age(self) -> None:
+        # Weeks of degraded-only history: the escalation clock would go red
+        # waiting for an `ok` this job never writes.
+        _log(self.conn, [_run("review_job", d, "degraded")
+                         for d in ("2026-07-02", "2026-07-16", "2026-07-29")])
+        self.assertEqual(self.check(self.DESIGNED_DEGRADED), [])
+
+    def test_judged_on_started_at_for_a_run_that_never_finished(self) -> None:
+        _log(self.conn, [("weekly_job", "2026-07-27T04:00:00Z", None, 0,
+                          "running", "")])
+        issues = self.check(wh.ScheduledJobSpec(
+            "weekly_job", 8, frozenset({"ok", "running"})))
+        self.assertEqual(issues, [])
+
+    def test_config_parses_scheduled_jobs(self) -> None:
+        cfg = wh.parse_config({"scheduled_jobs": [
+            {"platform": "weekly_job", "max_age_days": 8,
+             "expected_statuses": ["OK", "degraded"]}]})
+        self.assertEqual(cfg.scheduled_jobs, (wh.ScheduledJobSpec(
+            "weekly_job", 8, frozenset({"ok", "degraded"})),))
+        self.assertEqual(wh.parse_config().scheduled_jobs, ())
+
+    def test_config_rejects_a_bare_string_of_statuses(self) -> None:
+        with self.assertRaises(wh.ConfigError):
+            wh.parse_config({"scheduled_jobs": [
+                {"platform": "weekly_job", "max_age_days": 8,
+                 "expected_statuses": "ok"}]})
+
+    def test_collect_issues_runs_the_scheduled_tier(self) -> None:
+        _log(self.conn, [_run("google", "2026-07-30")])
+        cfg = wh.parse_config({
+            "status_platforms": {}, "freshness": [], "volume": [],
+            "snapshot_tables": [], "date_series": [],
+            "scheduled_jobs": [{"platform": "weekly_job", "max_age_days": 8}]})
+        issues = wh.collect_issues(self.conn, datetime(2026, 7, 30, 9), cfg)
+        self.assertEqual([i.check for i in issues], ["sync_status:weekly_job"])
+
+    def test_health_alerts_is_watched_by_default(self) -> None:
+        self.assertIn("health_alerts", wh.DEFAULT_STATUS_PLATFORMS)
+
+
 class ExitCodeTests(unittest.TestCase):
     def test_only_error_returns_nonzero(self) -> None:
         """DEGRADED must not drive the exit code."""

@@ -77,6 +77,7 @@ table soft forever.
 |---|---|---|
 | `sync_log` | `sync_log` missing or empty — an empty warehouse must not read as healthy | ERROR |
 | `sync_status:<platform>` | latest run is `error`; no run within the platform's own `max_days_between_runs`; `degraded` past the clock (ERROR) or inside it (DEGRADED); in strict mode, a declared platform with no row at all | ERROR / DEGRADED |
+| `sync_status:<job>` (scheduled jobs) | a declared non-daily job never ran; its latest run is older than its own `max_age_days`; or its latest status is outside `expected_statuses` | ERROR |
 | `freshness:<name>` | the newest date in a table is older than `max_age_days`; or the table has never produced anything | ERROR / DEGRADED (owned) |
 | `volume:<platform>` | the last *N*+1 **successful** runs (inside 14 days) all wrote 0 rows — a sync answering "did the request succeed?" instead of "did any data arrive?" | ERROR |
 | `snapshot_gaps:<name>` | missing days in a current-state snapshot table over the last 21 days (days before the table's first snapshot don't count) | WARN |
@@ -86,6 +87,15 @@ Staleness is checked **per platform**: daily feeds default to 3 days between
 runs (a weekend plus one bad morning), weekly feeds 9, monthly 40. A check that
 skipped platforms whose last run was old would go silent exactly when a feed
 died; this one reports it.
+
+**Non-daily jobs** (a weekly replenishment run, a weekdays-only report) go in
+`scheduled_jobs` instead. Each is judged on its own cadence and is either
+silent or ERROR, with no DEGRADED tier: a job whose healthy runs log `degraded`
+by design ("a proposal is waiting for review") lists it in
+`expected_statuses`, because the escalation clock would otherwise go red
+waiting for an `ok` the job never writes. A declared job that has never run is
+an ERROR regardless of `only_seen_platforms`: declaring it says it runs. Don't
+list a job in both `status_platforms` and `scheduled_jobs`.
 
 ### Unconfigured connectors stay quiet
 
@@ -131,6 +141,7 @@ you want to tweak one entry, or use `disable` to drop a single check.
 | `snapshot_tables` | inventory / waitlist snapshots | list of `{name, table, date_column?, platform?}` |
 | `snapshot_lookback_days` | `21` | window for snapshot gaps |
 | `date_series` | Google/Meta ad days, GA4 days | list of `{name, sql, platform?}`; `sql` returns one date per row |
+| `scheduled_jobs` | `[]` | list of `{platform, max_age_days, expected_statuses?}`; `max_age_days` = the longest normal gap between runs plus slack; `expected_statuses` defaults to `["ok", "success"]` |
 | `verified_empty_dates` | `{}` | `{series_name: ["YYYY-MM-DD", ...]}` days verified to have no data |
 | `disable` | `[]` | check ids to drop, shell wildcards allowed: `["freshness:gmc_visibility", "historical_gaps:*"]` |
 

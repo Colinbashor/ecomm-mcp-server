@@ -133,6 +133,28 @@ class FreshnessSpec:
 
 
 @dataclass(frozen=True)
+class ScheduledJobSpec:
+    """A job that is NOT daily (weekly, weekdays-only, ...), judged on its own
+    cadence instead of the daily stale-run clock."""
+    platform: str
+    # Longest NORMAL gap between runs, plus slack. A latest run older than this
+    # is an ERROR. Size it from the job's own schedule: a daily limit would call
+    # a weekly job dead six days in seven.
+    max_age_days: int
+    # Statuses that are this job's DESIGNED output. A job that logs `degraded`
+    # on every healthy run (e.g. "a proposal is waiting for review") cannot sit
+    # on the escalate_after_days clock: that clock waits for an `ok` the job
+    # never writes. Anything outside this set is an ERROR.
+    expected_statuses: frozenset[str] = frozenset(OK_STATUSES)
+
+    def __post_init__(self):
+        if isinstance(self.expected_statuses, str):
+            raise TypeError("expected_statuses must be a list of statuses")
+        object.__setattr__(self, "expected_statuses",
+                           frozenset(str(x).lower() for x in self.expected_statuses))
+
+
+@dataclass(frozen=True)
 class VolumeSpec:
     platform: str
     # Consecutive SUCCESSFUL runs allowed to write nothing before it is an
@@ -202,6 +224,9 @@ DEFAULT_STATUS_PLATFORMS: dict[str, int] = {
     "catalog": STALE_RUN_DAYS,
     "tiktok_finance": STALE_RUN_DAYS,
     "warehouse_backup": STALE_RUN_DAYS,
+    # The alarm itself: if health_alerts.py stops running or fails, nothing
+    # else announces anything.
+    "health_alerts": STALE_RUN_DAYS,
     # weekly
     "amazon_sqp": 9,
     # monthly
@@ -327,6 +352,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                for p in DEFAULT_VOLUME_PLATFORMS],
     "snapshot_tables": _SNAPSHOT_DEFAULTS,
     "date_series": _SERIES_DEFAULTS,
+    # Non-daily jobs, each judged on its own cadence. Empty by default: list
+    # your own, e.g. {"platform": "weekly_replen", "max_age_days": 8,
+    # "expected_statuses": ["ok", "degraded"]}. See docs/health.md.
+    "scheduled_jobs": [],
     # Dates a series genuinely had no data (verified against the platform),
     # so the gap check stops reporting them: {"google_ads": ["2025-01-01"]}.
     "verified_empty_dates": {},
@@ -355,6 +384,7 @@ class HealthConfig:
     volume: tuple[VolumeSpec, ...] = ()
     snapshot_tables: tuple[SnapshotSpec, ...] = ()
     date_series: tuple[SeriesSpec, ...] = ()
+    scheduled_jobs: tuple[ScheduledJobSpec, ...] = ()
     verified_empty_dates: Mapping[str, frozenset[date]] = field(
         default_factory=dict)
     disable: tuple[str, ...] = ()
@@ -445,6 +475,8 @@ def parse_config(raw: Mapping[str, Any] | None = None) -> HealthConfig:
         volume=specs("volume", VolumeSpec, ("max_zero_streak",)),
         snapshot_tables=specs("snapshot_tables", SnapshotSpec),
         date_series=specs("date_series", SeriesSpec),
+        scheduled_jobs=specs("scheduled_jobs", ScheduledJobSpec,
+                             ("max_age_days",)),
         verified_empty_dates=verified,
         disable=tuple(disable),
     )
@@ -860,6 +892,54 @@ def _disabled(check: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(check, p) for p in patterns)
 
 
+def check_scheduled_jobs(
+    conn: sqlite3.Connection,
+    today: date,
+    specs: Sequence[ScheduledJobSpec],
+) -> list[Issue]:
+    """Classify each non-daily job's most recent run on its OWN cadence.
+
+    Two states on purpose: silent, or ERROR. There is no DEGRADED tier: these
+    jobs have no upstream pause to tolerate, so a `degraded` they write is
+    either designed output (listed in expected_statuses) or a failure. Like
+    check_recent_statuses this iterates the DECLARED list, so a job that has
+    never logged is a finding -- declaring it is the statement that it runs.
+    """
+    issues: list[Issue] = []
+    for spec in specs:
+        check = f"sync_status:{spec.platform}"
+        row = conn.execute(
+            "SELECT started_at, status, message FROM sync_log "
+            "WHERE platform=? ORDER BY started_at DESC, id DESC LIMIT 1",
+            (spec.platform,),
+        ).fetchone()
+        if row is None:
+            issues.append(Issue(
+                ERROR, check,
+                "no sync_log row has ever been written for this job "
+                "(its schedule never ran, or was never registered?)"))
+            continue
+        started_at, status, message = row
+        # started_at, not finished_at: a run killed mid-flight never writes a
+        # finish, and that is the run most worth seeing.
+        seen = _date_value(started_at)
+        if seen is None:
+            issues.append(Issue(ERROR, check, "latest run has no usable timestamp"))
+            continue
+        age = (today - seen).days
+        if age > spec.max_age_days:
+            issues.append(Issue(
+                ERROR, check,
+                f"no run in {age} days (last {seen.isoformat()}, status "
+                f"{status}; limit {spec.max_age_days}d for this schedule)"))
+            continue
+        if str(status).lower() in spec.expected_statuses:
+            continue
+        issues.append(Issue(ERROR, check,
+                            f"latest status is {status}: {message or 'no message'}"))
+    return issues
+
+
 def collect_issues(
     conn: sqlite3.Connection,
     now: datetime | None = None,
@@ -883,6 +963,7 @@ def collect_issues(
                                       config.snapshot_lookback_days, seen))
     issues.extend(check_historical_date_gaps(
         conn, config.date_series, config.verified_empty_dates, seen))
+    issues.extend(check_scheduled_jobs(conn, today, config.scheduled_jobs))
     issues = [i for i in issues if not _disabled(i.check, config.disable)]
     # Most serious first: the actionable lines must not sit below a standing
     # DEGRADED condition someone has already decided to live with.
