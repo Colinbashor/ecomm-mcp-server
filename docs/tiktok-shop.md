@@ -18,6 +18,7 @@ settlement/fee data, and listing-quality diagnostics.
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
 | `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
 | `tiktok_listing_quality_sync.py` | standalone | per-product content-quality tier + issues (Listings Diagnosis API) |
+| `tiktok_promotions.py` | **WRITE-capable**, dry run unless `--apply` | fixed-price promotion activities: list/show/export, create, set product prices — see [Promotions](#promotions-tiktok_promotionspy) |
 
 ## Setup
 
@@ -181,6 +182,42 @@ body is retried only if that body carries one of the transient codes above.
   **reaches if you fix this issue**, not its current tier), and
   `suggestion_json` (TikTok's raw `suggestion` object for that field, if it
   sent one)
+
+## Promotions (`tiktok_promotions.py`)
+
+Writes to the live shop; nothing is written without `--apply`, and `add`
+re-reads the activity afterwards to verify every price. The app needs the
+promotion read/write scope; credentials are the same as the order connector.
+
+```bash
+python tiktok_promotions.py list --status ONGOING
+python tiktok_promotions.py export ACTIVITY_ID --out live.csv     # snapshot before editing
+python tiktok_promotions.py create --title "Winter sale"     --begin 2026-12-01T00:00:00-08:00 --end 2026-12-07T23:59:59-08:00 --apply
+python tiktok_promotions.py add ACTIVITY_ID --prices-file prices.csv            # dry run: diff vs live
+python tiktok_promotions.py add ACTIVITY_ID --prices-file prices.csv --apply
+```
+
+`prices.csv` has `product_id,price`; the whole file is refused on any bad row
+(a non-numeric id, which is what a spreadsheet makes of a long id, a
+non-positive price, a duplicate). Only new or repriced products are sent.
+Every write is appended to `reports/tiktok_promotions_log.csv`.
+
+Traps (each one an error the API returned):
+
+- An activity is created **empty**; products are attached with
+  `PUT .../activities/{id}/products`, which needs `activity_id` in the body as
+  well as the path. POST there answers "no schema found".
+- At `product_level: PRODUCT` the id is the **product** id; a SKU id fails
+  ("product IDs cannot be found"), and one price covers every SKU.
+- The write takes the flat string `activity_price_amount`, not the nested
+  `activity_price {amount, currency}` the read returns.
+- `quantity_limit` and `quantity_per_user` are both required (`-1` = none).
+- At most 20 products per call; code `36009037` is the rate limit (backed off).
+- Re-adding a product **overwrites** it. That is how a price changes, and it
+  also overwrites an edit someone made in Seller Center: `export` first.
+- Adding to an `ONGOING` activity changes live prices immediately.
+- Removing a product and deactivating an activity are not built; verify them
+  on a throwaway activity before relying on them.
 
 ## Notes
 
@@ -494,6 +531,8 @@ window being final, resuming from coverage not tag rows, the poison guard,
 `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
+`tests/test_tiktok_promotions.py` (a dry run never writes, the add body shapes,
+20-product batches, rate-limit backoff, one token refresh, verify-after-write),
 `tests/test_tiktok_affiliate_sync.py` (paging past a short page and stopping
 on an empty one, an order split across pages keeping every line, the 10k
 sample ceiling recorded as capped, window splitting and the fixed grid,
