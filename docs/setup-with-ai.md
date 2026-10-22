@@ -119,8 +119,9 @@ assistant what's already done; it can confirm with `env_check.py`,
 
 ## Think twice before approving
 
-- Any command with `--execute` or `--yes`, or any script ending in `_mutate.py`.
-  These change live ad accounts. Setup never needs them.
+- Any command with `--execute`, `--yes` or `--apply`, any script ending in
+  `_mutate.py`, `amazon_listing_quality_material_fix.py` or
+  `tiktok_promotions.py`. These change live accounts. Setup never needs them.
 - `--host 0.0.0.0`, or anything else that opens the server to your network.
   Read [SHARING.md](../SHARING.md) first.
 - Deleting `warehouse.db` **after** it holds real data. Some of it (inventory,

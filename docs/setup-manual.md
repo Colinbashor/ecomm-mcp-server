@@ -289,9 +289,10 @@ and then, because some of what it holds can't be downloaded again.
 - **Share with your team** over your network: [SHARING.md](../SHARING.md).
   This means binding the server beyond your own machine, with a token and
   ideally TLS. Read the whole page first.
-- **Write-capable scripts.** `google_ads_mutate.py`, `meta_ads_mutate.py` and
-  `reacher_sample_limits.py` change live accounts. They do a dry run unless you
-  pass `--execute` (or `--yes`). You don't need them for setup.
+- **Write-capable scripts.** The `*_mutate.py` scripts,
+  `amazon_listing_quality_material_fix.py`, `reacher_sample_limits.py` and
+  `tiktok_promotions.py` change live accounts. They do a dry run unless you
+  pass `--execute` (`--yes`, `--apply`). You don't need them for setup.
 - **Google Sheets write tools** for Claude: [google-sheets.md](google-sheets.md).
   They are off unless `WAREHOUSE_MCP_ENABLE_WRITES=1`.
 - **Mirror into BigQuery**: [operations.md](operations.md).

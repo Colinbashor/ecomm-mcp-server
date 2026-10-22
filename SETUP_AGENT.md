@@ -44,8 +44,9 @@ read `AGENTS.md` instead.)
    code, and they write tokens into `.env`. Give the person the exact command
    and let them run it. Don't ask them to paste the code to you.
 3. **Read-only setup. Never change a live account.** Don't run any
-   `*_mutate.py` script, `reacher_sample_limits.py`, or any command with
-   `--execute` or `--yes`. Don't set `WAREHOUSE_MCP_ENABLE_WRITES`. If the
+   `*_mutate.py` script, `amazon_listing_quality_material_fix.py`,
+   `reacher_sample_limits.py`, `tiktok_promotions.py`, or any command with
+   `--execute`, `--yes` or `--apply`. Don't set `WAREHOUSE_MCP_ENABLE_WRITES`. If the
    person wants those features, finish setup first, point them to the
    platform's doc, and treat it as a separate task they drive.
 4. **Don't open the server to the network on your own initiative.** Never use
