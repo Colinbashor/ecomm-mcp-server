@@ -275,7 +275,9 @@ class SendTests(unittest.TestCase):
                 os.environ.pop(key)
 
     def test_no_destination_configured_does_not_raise(self) -> None:
-        notify.send("hello", "unconfigured_dest")  # must not raise
+        failures = notify.send("hello", "unconfigured_dest")  # must not raise
+        self.assertEqual(len(failures), 1)
+        self.assertIn("no target configured", failures[0])
 
     @patch("warehouse.notify.send_email")
     def test_email_destination_calls_send_email(self, send_email: Mock) -> None:
@@ -290,7 +292,7 @@ class SendTests(unittest.TestCase):
     def test_email_failure_does_not_raise_or_block_other_platforms(self, send_email: Mock) -> None:
         os.environ["WEEKLY_DIGEST_EMAIL_TO"] = "a@example.com"
         send_email.return_value = False  # send_email() reports failure via return, not raise
-        notify.send("hello", "weekly_digest")  # must not raise
+        self.assertEqual(notify.send("hello", "weekly_digest"), ["email: send failed"])
 
     def test_blank_email_to_is_treated_as_unconfigured(self) -> None:
         # A whitespace/comma-only value (no real address) must be skipped
@@ -305,7 +307,7 @@ class SendTests(unittest.TestCase):
         os.environ["WEEKLY_DIGEST_SLACK_WEBHOOK"] = "https://hooks.slack.test/x"
         os.environ["WEEKLY_DIGEST_GCHAT_WEBHOOK"] = "https://chat.googleapis.test/x"
         post.return_value = Mock(raise_for_status=Mock())
-        notify.send("hello", "weekly_digest")
+        self.assertEqual(notify.send("hello", "weekly_digest"), [])
         self.assertEqual(post.call_count, 2)
         for call in post.call_args_list:
             self.assertEqual(call.kwargs["json"], {"text": "hello"})
@@ -322,7 +324,9 @@ class SendTests(unittest.TestCase):
             return Mock(raise_for_status=Mock())
 
         post.side_effect = side_effect
-        notify.send("hello", "weekly_digest")  # must not raise
+        failures = notify.send("hello", "weekly_digest")  # must not raise
+        # names the failed platform, never the webhook URL
+        self.assertEqual(failures, ["slack: ConnectionError"])
         self.assertEqual(post.call_count, 2)
 
     @patch("warehouse.notify.requests.post")

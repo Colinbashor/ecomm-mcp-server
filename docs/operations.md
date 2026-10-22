@@ -60,8 +60,11 @@ A `dest` with nothing configured prints
 `[notify] no target configured for dest=... — skipped` and returns. A target
 that fails prints `[notify] <platform> (dest=...) failed: ...` and the
 remaining targets still run — `send()` never raises, so a notification
-failure can't take down whatever pipeline called it. It returns `None`; if
-you need to know whether delivery worked, call `send_email()` directly.
+failure can't take down whatever pipeline called it. It returns a list of
+what did not get through (one line per failed target, or one line when nothing
+is configured; it names the platform, never the webhook URL). Empty means every
+configured target was reached. An alarm should check it; a report's side
+notification can ignore it.
 
 Formatting helpers:
 

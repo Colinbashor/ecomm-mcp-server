@@ -4,6 +4,7 @@ Hermetic: temp SQLite files, notify.send patched out, no network.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -18,6 +19,10 @@ from warehouse import db
 
 TUESDAY = date(2026, 9, 8)  # not the digest day
 MONDAY = date(2026, 9, 14)
+
+# A destination with a target, so delivery tests reach the (patched) push.
+REACHABLE = {"WAREHOUSE_HEALTH_SLACK_WEBHOOK": "https://hooks.example.com/health",
+             "OPS_CHANNEL_SLACK_WEBHOOK": "https://hooks.example.com/ops"}
 
 
 def _issue(severity=wh.ERROR, check="volume:gmc_visibility", message="0 rows"):
@@ -91,10 +96,13 @@ class ChangeOnlyDeliveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.conn = sqlite3.connect(Path(self._tmp.name) / "w.db")
-        self._send = patch.object(health_alerts.notify, "send")
+        self._send = patch.object(health_alerts.notify, "send", return_value=[])
         self.send = self._send.start()
+        self._env = patch.dict(os.environ, REACHABLE)
+        self._env.start()
 
     def tearDown(self) -> None:
+        self._env.stop()
         self._send.stop()
         self.conn.close()
         self._tmp.cleanup()
@@ -157,7 +165,7 @@ class ChangeOnlyDeliveryTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 1)
 
     def test_dry_run_records_nothing_and_sends_nothing(self) -> None:
-        message = self._run([_issue()], dry_run=True)
+        message = self._run([_issue()], dry_run=True).message
         self.assertIsNotNone(message)
         self.send.assert_not_called()
         self.assertEqual(health_alerts.load_state(self.conn), {})
@@ -187,13 +195,89 @@ class ChangeOnlyDeliveryTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 2)
 
 
+class DeliveryOutcomeTests(unittest.TestCase):
+    """An alarm that reaches no one must never log `ok`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.conn = sqlite3.connect(Path(self._tmp.name) / "w.db")
+        self._send = patch.object(health_alerts.notify, "send", return_value=[])
+        self.send = self._send.start()
+
+    def tearDown(self) -> None:
+        self._send.stop()
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def _run(self, issues, env, today=TUESDAY):
+        with patch.dict(os.environ, env, clear=True):
+            return health_alerts.run(issues, self.conn, today)
+
+    def test_unreachable_dest_with_news_is_degraded_and_not_pushed(self) -> None:
+        result = self._run([_issue()], {})
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("NOT DELIVERED", result.note)
+        self.assertIn("WAREHOUSE_HEALTH_SLACK_WEBHOOK", result.note)
+        self.send.assert_not_called()
+        state = health_alerts.load_state(self.conn)
+        self.assertIsNone(state["volume:gmc_visibility"]["notified_on"])
+
+    def test_unreachable_dest_on_a_quiet_day_is_still_degraded(self) -> None:
+        # An `ok` on the quiet path would reset the escalation clock.
+        result = self._run([], {})
+        self.assertIsNone(result.message)
+        self.assertEqual(result.status, "degraded")
+
+    def test_reachable_quiet_day_is_ok(self) -> None:
+        result = self._run([], REACHABLE)
+        self.assertEqual((result.status, result.note), ("ok", "no change"))
+
+    def test_a_failed_push_is_degraded_and_keeps_the_record(self) -> None:
+        self.send.return_value = ["slack: ConnectionError"]
+        result = self._run([_issue()], REACHABLE)
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("push failed - slack: ConnectionError", result.note)
+        self.assertIn("volume:gmc_visibility", health_alerts.load_state(self.conn))
+
+    def test_a_successful_push_is_ok(self) -> None:
+        result = self._run([_issue()], REACHABLE)
+        self.assertEqual((result.status, result.note), ("ok", "change announced"))
+
+    def test_undeliverable_names_the_keys_for_the_dest(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            why = health_alerts.undeliverable("ops_channel")
+        self.assertIn("OPS_CHANNEL_GCHAT_WEBHOOK", why)
+        with patch.dict(os.environ, {"OPS_CHANNEL_EMAIL_TO": "ops@example.com"},
+                        clear=True):
+            self.assertIsNone(health_alerts.undeliverable("ops_channel"))
+
+    def test_main_logs_degraded_when_nothing_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(db, "DB_PATH", Path(folder) / "w.db"), \
+                patch.dict(os.environ, {}, clear=True):
+            db.init_db()
+            db.log_sync("meta", db.now(), 0, "error", "token expired")
+            self.assertEqual(health_alerts.main(
+                ["--config", str(Path(folder) / "none.json")]), 0)
+            conn = sqlite3.connect(db.DB_PATH)
+            try:
+                status, = conn.execute(
+                    "SELECT status FROM sync_log WHERE platform='health_alerts'"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(status, "degraded")
+
+
 class MainTests(unittest.TestCase):
     """main() over a temp warehouse: health is computed, then diffed."""
 
     def test_main_announces_once_then_goes_quiet(self) -> None:
         with tempfile.TemporaryDirectory() as folder, \
                 patch.object(db, "DB_PATH", Path(folder) / "w.db"), \
-                patch.object(health_alerts.notify, "send") as send:
+                patch.dict(os.environ, REACHABLE), \
+                patch.object(health_alerts.notify, "send",
+                             return_value=[]) as send:
             db.init_db()
             db.log_sync("meta", db.now(), 0, "error", "token expired")
             cfg = ["--config", str(Path(folder) / "none.json")]

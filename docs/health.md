@@ -202,8 +202,11 @@ Recipients come only from environment variables (`.env`), through
 | `WAREHOUSE_HEALTH_GCHAT_WEBHOOK` | Google Chat space webhook URL |
 | `WAREHOUSE_HEALTH_EMAIL_TO` | comma-separated addresses; needs the global `SMTP_*` settings |
 
-Set any subset. With none set, changes are still recorded and printed, just not
-pushed. `--dest NAME` sends to `NAME_*` variables instead. See
+Set any subset. With none set, changes are still recorded and printed, but not
+pushed, and the run logs `degraded` ("NOT DELIVERED", naming the unset keys),
+on quiet days too, so an alarm wired to nothing ages into an ERROR on
+`sync_status:health_alerts` instead of reporting `ok` forever. A push that
+fails (webhook error, SMTP failure) is `degraded` as well. `--dest NAME` sends to `NAME_*` variables instead. See
 [operations.md](operations.md#notifications--warehousenotifypy) for webhook and
 SMTP details.
 

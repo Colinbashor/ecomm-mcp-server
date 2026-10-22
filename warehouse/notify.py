@@ -190,7 +190,7 @@ def to_email_html(text: str) -> str:
     )
 
 
-def send(text: str, dest: str) -> None:
+def send(text: str, dest: str) -> list[str]:
     """Push `text` to every target configured for `dest` (Slack/Chat webhook
     POST, or an email via send_email()). Best-effort per platform: a failing
     or unconfigured destination is logged and skipped, never raised — the
@@ -199,22 +199,31 @@ def send(text: str, dest: str) -> None:
     missing SMTP config or a hard failure after retries is a real problem for
     its own direct callers) -- here it's just one more target among several,
     so its bool return is what decides the [notify] log line, never an
-    exception that would skip the remaining targets."""
+    exception that would skip the remaining targets.
+
+    Returns what did NOT get through, one line per failed target (or one line
+    when nothing is configured): empty means every configured target was
+    reached. Most callers can ignore it; an alarm must not, or it reports
+    success while reaching no one."""
     targets = _targets(dest)
     if not targets:
         print(f"[notify] no target configured for dest={dest!r} — skipped")
-        return
+        return [f"no target configured for dest={dest!r}"]
+    failures: list[str] = []
     body = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "\n…(truncated)"
     for platform, value in targets.items():
         if platform == "email":
             recipients = [addr.strip() for addr in value.split(",") if addr.strip()]
             if not recipients:
                 print(f"[notify] email (dest={dest}) failed: no valid recipients in {value!r}")
+                failures.append("email: no valid recipients")
                 continue
             # Email has no chat-length constraint -- send the full text, not
             # the truncated `body` used for the webhook platforms below.
             if send_email(_email_subject(text), to_email_html(text), recipients, plaintext_body=text):
                 print(f"[notify] posted to email (dest={dest})")
+            else:
+                failures.append("email: send failed")
             continue
         try:
             r = requests.post(value, json={"text": body}, timeout=TIMEOUT_SECONDS)
@@ -222,6 +231,10 @@ def send(text: str, dest: str) -> None:
             print(f"[notify] posted to {platform} (dest={dest})")
         except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
             print(f"[notify] {platform} (dest={dest}) failed: {exc}")
+            # The exception text can carry the webhook URL (a credential), so
+            # the returned line, which may be logged, names only its type.
+            failures.append(f"{platform}: {type(exc).__name__}")
+    return failures
 
 
 def _smtp_config() -> tuple[str, int, str, str, str] | None:

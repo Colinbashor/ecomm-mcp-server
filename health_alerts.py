@@ -38,7 +38,11 @@ DELIVERY goes through `warehouse/notify.py` to the destination named by
 `--dest` (default `warehouse_health`), i.e. whichever of these env vars are
 set: WAREHOUSE_HEALTH_SLACK_WEBHOOK, WAREHOUSE_HEALTH_GCHAT_WEBHOOK,
 WAREHOUSE_HEALTH_EMAIL_TO (+ the global SMTP_* settings for email). None set
-is not an error: the change is still recorded and printed.
+still records and prints the change, but the run logs `degraded` ("NOT
+DELIVERED"), on quiet days too: an alarm whose destination reaches no one must
+not report `ok`, and an `ok` on every quiet day would reset the escalation
+clock so the condition could never age into an ERROR. A failed push is
+`degraded` as well.
 """
 from __future__ import annotations
 
@@ -47,7 +51,7 @@ import sqlite3
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import warehouse_health as wh
 from warehouse import db, notify
@@ -180,20 +184,53 @@ def save_state(conn: sqlite3.Connection, issues: Sequence[wh.Issue],
             )
 
 
+def undeliverable(dest: str) -> str | None:
+    """Why nothing can reach a person through `dest`, or None when it can.
+
+    notify.send() treats a destination with no target as a quiet no-op, which
+    is right for a report's side notification and wrong for the alarm itself:
+    an alarm wired to nothing would otherwise log `ok` on every run.
+    """
+    if notify._targets(dest):
+        return None
+    prefix = dest.upper()
+    return (f"dest {dest!r} has no target ({prefix}_SLACK_WEBHOOK, "
+            f"{prefix}_GCHAT_WEBHOOK and {prefix}_EMAIL_TO are all unset)")
+
+
+def run_outcome(note: str, unreachable: str | None,
+                push_error: str | None = None) -> tuple[str, str]:
+    """The (status, message) this run writes to sync_log.
+
+    `degraded` on the SILENT path too, not only when there was news: the alarm
+    is just as dead on a quiet day.
+    """
+    if unreachable:
+        return "degraded", f"{note}; NOT DELIVERED - {unreachable}"
+    if push_error:
+        return "degraded", f"{note}; push failed - {push_error}"
+    return "ok", note
+
+
+class RunResult(NamedTuple):
+    message: str | None   # sent (or, with dry_run, would be); None = nothing new
+    status: str           # sync_log status for this run
+    note: str             # sync_log message for this run
+
+
 def run(issues: Sequence[wh.Issue], conn: sqlite3.Connection, today: date,
         dest: str = DEFAULT_DEST, dry_run: bool = False, force: bool = False,
-        digest_weekday: int = DIGEST_WEEKDAY) -> str | None:
-    """Diff `issues` against the stored state, record, and push if changed.
-
-    Returns the message that was (or, with dry_run, would have been) sent,
-    or None when there was nothing new to say.
-    """
+        digest_weekday: int = DIGEST_WEEKDAY) -> RunResult:
+    """Diff `issues` against the stored state, record, and push if changed."""
     conn.executescript(DDL)
     previous = load_state(conn)
     buckets = classify(issues, previous)
     counts = {key: len(value) for key, value in buckets.items()}
     print(f"health: {counts['new']} new, {counts['escalated']} escalated, "
           f"{counts['resolved']} recovered, {counts['standing']} standing")
+    unreachable = undeliverable(dest)
+    if unreachable:
+        print(f"WARNING: {unreachable} - nothing here can reach a person")
 
     digest = today.weekday() == digest_weekday
     if force:
@@ -205,20 +242,27 @@ def run(issues: Sequence[wh.Issue], conn: sqlite3.Connection, today: date,
         print("Nothing new - staying silent (the normal outcome).")
         if not dry_run:
             save_state(conn, issues, previous, today, notified=False)
-        return None
+        return RunResult(None, *run_outcome("no change", unreachable))
 
     print()
     print(message)
     if dry_run:
         print("\n[dry-run] nothing recorded, nothing sent")
-        return message
+        return RunResult(message, *run_outcome("dry run", unreachable))
 
     # RECORD FIRST: the record is what suppresses a duplicate tomorrow, so it
-    # must survive a failed push.
-    save_state(conn, issues, previous, today, notified=True)
-    # notify.send is best-effort and never raises; it prints what it did.
-    notify.send(message, dest=dest)
-    return message
+    # must survive a failed push. notified= only when something can actually
+    # be delivered, so the record stays honest about what reached a person.
+    save_state(conn, issues, previous, today, notified=not unreachable)
+    push_error = None
+    if unreachable:
+        print(f"\nNot pushed: {unreachable}")
+    else:
+        # notify.send is best-effort and never raises; it returns what failed.
+        failures = notify.send(message, dest=dest)
+        push_error = "; ".join(failures) if failures else None
+    return RunResult(message, *run_outcome("change announced", unreachable,
+                                           push_error))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -258,14 +302,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     today = wh.today_local()
     conn = db.connect()
     try:
-        message = run(issues, conn, today, dest=args.dest,
-                      dry_run=args.dry_run, force=args.force,
-                      digest_weekday=args.digest_weekday)
+        result = run(issues, conn, today, dest=args.dest,
+                     dry_run=args.dry_run, force=args.force,
+                     digest_weekday=args.digest_weekday)
     finally:
         conn.close()
     if not args.dry_run:
-        db.log_sync(SYNC_PLATFORM, started, len(issues), "ok",
-                    "change announced" if message else "no change")
+        db.log_sync(SYNC_PLATFORM, started, len(issues), result.status,
+                    result.note)
     return 0
 
 
