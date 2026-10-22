@@ -15,6 +15,7 @@ For Amazon **retail orders / SP-API** (a separate credential set), see
 |---|---|---|
 | `warehouse/connectors/amazon_ads.py` | core, via `run_sync.py --only amazon` | daily campaign spend/clicks/impressions/conversions/revenue into `ad_metrics` |
 | `amazon_ads_detail_sync.py` | standalone | per-ASIN advertised-product performance, keyword/target-level performance, search-term performance |
+| `amazon_ads_mutate.py` | **WRITE-capable**, dry run by default | Sponsored Products keyword/target bid changes and ad-group negative keywords from a plan CSV, with undo files, revert and a read-only drift check — see [Writes](#writes) |
 
 ## Setup
 
@@ -85,6 +86,43 @@ per-report limit). The **core** connector does not — it requests the whole
   `spend` (Amazon's `cost`), `purchases` (`purchases14d`), `sales`
   (`sales14d`), and `synced_at`.
 
+## Writes
+
+`amazon_ads_mutate.py` changes the live account. It reuses the same
+credentials (the advertising login needs edit rights on the profile, or every
+write is a 403), plus optional `AMAZON_ADS_MIN_BID` (default `0.02`, the US
+floor; set your marketplace's minimum in its currency).
+
+```bash
+python amazon_ads_mutate.py set-bids --plan bid_plan.csv                       # dry run: prints PLAN <id>
+python amazon_ads_mutate.py set-bids --plan bid_plan.csv --execute --plan-id <id>
+python amazon_ads_mutate.py set-bids --revert reports/amazon_ads_undo/amazon_bids_undo_<ts>.csv
+python amazon_ads_mutate.py add-negatives --plan negatives.csv                 # dry run
+python amazon_ads_mutate.py check --applied reports/amazon_ads_undo/amazon_bids_undo_<ts>.csv
+```
+
+- **Dry run by default, and the client enforces it**: any non-`/list` call
+  raises before touching the network until `--execute` is given.
+- **`--execute` needs the dry run's `--plan-id`**, a hash of exactly the rows
+  that would change, so a plan that moved since review is refused.
+- **Undo file first.** Each chunk's pre-image is written (and fsynced) to
+  `reports/amazon_ads_undo/` before its request; `--revert FILE` restores it,
+  as its own dry-run-first write with its own undo file.
+- **Set-bids plan** columns: `kind` (`keyword`/`target`), `id`, `campaign_id`,
+  `before`, `after` (aliases `bid_before`/`bid_after`); extra columns are
+  carried into the undo file. A row whose live bid no longer equals `before`
+  is skipped as drift unless `--force-drift`; raises need `--allow-raises`.
+- **Add-negatives plan** columns: `campaign_id`, `ad_group_id`, `keyword_text`,
+  optional `match_type` (`NEGATIVE_EXACT` default, `NEGATIVE_PHRASE`). A
+  negative that already exists at ad-group or campaign level is skipped, and so
+  is one equal to a positive keyword in the ad group (it would switch your own
+  keyword off).
+- Traps: a target with no bid inherits the ad-group default; the plan sets an
+  explicit bid and a revert restores the explicit old value, not the
+  inheritance. A negative-keyword create is not idempotent, so a 5xx on create
+  is not retried. `check` is read-only and reports bids changed since you set
+  them (raised, lowered, back to inheriting, archived).
+
 ## Notes
 
 **Coverage.** `ad_metrics` covers Sponsored Products, Sponsored Brands, and
@@ -150,5 +188,6 @@ take 30-45+ minutes when Amazon's queue is congested; both scripts wait up to
 
 ## Tests
 
-`tests/test_amazon_ads_detail_sync.py` (detail script). The core connector
+`tests/test_amazon_ads_detail_sync.py` (detail script);
+`tests/test_amazon_ads_mutate.py` (writes, against a stateful fake API). The core connector
 (`warehouse/connectors/amazon_ads.py`) and `amazon_auth.py` have no dedicated tests.

@@ -33,7 +33,7 @@ warehouse/
   product_keys.py      sku_key / match_key normalization (catalog_sync.py + product_lookup)
   notify.py            optional Slack / Google Chat / email notifications
 server.py              MCP server (7 read-only tools + opt-in Sheets write set; stdio, or --http)
-*_mutate.py            WRITE-capable ad-account scripts (google, meta); dry-run unless --execute
+*_mutate.py            WRITE-capable ad-account scripts (google, meta, amazon); dry-run unless --execute
 google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
 backup_db.py           rotating, verified local backups of warehouse.db
 pipeline_runner.py     runs the scheduled steps from pipeline.json (template:
