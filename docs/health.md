@@ -150,8 +150,12 @@ typo silently falling back to a default is the kind of plausible-but-wrong
 outcome this tooling exists to prevent. Every spec accepts a `description`
 field for your own notes.
 
-Two rules when writing your own specs:
+Three rules when writing your own specs:
 
+- **A job whose normal output is zero rows goes in `status_platforms`, not
+  `volume`.** A push job that publishes nothing on most days, or an
+  incremental sync that often finds nothing new, would trip the zero-row
+  streak on healthy runs; for it, a missing or `error` row is the signal.
 - **Never give a freshness spec an `owner_platform` whose sync can log `ok`
   while writing nothing.** Ownership softens staleness while the owner is
   paused; a sync that reports success on empty pulls would hide exactly the
