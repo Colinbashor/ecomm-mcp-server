@@ -277,6 +277,7 @@ or an unknown mode, raises when the registry is imported.
 | `reconcile_days` | `90` | `window`: how far back to compare per-day counts. |
 | `allow_empty` | `False` | An empty SQLite table is legitimate (`ok`), not `degraded`. |
 | `create_if_missing` | `False` | Create a missing BigQuery table from the SQLite schema. Off by default so a registry typo cannot create junk tables. |
+| `where` | `None` | SQL predicate over the SQLite table. Exports AND the counts they are verified against both read through it, so a filtered-out row is absent from BigQuery (a blank), never a stale copy. Use it to hold back a period the source has not finished publishing. |
 
 Give every BigQuery table exactly **one** writer. If another job (a per-feed
 export, a scheduled query) already writes a table, leave it out of the
@@ -303,7 +304,9 @@ added to SQLite later cannot drift from a copied DDL.
 
   A day-**partitioned** BigQuery table (partitioned on the same column) gets one
   `WRITE_TRUNCATE` load per day into `table$YYYYMMDD`, including an empty load
-  for a day SQLite no longer has, and no DML. An **unpartitioned** table gets
+  for a day SQLite no longer has, and no DML. A day empty on BOTH sides within
+  `reconcile_days` is skipped, so a weekly-grain table costs one load per week;
+  an older catch-up day has no BigQuery count and is still truncated. An **unpartitioned** table gets
   the rows loaded into a temporary staging table (expires after 2 h, deleted
   in any case) and then one transaction, `DELETE <days>; INSERT <staging>`, so
   readers never see the days missing. A table partitioned on a different

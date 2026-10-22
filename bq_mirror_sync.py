@@ -34,7 +34,11 @@ HOW A TABLE IS WRITTEN
           `window_days`, plus any day in `reconcile_days` whose row count differs
           between SQLite and BigQuery, plus the gap since BigQuery's newest day.
           A missed night therefore heals itself on the next run (capped at
-          MAX_CATCHUP_DAYS unless --since says otherwise).
+          MAX_CATCHUP_DAYS unless --since says otherwise). A partition that is
+          empty on BOTH sides is skipped rather than truncated, so a weekly table
+          costs one load per week, not seven.
+  where   optional registry predicate: every SQLite read (export AND counts) goes
+          through it, so a filtered-out row is simply absent from BigQuery.
 
 CHECKS
   * every table is verified against what was exported (job output_rows / per-day
@@ -178,6 +182,13 @@ def infer_bq_type(sqlite_type: str) -> str:
     return "STRING"
 
 
+def source_sql(m: Mirror) -> str:
+    """What every SQLite read of `m` selects FROM: the table, or the table narrowed by
+    the registry's `where`. Exports and the counts they are verified against must use
+    the same source, or a filtered table would read as permanent count drift."""
+    return m.table if not m.where else f"(SELECT * FROM {m.table} WHERE {m.where})"
+
+
 def date_expr_sqlite(column: str) -> str:
     return f"substr({column}, 1, 10)"
 
@@ -319,10 +330,11 @@ def run_full(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
              tmp: Path, location: str, dry_run: bool) -> Result:
     res = Result(m.table)
     cols = ", ".join(c for c, _ in plan.columns)
-    src_n = conn.execute(f"SELECT COUNT(*) FROM {m.table}").fetchone()[0]
+    src = source_sql(m)
+    src_n = conn.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0]
     path = tmp / f"{m.table}.ndjson"
     with open(path, "wb") as fh:
-        n = _ndjson(conn.execute(f"SELECT {cols} FROM {m.table}"), plan.columns, fh)
+        n = _ndjson(conn.execute(f"SELECT {cols} FROM {src}"), plan.columns, fh)
     res.rows = n
     if n == 0 and not m.allow_empty:
         res.status = "degraded"
@@ -344,7 +356,7 @@ def run_full(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
 
 def _sqlite_day_counts(conn, m: Mirror, since: str) -> dict[str, int]:
     rows = conn.execute(
-        f"SELECT {date_expr_sqlite(m.column)} d, COUNT(*) FROM {m.table} "
+        f"SELECT {date_expr_sqlite(m.column)} d, COUNT(*) FROM {source_sql(m)} "
         f"WHERE {m.column} >= ? GROUP BY d", (since,)).fetchall()
     return {d: n for d, n in rows if d}
 
@@ -368,7 +380,8 @@ def run_window(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
         raise MirrorError(f"{m.table} is partitioned on {tp.field!r} but the registry "
                           f"windows on {m.column!r}")
 
-    sqlite_max = conn.execute(f"SELECT {date_expr_sqlite(m.column)} FROM {m.table} "
+    src = source_sql(m)
+    sqlite_max = conn.execute(f"SELECT {date_expr_sqlite(m.column)} FROM {src} "
                               f"WHERE {m.column} IS NOT NULL ORDER BY {m.column} DESC LIMIT 1"
                               ).fetchone()
     sqlite_max = sqlite_max[0] if sqlite_max else None
@@ -401,7 +414,7 @@ def run_window(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
         p = tmp / f"{m.table}_{d}.ndjson"
         with open(p, "wb") as fh:
             per_day[d] = _ndjson(conn.execute(
-                f"SELECT {cols} FROM {m.table} WHERE {m.column} >= ? AND {m.column} < ?",
+                f"SELECT {cols} FROM {src} WHERE {m.column} >= ? AND {m.column} < ?",
                 (d, next_day(d))), plan.columns, fh)
         files[d] = p
     res.rows = sum(per_day.values())
@@ -417,6 +430,11 @@ def run_window(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
     if partitioned:
         for d in days:
             dest = f"{table_ref}${d.replace('-', '')}"
+            # Empty on both sides: nothing to truncate. Only trusted inside the
+            # counted range -- a catch-up day older than recon_start has no BigQuery
+            # count, so it is still truncated rather than assumed empty.
+            if per_day[d] == 0 and d >= recon_start and b_counts.get(d, 0) == 0:
+                continue
             if per_day[d] == 0:
                 client.load_table_from_json([], dest, job_config=bigquery.LoadJobConfig(
                     schema=plan.schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,

@@ -396,6 +396,92 @@ def test_window_partitioned_table_gets_one_truncate_load_per_day_including_empty
     assert not [q for q in client.queries if "BEGIN TRANSACTION" in q]   # no DML on partitioned
 
 
+def _partitioned_snap(client, bq_rows=None):
+    ref = table_ref("snap")
+    client.date_col[ref] = "snapshot_date"
+    client.seed_table(ref, [SF("sku", "STRING"), SF("snapshot_date", "DATE"), SF("n", "INTEGER")],
+                      partition_field="snapshot_date")
+    if bq_rows:
+        client._data[ref] = bq_rows
+    return ref
+
+
+def test_window_partitioned_skips_a_day_empty_on_both_sides():
+    # A weekly table has rows on one day in seven: truncating the empty
+    # partitions every run would be load jobs that change nothing.
+    conn, client = make_sqlite(), MirrorClient()
+    conn.executemany("INSERT INTO snap VALUES (?,?,?)",
+                     [("SKU-1001", "2026-10-06", 4), ("SKU-1001", "2026-10-08", 2)])
+    ref = _partitioned_snap(client)
+    m = reg.Mirror("snap", "window", column="snapshot_date", window_days=3, reconcile_days=30)
+    res = run_one(client, conn, m)
+    assert res.status == "ok", res.message
+    assert client.partitions_written(ref) == ["2026-10-06", "2026-10-08"]
+
+
+def test_window_partitioned_still_truncates_a_catch_up_day_older_than_the_counted_range():
+    # BigQuery's newest day sits before reconcile_days, so its count was never
+    # read: that day must be truncated, not assumed empty.
+    conn, client = make_sqlite(), MirrorClient()
+    conn.execute("INSERT INTO snap VALUES ('SKU-1001','2026-10-08',2)")
+    ref = _partitioned_snap(client, {"2026-09-25": [
+        {"sku": "SKU-STALE", "snapshot_date": "2026-09-25", "n": 6}]})
+    m = reg.Mirror("snap", "window", column="snapshot_date", window_days=3, reconcile_days=5)
+    res = run_one(client, conn, m)
+    assert res.status == "ok", res.message
+    assert "2026-09-25" in client.partitions_written(ref)
+    assert client.partition_rows(ref, "2026-09-25") == []
+
+
+def test_where_filter_applies_to_the_export_and_the_counts_alike():
+    # If counts were taken over the unfiltered table, a filtered day would read
+    # as permanent count drift and be rewritten every run.
+    conn, client = make_sqlite(), MirrorClient()
+    conn.executemany("INSERT INTO snap VALUES (?,?,?)",
+                     [("SKU-1001", "2026-10-06", 1), ("SKU-1002", "2026-10-06", 9),
+                      ("SKU-1001", "2026-10-07", 9)])
+    ref = _partitioned_snap(client)
+    m = reg.Mirror("snap", "window", column="snapshot_date", window_days=3, reconcile_days=30,
+                   where="n < 5")
+    res = run_one(client, conn, m)
+    assert res.status == "ok", res.message
+    assert [r["sku"] for r in client.partition_rows(ref, "2026-10-06")] == ["SKU-1001"]
+    assert client.partitions_written(ref) == ["2026-10-06"]
+    # a second run finds no drift: nothing outside the trailing window is rewritten
+    assert ms._sqlite_day_counts(conn, m, "2026-10-01") == {"2026-10-06": 1}
+
+
+def test_where_filter_removes_a_row_bigquery_already_holds():
+    # A period mirrored once and later recorded incomplete must leave BigQuery
+    # (read as blank), not linger as a stale copy.
+    conn, client = make_sqlite(), MirrorClient()
+    conn.executemany("INSERT INTO snap VALUES (?,?,?)",
+                     [("SKU-1001", "2026-10-07", 9), ("SKU-1002", "2026-10-08", 1)])
+    ref = _partitioned_snap(client, {"2026-10-07": [
+        {"sku": "SKU-1001", "snapshot_date": "2026-10-07", "n": 9}]})
+    m = reg.Mirror("snap", "window", column="snapshot_date", window_days=3, reconcile_days=30,
+                   where="n < 5")
+    run_one(client, conn, m)
+    assert client.partition_rows(ref, "2026-10-07") == []
+
+
+def test_where_filter_in_full_mode():
+    conn, client = make_sqlite(), MirrorClient()
+    conn.executemany("INSERT INTO orders (order_id, order_date, total, qty, platform_discount)"
+                     " VALUES (?,?,?,?,?)",
+                     [("ORD-1001", "2026-10-08", 20.0, 1, 0), ("ORD-1002", "2026-10-08", 8.0, 3, 0)])
+    seed_orders(client)
+    res = run_one(client, conn, reg.Mirror("orders", where="qty = 1"))
+    assert res.status == "ok" and res.rows == 1
+    assert [r["order_id"] for r in client.rows_in(table_ref("orders"))] == ["ORD-1001"]
+
+
+def test_source_sql_is_the_bare_table_without_a_filter():
+    assert ms.source_sql(reg.Mirror("orders")) == "orders"
+    assert ms.source_sql(reg.Mirror("orders", where="qty = 1")) == \
+        "(SELECT * FROM orders WHERE qty = 1)"
+
+
 def test_window_refuses_a_partition_column_mismatch():
     conn, client = make_sqlite(), MirrorClient()
     conn.execute("INSERT INTO snap VALUES ('a','2026-10-08',1)")

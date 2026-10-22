@@ -51,6 +51,15 @@ class Mirror:
     # missing table stays an error, so a typo in this file cannot quietly
     # create junk tables in your dataset.
     create_if_missing: bool = False
+    # SQL predicate over the SQLite table: only matching rows are mirrored, and
+    # every count the mirror compares is taken over the same filtered rows, so a
+    # row the filter drops is ABSENT from BigQuery (a blank), never a stale copy.
+    # Use it to hold back a period the source has not finished publishing, e.g.
+    #   Mirror("weekly_sales", "window", column="week_start", window_days=35,
+    #          where="week_start NOT IN (SELECT week_start FROM weekly_sales_coverage"
+    #                " WHERE is_complete = 0)")
+    # The predicate is trusted SQL from this file, never user input.
+    where: str | None = None
 
     def __post_init__(self):
         if self.mode not in ("full", "window"):
