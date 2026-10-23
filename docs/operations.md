@@ -204,6 +204,29 @@ The partial file is removed on every failure path. One gap: if the source
 database file doesn't exist, the script fails on its size check before
 anything is logged, so that case shows only as a traceback / nonzero exit.
 
+## Disk-space probe — `disk_probe.py`
+
+Logs one `sync_log` row (platform `disk_space`) with the free space of the
+volume holding the database, so a filling disk reaches `warehouse_health.py`
+before SQLite can no longer write at all. `ok` at or above the degraded
+threshold, `degraded` between the two thresholds, `error` below the lower one.
+It always exits 0, so a full disk never fails the pipeline step; the row is
+the signal. `warehouse_health.py` watches `disk_space` by default once it has
+logged, and stays quiet on installs that never run the probe.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `DISK_PROBE_PATH` | file or folder on the volume to watch | the database's folder |
+| `DISK_PROBE_DEGRADED_GB` | `degraded` below this many GB free | `20` |
+| `DISK_PROBE_ERROR_GB` | `error` below this many GB free | `10` |
+
+Run it in the last wave of the daily pipeline, before the health check (it is
+in `pipeline.example.json`):
+
+```
+python disk_probe.py
+```
+
 ## BigQuery mirror — `bq_mirror_sync.py`
 
 Copies warehouse tables from SQLite into a BigQuery dataset on a schedule.
@@ -360,6 +383,7 @@ the same text, cut to 480 characters, is the `sync_log` message.
   cc, retry, exhausted retries return `False`), and `send()` (skips
   unconfigured dests, never raises, one failing
   platform doesn't block others, truncation).
+- `tests/test_disk_probe.py` — the three states, env thresholds, exit 0.
 - `tests/test_backup_db.py` — backup + verification, rejecting an empty
   source database, rotation (keeps newest N, removes `-wal`/`-shm` crumbs),
   partial sweeping, and the disk guard (refuses to start, drops to `KEEP-1`,

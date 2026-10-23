@@ -224,11 +224,16 @@ DEFAULT_STATUS_PLATFORMS: dict[str, int] = {
     "catalog": STALE_RUN_DAYS,
     "tiktok_finance": STALE_RUN_DAYS,
     "warehouse_backup": STALE_RUN_DAYS,
+    # disk_probe.py: free space on the warehouse volume. Skipped until it has
+    # logged once (only_seen_platforms), so installs not running it stay quiet.
+    "disk_space": STALE_RUN_DAYS,
     # The alarm itself: if health_alerts.py stops running or fails, nothing
     # else announces anything.
     "health_alerts": STALE_RUN_DAYS,
     # weekly
     "amazon_sqp": 9,
+    # amazon_listing_quality_sync.py, run weekly: a week plus slack.
+    "amazon_listing_quality": 9,
     # monthly
     "amazon_search_terms_monthly": 40,
 }

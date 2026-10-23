@@ -37,6 +37,12 @@
           ]
         },
         {
+          "description": "Free-space probe: always exits 0, logs a `disk_space` row that warehouse_health reads. Must precede the health check.",
+          "steps": [
+            {"script": "disk_probe.py", "timeout_minutes": 2}
+          ]
+        },
+        {
           "description": "Strictly last: both read everything. warehouse_health exits 1 on any ERROR; health_alerts is what reaches a person, and only when something changed.",
           "steps": [
             {"script": "warehouse_health.py", "timeout_minutes": 15},
