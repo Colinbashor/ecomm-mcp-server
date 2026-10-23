@@ -8,7 +8,7 @@ deeper history that can't be re-pulled once it ages out upstream). This
 script uses SQLite's online backup API, which is safe against a live WAL
 database — a concurrent sync job can keep writing while the backup runs.
 
-Backups go to BACKUP_DIR (default: a `backups/` folder OUTSIDE the project
+Backups go to BACKUP_DIR (default: a `warehouse-backups/` folder OUTSIDE the project
 directory, so a botched project-folder operation — e.g. `git clean`, a bad
 `rm -rf` — can't take the backups down with it), named
 warehouse-YYYY-MM-DD.db, keeping the newest KEEP copies. This is same-disk
