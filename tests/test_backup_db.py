@@ -19,6 +19,7 @@ import sqlite3
 import tempfile
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -267,6 +268,102 @@ class DiskGuardTests(unittest.TestCase):
                         "rotate() must run BEFORE the copy, or a tight disk can never recover")
         self.assertLess(body.index("sweep_partials("), body.index(".backup("),
                         "partials must be swept BEFORE the copy")
+
+
+class SidecarSweepTests(unittest.TestCase):
+    """Sidecars of a swept partial or a rotated-away backup used to pile up
+    forever because the sweep only matched bare `.partial` files."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dest = Path(self.tmp.name)
+        import backup_db
+        self.mod = backup_db
+        patcher = patch.object(self.mod, "BACKUP_DIR", self.dest)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def _mk(self, name: str, size: int = 8) -> Path:
+        p = self.dest / name
+        p.write_bytes(b"x" * size)
+        return p
+
+    def test_orphaned_sidecars_are_swept(self) -> None:
+        for n in ("warehouse-2025-01-01.db.partial-wal",
+                  "warehouse-2025-01-01.db.partial-shm",
+                  "warehouse-2025-01-02.db-journal"):
+            self._mk(n)
+        self.mod.sweep_partials()
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_sidecars_of_a_live_backup_are_kept_unless_wal_is_empty(self) -> None:
+        self._mk("warehouse-2025-01-01.db")
+        self._mk("warehouse-2025-01-01.db-wal", 8)
+        self._mk("warehouse-2025-01-01.db-shm", 8)
+        self._mk("warehouse-2025-01-01.db-journal", 8)
+        self.mod.sweep_partials()
+        self.assertEqual(len(list(self.dest.iterdir())), 4, "non-empty wal: keep all")
+
+        (self.dest / "warehouse-2025-01-01.db-wal").write_bytes(b"")
+        self.mod.sweep_partials()
+        left = sorted(p.name for p in self.dest.iterdir())
+        self.assertEqual(left, ["warehouse-2025-01-01.db",
+                                "warehouse-2025-01-01.db-journal"],
+                         "a journal beside a complete backup is never swept")
+
+
+class WeeklyZipTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = Path(self.tmp.name)
+        self.dest = self.tmp_path / "backups"
+        self.dest.mkdir()
+        db = self.tmp_path / "warehouse.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.commit()
+        conn.close()
+        import backup_db
+        self.mod = backup_db
+        for target, value in (("BACKUP_DIR", self.dest), ("DB", db),
+                              ("KEEP", 2), ("ZIPS", 2), ("ZIP_WEEKDAY", 6)):
+            patcher = patch.object(self.mod, target, value)
+            self.addCleanup(patcher.stop)
+            patcher.start()
+        self.logged = []
+        lp = patch.object(self.mod.wdb, "log_sync",
+                          side_effect=lambda *a, **k: self.logged.append(a))
+        self.addCleanup(lp.stop)
+        lp.start()
+
+    def test_disabled_by_default(self) -> None:
+        with patch.object(self.mod, "ZIPS", 0):
+            self.assertFalse(self.mod.is_zip_day(date(2025, 1, 5)))
+
+    def test_zip_written_only_on_zip_day_and_rotated(self) -> None:
+        for d in ("2024-12-22", "2024-12-29"):
+            (self.dest / f"warehouse-{d}.db.zip").write_bytes(b"z")
+        self.mod.main(today=date(2025, 1, 5))  # a Sunday
+        zips = sorted(p.name for p in self.dest.glob("*.zip"))
+        self.assertEqual(zips, ["warehouse-2024-12-29.db.zip",
+                                "warehouse-2025-01-05.db.zip"])
+        self.assertEqual(self.logged[-1][3], "ok")
+
+        self.mod.main(today=date(2025, 1, 6))  # Monday: no new zip
+        self.assertEqual(len(list(self.dest.glob("*.zip"))), 2)
+
+    def test_zip_failure_is_degraded_and_keeps_the_old_zip(self) -> None:
+        old = self.dest / "warehouse-2024-12-29.db.zip"
+        old.write_bytes(b"z")
+        with patch.object(self.mod, "_write_zip", side_effect=OSError("boom")):
+            self.mod.main(today=date(2025, 1, 5))
+        self.assertEqual(self.logged[-1][3], "degraded")
+        self.assertTrue(old.exists())
+        self.assertEqual(list(self.dest.glob("*.zip.partial")), [])
+        self.assertTrue((self.dest / "warehouse-2025-01-05.db").exists(),
+                        "the nightly backup itself still succeeded")
 
 
 if __name__ == "__main__":

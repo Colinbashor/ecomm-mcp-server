@@ -147,7 +147,7 @@ python backup_db.py
 ```
 
 There are no command-line flags; configuration is by environment (the script
-calls `load_dotenv()`, so `.env` works; all three are listed, commented out,
+calls `load_dotenv()`, so `.env` works; all of them are listed, commented out,
 in `.env.example`):
 
 | Variable | Purpose | Default |
@@ -155,6 +155,8 @@ in `.env.example`):
 | `WAREHOUSE_DB` | path to the SQLite file (used throughout the repo, not just here). A relative value is resolved against the **script's directory** (the project root), not the current working directory. | `warehouse.db` in the project root |
 | `WAREHOUSE_BACKUP_DIR` | where copies are written (created if missing) | `warehouse-backups/` next to (not inside) the project directory |
 | `WAREHOUSE_BACKUP_KEEP` | how many complete copies to keep. Use `1` or more — `0` makes rotation delete every copy, including the one just made. | `3` |
+| `WAREHOUSE_BACKUP_ZIPS` | how many weekly compressed copies (`warehouse-YYYY-MM-DD.db.zip`) to keep; `0` disables them. Lets you lower `KEEP` and still retain deeper history. A zip is CRC- and size-verified before the one it replaces is deleted; a zip failure logs `degraded`, not `ok`. | `0` |
+| `WAREHOUSE_BACKUP_ZIP_WEEKDAY` | weekday that writes the zip (`0` = Monday … `6` = Sunday) | `6` |
 
 Copies are named `warehouse-YYYY-MM-DD.db` (local date). Running twice on
 the same day replaces that day's file rather than adding another. Rotation
@@ -371,3 +373,9 @@ the same text, cut to 480 characters, is the `sync_log` message.
   dry run), the one-transaction window replace, per-day partition loads,
   partition-column mismatch, one `sync_log` row per table, the default
   registry against `warehouse/schema.sql`, and the env checks.
+
+**Stray SQLite files.** Before each run the script deletes any `.partial`
+(and `.zip.partial`) from a run that died, plus `-wal`/`-shm`/`-journal`
+files whose main file no longer exists. A complete backup's `-wal`/`-shm` are
+removed only when the `-wal` is empty and nothing has it open; a `-journal`
+beside a complete backup is never touched.
