@@ -266,9 +266,11 @@ gcloud auth application-default login     # or GOOGLE_APPLICATION_CREDENTIALS=<s
 | `BQ_PROJECT` | GCP project id. Required. |
 | `BQ_DATASET` | Destination dataset. Required; must already exist. |
 | `BQ_LOCATION` | Dataset location for load/query jobs. Default `US`. |
+| `BQ_SA_KEY_PATH` | Optional service-account key file, loaded directly. Recommended for scheduled runs. |
 
-Auth is Google Application Default Credentials. For an unattended scheduled
-task, point `GOOGLE_APPLICATION_CREDENTIALS` at a service-account key. The
+For an unattended scheduled task set `BQ_SA_KEY_PATH`. Without it the client
+falls back to Application Default Credentials and logs a warning: user ADC
+expires, and a nightly job quietly riding one fails the day it does. The
 principal needs **BigQuery Data Editor** on the dataset and **BigQuery Job
 User** on the project.
 

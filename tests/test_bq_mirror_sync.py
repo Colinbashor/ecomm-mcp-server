@@ -619,3 +619,22 @@ def test_main_checks_env_before_touching_bigquery(monkeypatch):
     monkeypatch.setattr(ms, "run", lambda *a, **k: pytest.fail("run() must not be reached"))
     with pytest.raises(SystemExit, match="BQ_PROJECT"):
         ms.main(["--set", "facts"])
+
+
+def test_get_client_falls_back_to_adc_with_a_warning(monkeypatch, capsys):
+    """No key configured: ADC is used, loudly, because user ADC expires."""
+    monkeypatch.setenv("BQ_SA_KEY_PATH", "")
+    built = []
+    monkeypatch.setattr(ms.bigquery, "Client", lambda **kw: built.append(kw) or object())
+    ms.get_client("my-project")
+    assert built == [{"project": "my-project"}]
+    assert "Application Default" in capsys.readouterr().err
+
+
+def test_get_client_unreadable_key_falls_back_not_crashes(monkeypatch, capsys):
+    monkeypatch.setenv("BQ_SA_KEY_PATH", "/no/such/key.json")
+    built = []
+    monkeypatch.setattr(ms.bigquery, "Client", lambda **kw: built.append(kw) or object())
+    ms.get_client("my-project")
+    assert built == [{"project": "my-project"}]
+    assert "falling back" in capsys.readouterr().err

@@ -13,9 +13,12 @@ in the repo needs BigQuery.
 SETUP
   pip install google-cloud-bigquery
   .env:  BQ_PROJECT=<gcp project id>   BQ_DATASET=<dataset>   (BQ_LOCATION=US)
-  Auth is Google Application Default Credentials: `gcloud auth
-  application-default login` interactively, or GOOGLE_APPLICATION_CREDENTIALS
-  pointing at a service-account key for an unattended scheduled task. The
+  Auth: for an unattended scheduled task set BQ_SA_KEY_PATH to a service-account
+  key file; it is loaded directly, so the run never depends on a personal login.
+  Without it the client falls back to Google Application Default Credentials
+  (`gcloud auth application-default login`, or GOOGLE_APPLICATION_CREDENTIALS),
+  with a logged WARNING -- user ADC EXPIRES, and a nightly job quietly riding
+  one fails the day it does. The
   principal needs BigQuery Data Editor on the dataset and Job User on the
   project. The dataset must already exist; tables are created only for
   registry entries with `create_if_missing=True`.
@@ -112,6 +115,26 @@ def check_required_env() -> None:
     missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
     if missing:
         raise SystemExit(f"Missing required env var(s): {', '.join(missing)}. See .env.example.")
+
+
+def get_client(project: str):
+    """Build the BigQuery client. BQ_SA_KEY_PATH (a service-account key file) is
+    loaded explicitly; otherwise Application Default Credentials are used and a
+    warning is logged, because user ADC expires."""
+    key = os.environ.get("BQ_SA_KEY_PATH", "").strip()
+    if key:
+        try:
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(
+                key, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            return bigquery.Client(project=project, credentials=creds)
+        except Exception as exc:  # noqa: BLE001 -- fall back loudly, not silently
+            print(f"WARNING: could not load BQ_SA_KEY_PATH ({type(exc).__name__}); "
+                  "falling back to Application Default Credentials", file=sys.stderr)
+    else:
+        print("WARNING: BQ_SA_KEY_PATH not set; using Application Default "
+              "Credentials, which can expire", file=sys.stderr)
+    return bigquery.Client(project=project)
 
 
 def bq_target() -> tuple[str, str, str]:
@@ -537,7 +560,7 @@ def mirror_one(client, conn, m: Mirror, project: str, dataset: str, location: st
 def run(mirrors: list[Mirror], *, dry_run: bool = False, since: str | None = None,
         client=None, conn=None, today: str | None = None) -> list[Result]:
     project, dataset, location = bq_target()
-    client = client or bigquery.Client(project=project)
+    client = client or get_client(project)
     own_conn = conn is None
     conn = conn or open_sqlite()
     today = today or date.today().isoformat()
