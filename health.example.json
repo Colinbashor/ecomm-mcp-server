@@ -15,7 +15,10 @@
     {"name": "meta_ads", "platform": "meta", "max_age_days": 2,
      "sql": "SELECT MAX(date) FROM ad_metrics WHERE platform='meta'"},
     {"name": "google_ads", "platform": "google", "max_age_days": 2,
-     "sql": "SELECT MAX(date) FROM ad_metrics WHERE platform='google'"}
+     "sql": "SELECT MAX(date) FROM ad_metrics WHERE platform='google'"},
+    {"name": "hourly_poller", "max_age_hours": 3,
+     "description": "A job of your own that logs every hour: an hour limit, because at day grain it could die after midnight and still read fresh.",
+     "sql": "SELECT MAX(started_at) FROM sync_log WHERE platform='hourly_poller'"}
   ],
   "verified_empty_dates": {
     "google_ads": ["2025-12-25"]
@@ -23,7 +26,8 @@
   "scheduled_jobs": [
     {"platform": "weekly_replen", "max_age_days": 8,
      "expected_statuses": ["ok", "degraded"],
-     "description": "Runs Tuesdays; degraded (warnings for review) is its normal result."}
+     "blocked_prefix": "[BLOCKED] ", "blocked_escalate_days": 3,
+     "description": "Runs Tuesdays; degraded (warnings for review) is its normal result. A run whose message starts with [BLOCKED] is shown as DEGRADED, and as ERROR once it has stood more than 3 days."}
   ],
   "disable": ["historical_gaps:ga4"]
 }

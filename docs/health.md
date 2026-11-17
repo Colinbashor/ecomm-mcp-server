@@ -43,8 +43,8 @@ three severities. **Only ERROR drives the exit code.**
 
 | Severity | Meaning | Exit | Pushed by `health_alerts.py` |
 |---|---|---|---|
-| **ERROR** | Ours and actionable now: a sync erroring, a feed that stopped running, a table gone stale while its sync says `ok`, successful runs writing 0 rows, or a DEGRADED condition that has aged past the escalation clock | 1 | when new, when escalated |
-| **DEGRADED** | A known upstream condition still inside its clock: a sync currently `degraded`/`paused`, or a table stale *because* its owning sync is paused | 0 | when new; again in the weekly digest |
+| **ERROR** | Ours and actionable now: a sync erroring, a feed that stopped running, a table gone stale while its sync says `ok`, successful runs writing 0 rows, or a DEGRADED condition that has aged past the escalation clock | 1 | when new, when escalated; again in the weekly digest |
+| **DEGRADED** | A known upstream condition still inside its clock: a sync currently `degraded`/`paused`, a table stale *because* its owning sync is paused, or a scheduled job reporting itself blocked | 0 | when new; again in the weekly digest |
 | **WARN** | Historical or unrecoverable data-quality drift: missing days in a snapshot table (no backfill exists) or inside a daily series | 0 | never (report only) |
 
 ### Escalation: classification, not suppression
@@ -77,8 +77,8 @@ table soft forever.
 |---|---|---|
 | `sync_log` | `sync_log` missing or empty — an empty warehouse must not read as healthy | ERROR |
 | `sync_status:<platform>` | latest run is `error`; no run within the platform's own `max_days_between_runs`; `degraded` past the clock (ERROR) or inside it (DEGRADED); in strict mode, a declared platform with no row at all | ERROR / DEGRADED |
-| `sync_status:<job>` (scheduled jobs) | a declared non-daily job never ran; its latest run is older than its own `max_age_days`; or its latest status is outside `expected_statuses` | ERROR |
-| `freshness:<name>` | the newest date in a table is older than `max_age_days`; or the table has never produced anything | ERROR / DEGRADED (owned) |
+| `sync_status:<job>` (scheduled jobs) | a declared non-daily job never ran; its latest run is older than its own `max_age_days`; or its latest status is outside `expected_statuses`. With `blocked_prefix`: its latest run is tagged as blocked (DEGRADED, then ERROR past `blocked_escalate_days`) | ERROR / DEGRADED (blocked) |
+| `freshness:<name>` | the newest date in a table is older than `max_age_days` (or its newest timestamp older than `max_age_hours`); or the table has never produced anything | ERROR / DEGRADED (owned) |
 | `volume:<platform>` | the last *N*+1 **successful** runs (inside 14 days) all wrote 0 rows — a sync answering "did the request succeed?" instead of "did any data arrive?" | ERROR |
 | `snapshot_gaps:<name>` | missing days in a current-state snapshot table over the last 21 days (days before the table's first snapshot don't count) | WARN |
 | `historical_gaps:<name>` | missing days inside a daily series, minus `verified_empty_dates` | WARN |
@@ -96,6 +96,26 @@ by design ("a proposal is waiting for review") lists it in
 waiting for an `ok` the job never writes. A declared job that has never run is
 an ERROR regardless of `only_seen_platforms`: declaring it says it runs. Don't
 list a job in both `status_platforms` and `scheduled_jobs`.
+
+The one exception to "silent or ERROR" is a job whose **blocked** result
+shares a status with its routine one: "a proposal is waiting for review" and
+"a guardrail stopped the run; nothing can proceed until someone clears it"
+both logging `degraded`. Once `degraded` is an expected status, the block is as
+silent as the routine result and can stand for weeks. Have the job start the
+`sync_log` message of a blocked run with a fixed tag, and give the spec
+`blocked_prefix` (that tag) and `blocked_escalate_days`. A latest run carrying
+the tag is then DEGRADED, and an ERROR once the unbroken run of tagged results
+has stood for more than `blocked_escalate_days` — counted in days since the
+first tagged run, not in runs, so a job that runs twice a day does not age
+twice as fast. The first untagged run ends the streak.
+
+**Feeds that write more often than daily** (an hourly heartbeat, a poller)
+take `max_age_hours` instead of `max_age_days` in their freshness spec. At day
+grain such a writer can die just after midnight and still read "today" until
+the next day's limit runs out. The spec's `sql` must then return a full
+timestamp; one without a UTC offset is read as UTC, which is what
+`sync_log.started_at` holds. A bare date under an hour limit is reported as an
+ERROR rather than guessed at.
 
 ### Unconfigured connectors stay quiet
 
@@ -135,13 +155,13 @@ you want to tweak one entry, or use `disable` to drop a single check.
 | `escalate_after_days` | `7` | days a platform may go without an `ok` before DEGRADED becomes ERROR |
 | `only_seen_platforms` | `true` | skip declared platforms (and checks tied to them) that have never logged a row |
 | `status_platforms` | the public connectors | `{platform: max_days_between_runs}`; a plain list means 3 days each |
-| `freshness` | ad/order/snapshot tables of the public connectors | list of `{name, sql, max_age_days, owner_platform?, platform?}`; `sql` returns one date; `platform` only gates activation, `owner_platform` enables the paused-owner softening |
+| `freshness` | ad/order/snapshot tables of the public connectors | list of `{name, sql, max_age_days, owner_platform?, platform?}`; `sql` returns one date; `platform` only gates activation, `owner_platform` enables the paused-owner softening. Give `max_age_hours` (a number) **instead of** `max_age_days` for a sub-daily writer; `sql` then returns one timestamp |
 | `volume` | feeds that should always write rows | list of `{platform, max_zero_streak}` (default streak 2) |
 | `volume_window_days` | `14` | how far back zero-row streaks are judged |
 | `snapshot_tables` | inventory / waitlist snapshots | list of `{name, table, date_column?, platform?}` |
 | `snapshot_lookback_days` | `21` | window for snapshot gaps |
 | `date_series` | Google/Meta ad days, GA4 days | list of `{name, sql, platform?}`; `sql` returns one date per row |
-| `scheduled_jobs` | `[]` | list of `{platform, max_age_days, expected_statuses?}`; `max_age_days` = the longest normal gap between runs plus slack; `expected_statuses` defaults to `["ok", "success"]` |
+| `scheduled_jobs` | `[]` | list of `{platform, max_age_days, expected_statuses?, blocked_prefix?, blocked_escalate_days?}`; `max_age_days` = the longest normal gap between runs plus slack; `expected_statuses` defaults to `["ok", "success"]`; the two `blocked_*` keys go together (see above) |
 | `verified_empty_dates` | `{}` | `{series_name: ["YYYY-MM-DD", ...]}` days verified to have no data |
 | `disable` | `[]` | check ids to drop, shell wildcards allowed: `["freshness:gmc_visibility", "historical_gaps:*"]` |
 
@@ -180,9 +200,14 @@ outage.
 - an **escalation** — a check whose severity went up (typically DEGRADED aging
   into ERROR);
 - a **recovery** of anything that was announced or had reached ERROR;
-- on Mondays, a digest of standing DEGRADED conditions, so a long pause stays
-  visible without being repeated every morning (`--digest-weekday N`, 0 =
-  Monday, `-1` to disable).
+- on Mondays, a digest of what is still wrong — standing ERRORs first (with
+  how long each has stood), then standing DEGRADED conditions — so neither an
+  unfixed failure nor a long pause fades out of view, and neither is repeated
+  every morning (`--digest-weekday N`, 0 = Monday, `-1` to disable). Without
+  the ERRORs an error would be announced exactly once: miss that message and
+  it never comes up again while it stays broken. The digest goes out once on
+  its day however often the script runs, and skips anything already pushed
+  that day.
 
 Silence is the normal output, both on a healthy day and on a day when the same
 known problems are still true. Identity is the check id and change is the
@@ -412,7 +437,10 @@ step scripts, `notify.send` patched out. They cover:
   and vanished platforms, zero-row streaks, owner softening and its cap, gap
   checks, `only_seen_platforms`, `disable`, and that every default freshness
   table is one this repo creates;
+- hour-grain freshness (same-day silence, across midnight, another time zone,
+  a bare date refused) and the blocked-job tier (visible on day one, ERROR past
+  its clock, days not runs, an untagged run ending the streak);
 - change-only delivery: the same state twice sends once; new → silent →
   recovered → silent → recurring sends exactly three messages; an escalation
-  sends once; the digest repeats standing DEGRADED only on its weekday; state is
-  written before the push.
+  sends once; the digest repeats standing ERROR and DEGRADED checks only on
+  its weekday, errors first, once that day; state is written before the push.

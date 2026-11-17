@@ -13,7 +13,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,6 +84,105 @@ class FreshnessTests(_Conn):
             self.conn, date(2026, 7, 28), spec, seen=set()), [])
         self.assertEqual(len(wh.check_freshness(
             self.conn, date(2026, 7, 28), spec, seen=None)), 1)
+
+
+class HourlyFreshnessTests(_Conn):
+    """A writer that runs more often than daily needs a limit in hours: at
+    day grain one that dies just after midnight still reads "today"."""
+
+    SPEC = wh.FreshnessSpec(
+        "heartbeat",
+        "SELECT MAX(started_at) FROM sync_log WHERE platform='heartbeat'",
+        max_age_hours=3)
+
+    def check(self, started, now, spec=None, **kw):
+        self.conn.execute("DELETE FROM sync_log WHERE platform='heartbeat'")
+        _log(self.conn, [("heartbeat", started, None, 1, "ok", "")])
+        return wh.check_freshness(self.conn, now.date(), (spec or self.SPEC,),
+                                  now=now, **kw)
+
+    def test_silent_for_five_hours_is_an_error_the_same_day(self) -> None:
+        # Same calendar date: a day-grain limit reads this as age 0, fresh.
+        issues = self.check("2026-07-28T09:00:00+00:00",
+                            datetime(2026, 7, 28, 14, 0, tzinfo=timezone.utc))
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("5.0 hours old (limit 3h)", issues[0].message)
+
+    def test_a_recent_heartbeat_is_fresh_across_midnight(self) -> None:
+        self.assertEqual(
+            self.check("2026-07-28T23:30:00+00:00",
+                       datetime(2026, 7, 29, 0, 45, tzinfo=timezone.utc)), [])
+
+    def test_now_in_another_zone_is_compared_as_an_instant(self) -> None:
+        behind = timezone(timedelta(hours=-7))
+        now = datetime(2026, 7, 28, 14, 0, tzinfo=behind)      # 21:00 UTC
+        self.assertEqual(self.check("2026-07-28T20:30:00+00:00", now), [])
+        self.assertTrue(self.check("2026-07-28T15:00:00+00:00", now))
+
+    def test_a_timestamp_without_an_offset_is_read_as_utc(self) -> None:
+        now = datetime(2026, 7, 28, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(self.check("2026-07-28 12:30:00", now), [])
+        self.assertEqual(self.check("2026-07-28T12:30:00Z", now), [])
+
+    def test_a_bare_date_cannot_be_aged_in_hours(self) -> None:
+        self.conn.execute("CREATE TABLE feed (day TEXT)")
+        self.conn.execute("INSERT INTO feed (day) VALUES ('2026-07-28')")
+        spec = wh.FreshnessSpec("feed", "SELECT MAX(day) FROM feed",
+                                max_age_hours=3)
+        issues = wh.check_freshness(
+            self.conn, date(2026, 7, 28), (spec,),
+            now=datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc))
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("no time of day", issues[0].message)
+
+    def test_never_recorded_is_still_its_own_finding(self) -> None:
+        issues = wh.check_freshness(
+            self.conn, date(2026, 7, 28), (self.SPEC,),
+            now=datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc))
+        self.assertIn("never recorded", issues[0].message)
+
+    def test_a_paused_owner_softens_an_hourly_spec_too(self) -> None:
+        owned = wh.FreshnessSpec(
+            "heartbeat",
+            "SELECT MAX(started_at) FROM sync_log WHERE platform='heartbeat'",
+            owner_platform="poller", max_age_hours=3)
+        _log(self.conn, [_run("poller", "2026-07-27"),
+                         _run("poller", "2026-07-28", "degraded")])
+        issues = self.check("2026-07-28T02:00:00+00:00",
+                            datetime(2026, 7, 28, 14, 0, tzinfo=timezone.utc),
+                            spec=owned)
+        self.assertEqual([i.severity for i in issues], [wh.DEGRADED])
+
+    def test_exactly_one_limit_is_required(self) -> None:
+        for kwargs in ({}, {"max_age_days": 1, "max_age_hours": 3},
+                       {"max_age_hours": 0}, {"max_age_hours": True},
+                       {"max_age_hours": "3"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(TypeError):
+                wh.FreshnessSpec("x", "SELECT 1", **kwargs)
+
+    def test_config_accepts_hours_and_rejects_both_or_neither(self) -> None:
+        base = {"name": "heartbeat", "sql": "SELECT 1"}
+        cfg = wh.parse_config({"freshness": [{**base, "max_age_hours": 1.5}]})
+        self.assertEqual(cfg.freshness[0].max_age_hours, 1.5)
+        self.assertIsNone(cfg.freshness[0].max_age_days)
+        for bad in ({**base}, {**base, "max_age_days": 1, "max_age_hours": 2},
+                    {**base, "max_age_hours": -1}):
+            with self.subTest(bad=bad), self.assertRaises(wh.ConfigError):
+                wh.parse_config({"freshness": [bad]})
+
+    def test_collect_issues_passes_its_clock_through(self) -> None:
+        _log(self.conn, [("heartbeat", "2026-07-28T09:00:00+00:00", None, 1,
+                          "ok", "")])
+        cfg = wh.parse_config({
+            "status_platforms": {}, "volume": [], "snapshot_tables": [],
+            "date_series": [],
+            "freshness": [{"name": "heartbeat", "max_age_hours": 3,
+                           "sql": self.SPEC.sql}]})
+        now = datetime(2026, 7, 28, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual([i.check for i in wh.collect_issues(self.conn, now, cfg)],
+                         ["freshness:heartbeat"])
+        early = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+        self.assertEqual(wh.collect_issues(self.conn, early, cfg), [])
 
 
 class FlexportReturnsFreshnessTests(unittest.TestCase):
@@ -462,6 +561,71 @@ class ScheduledJobTests(_Conn):
         _log(self.conn, [_run("review_job", d, "degraded")
                          for d in ("2026-07-02", "2026-07-16", "2026-07-29")])
         self.assertEqual(self.check(self.DESIGNED_DEGRADED), [])
+
+    # A job whose BLOCKED result shares `degraded` with its routine one.
+    GUARDED = wh.ScheduledJobSpec(
+        "review_job", 4, frozenset({"ok", "degraded"}),
+        blocked_prefix="[BLOCKED] ", blocked_escalate_days=2)
+
+    def test_a_routine_designed_degraded_stays_silent_with_a_block_tag_set(self) -> None:
+        _log(self.conn, [_run("review_job", "2026-07-29", "degraded",
+                              message="proposal waiting for review")])
+        self.assertEqual(self.check(self.GUARDED), [])
+
+    def test_a_blocked_run_is_visible_from_the_first_day(self) -> None:
+        _log(self.conn, [_run("review_job", "2026-07-29", "degraded",
+                              message="[BLOCKED] input file is stale")])
+        issues = self.check(self.GUARDED)
+        self.assertEqual([i.severity for i in issues], [wh.DEGRADED])
+        self.assertIn("blocked for 1 day(s) since 2026-07-29", issues[0].message)
+        self.assertIn("input file is stale", issues[0].message)
+
+    def test_a_block_that_stands_past_its_clock_is_an_error(self) -> None:
+        _log(self.conn, [_run("review_job", d, "degraded",
+                              message="[BLOCKED] input file is stale")
+                         for d in ("2026-07-27", "2026-07-28", "2026-07-29")])
+        issues = self.check(self.GUARDED)
+        self.assertEqual([i.severity for i in issues], [wh.ERROR])
+        self.assertIn("blocked for 3 day(s) since 2026-07-27", issues[0].message)
+
+    def test_the_block_clock_is_days_not_runs(self) -> None:
+        # Four runs in one day must not age the block four times as fast.
+        _log(self.conn, [("review_job", f"2026-07-29T0{h}:00:00Z", None, 0,
+                          "degraded", "[BLOCKED] input file is stale")
+                         for h in range(4)])
+        self.assertEqual([i.severity for i in self.check(self.GUARDED)],
+                         [wh.DEGRADED])
+
+    def test_an_unblocked_run_restarts_the_block_clock(self) -> None:
+        _log(self.conn, [
+            _run("review_job", "2026-07-20", "degraded", message="[BLOCKED] a"),
+            _run("review_job", "2026-07-28", "degraded", message="waiting"),
+            _run("review_job", "2026-07-29", "degraded", message="[BLOCKED] b")])
+        issues = self.check(self.GUARDED)
+        self.assertEqual([i.severity for i in issues], [wh.DEGRADED])
+        self.assertIn("since 2026-07-29", issues[0].message)
+
+    def test_a_cleared_block_is_silent(self) -> None:
+        _log(self.conn, [
+            _run("review_job", "2026-07-20", "degraded", message="[BLOCKED] a"),
+            _run("review_job", "2026-07-29", "degraded", message="waiting")])
+        self.assertEqual(self.check(self.GUARDED), [])
+
+    def test_block_settings_come_as_a_pair(self) -> None:
+        for kwargs in ({"blocked_prefix": "[BLOCKED] "},
+                       {"blocked_escalate_days": 2},
+                       {"blocked_prefix": "", "blocked_escalate_days": 2}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(TypeError):
+                wh.ScheduledJobSpec("review_job", 4, **kwargs)
+        cfg = wh.parse_config({"scheduled_jobs": [
+            {"platform": "review_job", "max_age_days": 4,
+             "expected_statuses": ["ok", "degraded"],
+             "blocked_prefix": "[BLOCKED] ", "blocked_escalate_days": 2}]})
+        self.assertEqual(cfg.scheduled_jobs, (self.GUARDED,))
+        with self.assertRaises(wh.ConfigError):
+            wh.parse_config({"scheduled_jobs": [
+                {"platform": "review_job", "max_age_days": 4,
+                 "blocked_prefix": "[BLOCKED] "}]})
 
     def test_judged_on_started_at_for_a_run_that_never_finished(self) -> None:
         _log(self.conn, [("weekly_job", "2026-07-27T04:00:00Z", None, 0,

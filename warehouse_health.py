@@ -37,7 +37,9 @@ WHAT IS CHECKED (each list is configurable; see docs/health.md):
   freshness:<name>        the newest date in a table, against a per-table
                           limit. A table can go stale while its sync keeps
                           logging `ok`, which is exactly the failure that
-                          status checks cannot see.
+                          status checks cannot see. The limit is in days, or
+                          in hours (`max_age_hours`) for a writer that runs
+                          more often than daily.
   volume:<platform>       consecutive successful runs that wrote 0 rows. A
                           connector answering "did the request succeed?"
                           instead of "did any data arrive?" logs `ok` on an
@@ -66,7 +68,7 @@ import os
 import sqlite3
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -116,7 +118,8 @@ class Issue:
 class FreshnessSpec:
     name: str
     sql: str
-    max_age_days: int
+    # Exactly one of max_age_days / max_age_hours.
+    max_age_days: int | None = None
     # The sync_log platform that FEEDS this table, where one owns it. A table
     # cannot be fresh while its own writer is deliberately paused, so its
     # staleness is then a CONSEQUENCE of that platform's status, not a second
@@ -130,6 +133,22 @@ class FreshnessSpec:
     # Activation only: with only_seen_platforms, skip this spec until this
     # platform has logged at least one sync_log row. No effect on severity.
     platform: str | None = None
+    # For a writer that runs MORE often than daily (an hourly heartbeat, a
+    # poller): the limit in hours, compared against the full timestamp. A
+    # day-grain limit cannot see such a writer die: one that stops just after
+    # midnight still reads "today" for the rest of the day and, with a 1-day
+    # limit, all of the next. `sql` must then return a timestamp, not a date;
+    # one without a UTC offset is read as UTC (what db.now() writes).
+    max_age_hours: float | None = None
+
+    def __post_init__(self):
+        if (self.max_age_days is None) == (self.max_age_hours is None):
+            raise TypeError("give exactly one of max_age_days / max_age_hours")
+        hours = self.max_age_hours
+        if hours is not None and (isinstance(hours, bool)
+                                  or not isinstance(hours, (int, float))
+                                  or hours <= 0):
+            raise TypeError(f"max_age_hours must be a number > 0, got {hours!r}")
 
 
 @dataclass(frozen=True)
@@ -146,12 +165,28 @@ class ScheduledJobSpec:
     # on the escalate_after_days clock: that clock waits for an `ok` the job
     # never writes. Anything outside this set is an ERROR.
     expected_statuses: frozenset[str] = frozenset(OK_STATUSES)
+    # For a job whose BLOCKED result shares an expected status with its
+    # routine one -- "a proposal is waiting for review" and "a guardrail
+    # stopped the run, nothing can proceed until someone clears it" both
+    # logging `degraded`. Listing `degraded` as expected makes the block as
+    # silent as the routine result, so it can stand for weeks. Have the job
+    # start the sync_log message of a blocked run with a fixed tag and name
+    # that tag here: a latest run carrying it is DEGRADED (visible), then
+    # ERROR once the unbroken run of tagged results has stood for more than
+    # blocked_escalate_days. Give both or neither.
+    blocked_prefix: str | None = None
+    blocked_escalate_days: int | None = None
 
     def __post_init__(self):
         if isinstance(self.expected_statuses, str):
             raise TypeError("expected_statuses must be a list of statuses")
         object.__setattr__(self, "expected_statuses",
                            frozenset(str(x).lower() for x in self.expected_statuses))
+        if (self.blocked_prefix is None) != (self.blocked_escalate_days is None):
+            raise TypeError("blocked_prefix and blocked_escalate_days go together")
+        if self.blocked_prefix is not None and (
+                not isinstance(self.blocked_prefix, str) or not self.blocked_prefix):
+            raise TypeError("blocked_prefix must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -359,7 +394,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "date_series": _SERIES_DEFAULTS,
     # Non-daily jobs, each judged on its own cadence. Empty by default: list
     # your own, e.g. {"platform": "weekly_replen", "max_age_days": 8,
-    # "expected_statuses": ["ok", "degraded"]}. See docs/health.md.
+    # "expected_statuses": ["ok", "degraded"]}, optionally with
+    # "blocked_prefix" / "blocked_escalate_days". See docs/health.md.
     "scheduled_jobs": [],
     # Dates a series genuinely had no data (verified against the platform),
     # so the gap check stops reporting them: {"google_ads": ["2025-01-01"]}.
@@ -481,7 +517,7 @@ def parse_config(raw: Mapping[str, Any] | None = None) -> HealthConfig:
         snapshot_tables=specs("snapshot_tables", SnapshotSpec),
         date_series=specs("date_series", SeriesSpec),
         scheduled_jobs=specs("scheduled_jobs", ScheduledJobSpec,
-                             ("max_age_days",)),
+                             ("max_age_days", "blocked_escalate_days")),
         verified_empty_dates=verified,
         disable=tuple(disable),
     )
@@ -525,6 +561,22 @@ def _date_value(value: object) -> date | None:
         return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
+
+
+def _datetime_value(value: object) -> datetime | None:
+    """A stored timestamp as an aware datetime, or None when it carries no
+    time of day. A value without a UTC offset is read as UTC, which is what
+    db.now() writes."""
+    text = str(value).strip() if value not in (None, "") else ""
+    if len(text) <= 10:     # a bare date cannot be aged in hours
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _seen_platforms(conn: sqlite3.Connection) -> set[str]:
@@ -625,12 +677,18 @@ def check_freshness(
     specs: Sequence[FreshnessSpec],
     escalate_after_days: int = ESCALATE_AFTER_DAYS,
     seen: set[str] | None = None,
+    now: datetime | None = None,
 ) -> list[Issue]:
     """Age-check each tracked table.
 
     A spec whose `owner_platform` is CURRENTLY paused reports DEGRADED rather
     than ERROR, and still escalates on the owner's clock.
+
+    `now` is only read by specs with `max_age_hours`; a naive value is taken
+    as this machine's local time, None as the current instant.
     """
+    now_utc = (now.astimezone(timezone.utc) if now is not None
+               else datetime.now(timezone.utc))
     issues: list[Issue] = []
     for spec in specs:
         if not _active(spec.platform, seen):
@@ -650,19 +708,36 @@ def check_freshness(
                 "never recorded - this feed has produced nothing, ever "
                 "(not stale: absent)"))
             continue
-        age = (today - latest).days
-        if age <= spec.max_age_days:
-            continue
-        detail = (f"latest {latest.isoformat()} is {age} days old "
-                  f"(limit {spec.max_age_days})")
+        if spec.max_age_hours is not None:
+            stamp = _datetime_value(value)
+            if stamp is None:
+                issues.append(Issue(
+                    ERROR, check,
+                    f"latest {value!r} has no time of day - max_age_hours "
+                    f"needs a full timestamp (use max_age_days for a date "
+                    f"column)"))
+                continue
+            hours = (now_utc - stamp).total_seconds() / 3600
+            if hours <= spec.max_age_hours:
+                continue
+            detail = (f"latest {stamp.isoformat(timespec='minutes')} is "
+                      f"{hours:.1f} hours old (limit {spec.max_age_hours:g}h)")
+            softenable = (hours
+                          <= spec.max_age_hours + escalate_after_days * 24)
+        else:
+            age = (today - latest).days
+            if age <= spec.max_age_days:
+                continue
+            detail = (f"latest {latest.isoformat()} is {age} days old "
+                      f"(limit {spec.max_age_days})")
+            softenable = age <= spec.max_age_days + escalate_after_days
         severity = ERROR
         # The owner's clock alone is not enough: a writer that alternates
         # ok/paused resets "days since last ok" on every lucky run while the
         # table falls further behind. So the TABLE's own lag also caps the
         # softening: past limit + escalate_after_days it is an ERROR whatever
         # the owner says.
-        if (spec.owner_platform
-                and age <= spec.max_age_days + escalate_after_days):
+        if spec.owner_platform and softenable:
             owner_state = _latest_status(conn, spec.owner_platform)
             owner_age = _last_ok_age(conn, spec.owner_platform, today)
             if owner_state in TOLERATED_STATUSES and (
@@ -897,6 +972,22 @@ def _disabled(check: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(check, p) for p in patterns)
 
 
+def _blocked_since(conn: sqlite3.Connection, platform: str,
+                   prefix: str) -> date | None:
+    """Date of the oldest run in the unbroken streak of `prefix`-tagged runs
+    ending at the latest one; the first untagged run walking back ends it.
+    A date, not a run count: a job that runs twice on some days must not age
+    twice as fast."""
+    start = None
+    for started_at, message in conn.execute(
+            "SELECT started_at, message FROM sync_log WHERE platform=? "
+            "ORDER BY started_at DESC, id DESC", (platform,)):
+        if not str(message or "").startswith(prefix):
+            break
+        start = _date_value(started_at) or start
+    return start
+
+
 def check_scheduled_jobs(
     conn: sqlite3.Connection,
     today: date,
@@ -909,6 +1000,10 @@ def check_scheduled_jobs(
     either designed output (listed in expected_statuses) or a failure. Like
     check_recent_statuses this iterates the DECLARED list, so a job that has
     never logged is a finding -- declaring it is the statement that it runs.
+
+    The one exception is a spec with `blocked_prefix`: a latest run whose
+    message carries that tag is DEGRADED, then ERROR once the tagged streak
+    has stood for more than `blocked_escalate_days`.
     """
     issues: list[Issue] = []
     for spec in specs:
@@ -939,6 +1034,19 @@ def check_scheduled_jobs(
                 f"{status}; limit {spec.max_age_days}d for this schedule)"))
             continue
         if str(status).lower() in spec.expected_statuses:
+            if spec.blocked_prefix and str(message or "").startswith(
+                    spec.blocked_prefix):
+                start = _blocked_since(conn, spec.platform,
+                                       spec.blocked_prefix) or seen
+                standing = (today - start).days
+                escalated = standing > spec.blocked_escalate_days
+                limit = (f"escalated past {spec.blocked_escalate_days}d - "
+                         f"this needs a person" if escalated else
+                         f"tolerated to {spec.blocked_escalate_days}d")
+                issues.append(Issue(
+                    ERROR if escalated else DEGRADED, check,
+                    f"blocked for {standing} day(s) since "
+                    f"{start.isoformat()} ({limit}): {message}"))
             continue
         issues.append(Issue(ERROR, check,
                             f"latest status is {status}: {message or 'no message'}"))
@@ -961,7 +1069,8 @@ def collect_issues(
     issues.extend(check_recent_statuses(
         conn, today, config.status_platforms, config.escalate_after_days, seen))
     issues.extend(check_freshness(
-        conn, today, config.freshness, config.escalate_after_days, seen))
+        conn, today, config.freshness, config.escalate_after_days, seen,
+        now=now))
     issues.extend(check_volume(conn, today, config.volume,
                                config.volume_window_days))
     issues.extend(check_snapshot_gaps(conn, today, config.snapshot_tables,
