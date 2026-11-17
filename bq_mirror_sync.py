@@ -28,14 +28,22 @@ HOW A TABLE IS WRITTEN
   a column added to SQLite cannot drift from a copy of its DDL). Columns SQLite
   has and BigQuery lacks are ADDED (nullable) before the load, typed TEXT ->
   STRING, INTEGER -> INTEGER, REAL -> FLOAT; columns BigQuery has and SQLite
-  lacks load as NULL and are reported.
+  lacks load as NULL and are reported. A registry entry's `types` overrides
+  the inferred type per column (full mode only) -- needed for a SQLite VIEW,
+  whose computed columns declare no type and would otherwise all land as
+  STRING. A type the mirror had to GUESS for an undeclared column is
+  `degraded`, never `ok`.
   full    one WRITE_TRUNCATE load job of the whole table -- atomic.
   window  rewrite a set of DAYS. Partitioned table: one WRITE_TRUNCATE load per
           day into `table$YYYYMMDD` (no DML). Unpartitioned table: load the rows
           into a staging table, then ONE transaction `DELETE days; INSERT staging`
           so readers never see the days missing. The days are the trailing
           `window_days`, plus any day in `reconcile_days` whose row count differs
-          between SQLite and BigQuery, plus the gap since BigQuery's newest day.
+          between SQLite and BigQuery, plus any such day whose VALUES differ
+          (per numeric column: the non-null count and the sum -- a re-pull can
+          restate a day's amounts with the row count unchanged, which a
+          count-only check never re-copies), plus the gap since BigQuery's
+          newest day.
           A missed night therefore heals itself on the next run (capped at
           MAX_CATCHUP_DAYS unless --since says otherwise). A partition that is
           empty on BOTH sides is skipped rather than truncated, so a weekly table
@@ -48,8 +56,8 @@ CHECKS
     counts after the load) and a mismatch is an `error`, never silently `ok`;
   * an empty SQLite table is `degraded` and the BigQuery copy is left alone,
     unless the registry marks it allow_empty (an empty pull is not success);
-  * what gets rewritten is decided by COMPARING COUNTS, never by "absence of
-    rows" — a day can legitimately have none;
+  * what gets rewritten is decided by COMPARING COUNTS AND COLUMN SUMS, never
+    by "absence of rows" — a day can legitimately have none;
   * one sync_log row per table, platform `mirror_<table>_bq`, so the warehouse's
     own freshness checks (the `last_sync_status` MCP tool) see the mirror too;
   * one table failing never stops the rest; the process exits 1 if any table
@@ -224,12 +232,49 @@ def next_day(day: str) -> str:
     return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
 
 
+# A day's column sum can differ between the two engines by summation order
+# alone (floating point); anything beyond this is a restatement. Relative to
+# the larger side, with an absolute floor so near-zero sums do not read as drift.
+SUM_REL_TOL = 1e-6
+SUM_ABS_TOL = 0.005
+
+DayValues = dict[str, dict[str, tuple[int, float]]]   # day -> column -> (non-null count, sum)
+
+
+def sum_columns(bq_schema, sqlite_cols: list[tuple[str, str]], date_column: str) -> list[str]:
+    """Columns whose per-day values the reconcile fingerprints: numeric in the
+    EXISTING BigQuery schema (a column this run is about to add cannot be
+    queried yet) and present in SQLite, never the date column itself."""
+    lite = {n for n, _ in sqlite_cols}
+    return [f.name for f in bq_schema
+            if f.name in lite and f.name != date_column
+            and f.field_type.upper() in (_INT | _FLOAT)]
+
+
+def values_differ(a: dict[str, tuple[int, float]] | None,
+                  b: dict[str, tuple[int, float]] | None) -> list[str]:
+    """Columns whose (non-null count, sum) fingerprint differs between the two
+    sides of one day. Non-null counts compare exactly: NULL becoming 0 is a
+    restatement too, and the sum alone cannot see it."""
+    a, b = a or {}, b or {}
+    out = []
+    for col in sorted(set(a) | set(b)):
+        na, sa = a.get(col, (0, 0.0))
+        nb, sb = b.get(col, (0, 0.0))
+        if na != nb or abs(sa - sb) > max(SUM_ABS_TOL, SUM_REL_TOL * max(abs(sa), abs(sb))):
+            out.append(col)
+    return out
+
+
 def plan_days(*, today: str, sqlite_max: str | None, window_days: int, reconcile_days: int,
               bq_max: str | None, sqlite_counts: dict[str, int], bq_counts: dict[str, int],
-              since: str | None = None) -> list[str]:
+              since: str | None = None, sqlite_values: DayValues | None = None,
+              bq_values: DayValues | None = None) -> list[str]:
     """The days to rewrite this run, ascending. Pure so the catch-up logic is testable.
 
     sqlite_counts / bq_counts: per-day row counts over the reconcile range.
+    sqlite_values / bq_values: per-day {column: (non-null count, sum)} over the
+    same range; a day whose counts agree but whose values do not is rewritten too.
     """
     if sqlite_max is None:
         return []
@@ -250,9 +295,11 @@ def plan_days(*, today: str, sqlite_max: str | None, window_days: int, reconcile
         days.add(d.isoformat())
         d += timedelta(days=1)
     recon_start = (t - timedelta(days=reconcile_days)).isoformat()
+    sv, bv = sqlite_values or {}, bq_values or {}
     for day in set(sqlite_counts) | set(bq_counts):
-        if day >= recon_start and day < start.isoformat() \
-                and sqlite_counts.get(day, 0) != bq_counts.get(day, 0):
+        if day >= recon_start and day < start.isoformat() and (
+                sqlite_counts.get(day, 0) != bq_counts.get(day, 0)
+                or values_differ(sv.get(day), bv.get(day))):
             days.add(day)
     return sorted(days)
 
@@ -284,16 +331,47 @@ def sqlite_columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]
     return [(r[1], r[2]) for r in rows]
 
 
+_TYPE_ALIAS = {"INT64": "INTEGER", "FLOAT64": "FLOAT", "BOOL": "BOOLEAN"}
+
+
+def _norm_type(t: str | None) -> str:
+    t = (t or "").upper()
+    return _TYPE_ALIAS.get(t, t)
+
+
+def untyped_guesses(sqlite_cols: list[tuple[str, str]], names, types: dict[str, str]) -> list[str]:
+    """Columns among `names` whose type the mirror had to GUESS: no SQLite
+    declaration (a view's computed column) and no registry override. The guess
+    is STRING, so a metric silently becomes text."""
+    decl = dict(sqlite_cols)
+    return [n for n in names if not (decl.get(n) or "").strip() and n not in types]
+
+
 class Plan:
-    """Column mapping between a SQLite table and its (possibly extended) BigQuery schema."""
+    """Column mapping between a SQLite table and its (possibly extended) BigQuery schema.
+
+    `types` (Mirror.type_map) overrides a column's type: a new column is added
+    with it, and an existing BigQuery column of a different type is RETYPED in
+    the schema the load sends (`retyped`). Only a full-mode WRITE_TRUNCATE load
+    can apply a retype, which the registry enforces."""
 
     def __init__(self, bq_schema: list[bigquery.SchemaField],
-                 sqlite_cols: list[tuple[str, str]]):
+                 sqlite_cols: list[tuple[str, str]], types: dict[str, str] | None = None):
+        types = types or {}
         lite = {n: t for n, t in sqlite_cols}
         bq_names = {f.name for f in bq_schema}
-        self.added = [bigquery.SchemaField(n, infer_bq_type(t)) for n, t in sqlite_cols
-                      if n not in bq_names]
-        self.schema = list(bq_schema) + self.added
+        self.added = [bigquery.SchemaField(n, types.get(n) or infer_bq_type(t))
+                      for n, t in sqlite_cols if n not in bq_names]
+        self.retyped: list[str] = []
+        kept = []
+        for f in bq_schema:
+            want = types.get(f.name)
+            if want and f.name in lite and _norm_type(f.field_type) != _norm_type(want):
+                self.retyped.append(f"{f.name} {f.field_type}->{want}")
+                f = bigquery.SchemaField(f.name, want, mode=f.mode or "NULLABLE",
+                                         description=f.description)
+            kept.append(f)
+        self.schema = kept + self.added
         self.missing_in_sqlite = [f.name for f in self.schema if f.name not in lite]
         # (sqlite column, bq type) in schema order, only columns SQLite has
         self.columns = [(f.name, f.field_type) for f in self.schema if f.name in lite]
@@ -366,7 +444,11 @@ def run_full(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
     if dry_run:
         res.message = f"dry-run: would replace table with {n} rows ({src_n} counted)"
         return res
-    _apply_new_columns(client, table_ref, bq_table, plan, dry_run)
+    if not plan.retyped:
+        # A retype cannot go through update_table (BigQuery refuses a type
+        # change); the WRITE_TRUNCATE load below replaces the whole schema,
+        # new columns included.
+        _apply_new_columns(client, table_ref, bq_table, plan, dry_run)
     job = _load_file(client, path, table_ref, plan.schema, location)
     loaded = int(job.output_rows if job.output_rows is not None else n)
     if loaded != n:
@@ -391,6 +473,36 @@ def _bq_day_counts(client, table_ref: str, m: Mirror, since: str, location: str)
                 f"WHERE {expr} >= @since GROUP BY d",
         [bigquery.ScalarQueryParameter("since", "STRING", since)], location)
     return {r["d"]: int(r["n"]) for r in rows if r["d"]}
+
+
+def _sqlite_day_values(conn, m: Mirror, since: str, cols: list[str]) -> DayValues:
+    if not cols:
+        return {}
+    # TOTAL(), not SUM(): it returns 0.0 for an all-NULL day instead of NULL.
+    sel = ", ".join(f'COUNT("{c}"), TOTAL("{c}")' for c in cols)
+    out: DayValues = {}
+    for row in conn.execute(
+            f"SELECT {date_expr_sqlite(m.column)} d, {sel} FROM {source_sql(m)} "
+            f"WHERE {m.column} >= ? GROUP BY d", (since,)):
+        if row[0]:
+            out[row[0]] = {c: (int(row[1 + 2 * i]), float(row[2 + 2 * i]))
+                           for i, c in enumerate(cols)}
+    return out
+
+
+def _bq_day_values(client, table_ref: str, m: Mirror, since: str, location: str,
+                   cols: list[str]) -> DayValues:
+    if not cols:
+        return {}
+    expr = date_expr_bq(m.column)
+    sel = ", ".join(f"COUNT(`{c}`) AS n{i}, COALESCE(SUM(CAST(`{c}` AS FLOAT64)), 0) AS s{i}"
+                    for i, c in enumerate(cols))
+    rows = _scalar_rows(
+        client, f"SELECT {expr} AS d, {sel} FROM `{table_ref}` "
+                f"WHERE {expr} >= @since GROUP BY d",
+        [bigquery.ScalarQueryParameter("since", "STRING", since)], location)
+    return {r["d"]: {c: (int(r[f"n{i}"]), float(r[f"s{i}"])) for i, c in enumerate(cols)}
+            for r in rows if r["d"]}
 
 
 def run_window(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
@@ -423,12 +535,23 @@ def run_window(client, conn, m: Mirror, bq_table, plan: Plan, table_ref: str,
                          "reconcile-range drift (pass --since for older history)")
     s_counts = _sqlite_day_counts(conn, m, recon_start)
     b_counts = _bq_day_counts(client, table_ref, m, recon_start, location)
+    vcols = sum_columns(bq_table.schema, sqlite_columns(conn, m.table), m.column)
+    s_values = _sqlite_day_values(conn, m, recon_start, vcols)
+    b_values = _bq_day_values(client, table_ref, m, recon_start, location, vcols)
     days = plan_days(today=today, sqlite_max=sqlite_max, window_days=m.window_days,
                      reconcile_days=m.reconcile_days, bq_max=bq_max, sqlite_counts=s_counts,
-                     bq_counts=b_counts, since=since)
+                     bq_counts=b_counts, since=since, sqlite_values=s_values,
+                     bq_values=b_values)
     drift = sorted(d for d in days if s_counts.get(d, 0) != b_counts.get(d, 0))
+    vdrift = {d: values_differ(s_values.get(d), b_values.get(d)) for d in days
+              if d >= recon_start and d not in drift}
+    vdrift = {d: c for d, c in vdrift.items() if c}
     res.notes.append(f"{len(days)} day(s) {days[0]}..{days[-1]}; bq_max={bq_max}; "
                      f"{len(drift)} with count drift before")
+    if vdrift:
+        cols_hit = sorted({c for cs in vdrift.values() for c in cs})
+        res.notes.append(f"{len(vdrift)} day(s) with VALUE drift (restated in SQLite, same "
+                         f"row count) {min(vdrift)}..{max(vdrift)}: {', '.join(cols_hit[:6])}")
 
     cols = ", ".join(c for c, _ in plan.columns)
     per_day: dict[str, int] = {}
@@ -513,8 +636,11 @@ def _replace_days_transaction(client, table_ref, m: Mirror, plan: Plan, days, fi
 def create_from_sqlite(client, conn, m: Mirror, table_ref: str) -> bigquery.Table:
     """Create a missing BigQuery table from the SQLite schema (same type mapping
     as a column SQLite gains later: TEXT->STRING, INTEGER->INTEGER, REAL->FLOAT).
-    Unpartitioned, so a window mirror uses the one-transaction day replace."""
-    schema = [bigquery.SchemaField(n, infer_bq_type(t)) for n, t in sqlite_columns(conn, m.table)]
+    Unpartitioned, so a window mirror uses the one-transaction day replace.
+    Registry type overrides win over the inferred type."""
+    types = m.type_map
+    schema = [bigquery.SchemaField(n, types.get(n) or infer_bq_type(t))
+              for n, t in sqlite_columns(conn, m.table)]
     return client.create_table(bigquery.Table(table_ref, schema=schema), exists_ok=True)
 
 
@@ -536,7 +662,10 @@ def mirror_one(client, conn, m: Mirror, project: str, dataset: str, location: st
                 return res
             bq_table = create_from_sqlite(client, conn, m, table_ref)
             created = True
-        plan = Plan(bq_table.schema, sqlite_columns(conn, m.table))
+        sqlite_cols = sqlite_columns(conn, m.table)
+        plan = Plan(bq_table.schema, sqlite_cols, m.type_map)
+        if plan.retyped and m.mode != "full":   # the registry refuses this too
+            raise MirrorError(f"{m.table}: cannot retype {plan.retyped} outside full mode")
         with tempfile.TemporaryDirectory(prefix="bq_mirror_") as td:
             tmp = Path(td)
             if m.mode == "full":
@@ -548,6 +677,18 @@ def mirror_one(client, conn, m: Mirror, project: str, dataset: str, location: st
             res.notes.append("created the BigQuery table from the SQLite schema")
         if plan.added:
             res.notes.append("added BQ column(s): " + ", ".join(f.name for f in plan.added))
+        if plan.retyped and not dry_run:
+            res.notes.append("retyped BQ column(s): " + ", ".join(plan.retyped))
+        # A type the mirror had to guess this run (table created, or column
+        # added) is degraded, not ok: the guess is STRING, and a metric stored
+        # as text looks present while being unusable. Declare it in `types`.
+        decided = [n for n, _ in sqlite_cols] if created else [f.name for f in plan.added]
+        guessed = untyped_guesses(sqlite_cols, decided, m.type_map)
+        if guessed:
+            res.notes.append("UNTYPED in SQLite, guessed STRING (declare in the registry "
+                             "`types`): " + ", ".join(guessed))
+            if res.status == "ok":
+                res.status = "degraded"
         if plan.missing_in_sqlite:
             res.notes.append("NULL (not in SQLite): " + ", ".join(plan.missing_in_sqlite))
     except Exception as exc:  # noqa: BLE001 -- one table must never stop the rest

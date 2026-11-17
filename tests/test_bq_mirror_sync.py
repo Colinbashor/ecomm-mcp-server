@@ -72,13 +72,28 @@ class MirrorClient(FakeBigQueryClient):
         self.queries.append(sql)
         params = {p.name: p.values if hasattr(p, "values") else p.value
                   for p in (getattr(job_config, "query_parameters", None) or [])}
-        table = re.search(r"`([^`]+)`", sql).group(1)
+        # the table is the FROM target (a value query backticks its columns first)
+        table = (re.search(r"FROM `([^`]+)`", sql) or re.search(r"`([^`]+)`", sql)).group(1)
         col = self.date_col.get(table, "date")
         if sql.lstrip().startswith("BEGIN TRANSACTION"):
             return self._transaction(sql, table, col, params)
         if "MAX(" in sql:
             days = [str(r[col])[:10] for r in self.rows_in(table) if r.get(col)]
             return _Rows([{"d": max(days) if days else None}])
+        if "GROUP BY d" in sql and "AS s0" in sql:      # per-day value fingerprint
+            cols = re.findall(r"COUNT\(`([^`]+)`\) AS n\d+", sql)
+            out: dict[str, dict] = {}
+            for r in self.rows_in(table):
+                d = str(r[col])[:10]
+                if d < params["since"]:
+                    continue
+                acc = out.setdefault(d, {"d": d, **{f"n{i}": 0 for i in range(len(cols))},
+                                         **{f"s{i}": 0.0 for i in range(len(cols))}})
+                for i, c in enumerate(cols):
+                    if r.get(c) is not None:
+                        acc[f"n{i}"] += 1
+                        acc[f"s{i}"] += float(r[c])
+            return _Rows(list(out.values()))
         if "GROUP BY d" in sql:
             counts: dict[str, int] = {}
             for r in self.rows_in(table):
@@ -512,6 +527,181 @@ def test_window_detects_a_post_load_count_mismatch():
 
     client._transaction = drop_one
     assert run_one(client, conn, WINDOW).status == "error"
+
+
+# ------------------------------------------- value drift (restatement, same count)
+# A connector that re-pulls history can restate a day's amounts without adding
+# or removing a row. A count-only reconcile never re-copies that day, so the
+# BigQuery copy keeps the old figures indefinitely.
+def test_values_differ_ignores_float_noise_and_flags_real_change():
+    assert ms.values_differ({"total": (3, 100.0)}, {"total": (3, 100.0 + 1e-9)}) == []
+    assert ms.values_differ({"total": (3, 100.0)}, {"total": (3, 101.25)}) == ["total"]
+    assert ms.values_differ({"total": (3, 0.0)}, {"total": (2, 0.0)}) == ["total"]  # NULL -> 0
+    assert ms.values_differ({"total": (1, 2.0)}, None) == ["total"]
+    assert ms.values_differ(None, None) == []
+
+
+def test_sum_columns_only_existing_numeric_bq_columns_not_the_date():
+    schema = [SF("order_id", "STRING"), SF("order_date", "STRING"), SF("total", "FLOAT"),
+              SF("qty", "INT64"), SF("dropped", "FLOAT")]
+    lite = [("order_id", "TEXT"), ("order_date", "TEXT"), ("total", "REAL"), ("qty", "INTEGER"),
+            ("platform_discount", "REAL")]      # not in BigQuery yet: cannot be queried there
+    assert ms.sum_columns(schema, lite, "order_date") == ["total", "qty"]
+    assert ms.sum_columns([SF("n", "INTEGER")], [("n", "INTEGER")], "n") == []
+
+
+def test_plan_adds_a_value_drift_day_inside_the_reconcile_range_only():
+    counts = {"2026-10-01": 2, "2026-09-01": 2}
+    vals_s = {"2026-10-01": {"total": (2, 50.0)}, "2026-09-01": {"total": (2, 50.0)}}
+    vals_b = {"2026-10-01": {"total": (2, 40.0)}, "2026-09-01": {"total": (2, 40.0)}}
+    days = plan(sqlite_counts=counts, bq_counts=counts, sqlite_values=vals_s, bq_values=vals_b)
+    assert "2026-10-01" in days            # restated inside reconcile_days
+    assert "2026-09-01" not in days        # older than the range: needs --since
+    assert "2026-10-01" not in plan(sqlite_counts=counts, bq_counts=counts)   # counts alone agree
+
+
+def test_window_rewrites_an_old_day_restated_with_the_same_row_count():
+    conn, client = make_sqlite(), MirrorClient()
+    conn.executemany("INSERT INTO snap (sku, snapshot_date, n) VALUES (?,?,?)",
+                     [("SKU-1001", "2026-10-01", 5), ("SKU-1002", "2026-10-01", 7),
+                      ("SKU-1001", "2026-10-02", 3),
+                      ("SKU-1001", "2026-10-08", 1)])
+    ref = _partitioned_snap(client, {
+        "2026-10-01": [{"sku": "SKU-1001", "snapshot_date": "2026-10-01", "n": 1},   # stale value
+                       {"sku": "SKU-1002", "snapshot_date": "2026-10-01", "n": 7}],
+        "2026-10-02": [{"sku": "SKU-1001", "snapshot_date": "2026-10-02", "n": 3}],  # identical
+        "2026-10-08": [{"sku": "SKU-1001", "snapshot_date": "2026-10-08", "n": 1}],
+    })
+    m = reg.Mirror("snap", "window", column="snapshot_date", window_days=3, reconcile_days=30)
+    res = run_one(client, conn, m)
+    assert res.status == "ok", res.message
+    assert "2026-10-01" in client.partitions_written(ref)
+    assert "2026-10-02" not in client.partitions_written(ref)      # unchanged: no needless load
+    assert sorted(r["n"] for r in client.partition_rows(ref, "2026-10-01")) == [5, 7]
+    assert any("VALUE drift" in n and "2026-10-01" in n for n in res.notes)
+
+
+def test_value_fingerprint_respects_the_where_filter():
+    # Same reason as the counts: a filtered-out row must not read as drift.
+    conn = make_sqlite()
+    conn.executemany("INSERT INTO snap (sku, snapshot_date, n) VALUES (?,?,?)",
+                     [("SKU-1001", "2026-10-06", 1), ("SKU-1002", "2026-10-06", 9),
+                      ("SKU-1003", "2026-10-07", None)])
+    m = reg.Mirror("snap", "window", column="snapshot_date", where="n < 5 OR n IS NULL")
+    assert ms._sqlite_day_values(conn, m, "2026-10-01", ["n"]) == {
+        "2026-10-06": {"n": (1, 1.0)}, "2026-10-07": {"n": (0, 0.0)}}
+    assert ms._sqlite_day_values(conn, m, "2026-10-01", []) == {}
+
+
+# ------------------------------------------- registry type overrides (views)
+# A SQLite VIEW's computed columns declare no type, so without an override the
+# mirror can only guess STRING and every metric lands in BigQuery as text.
+class SchemaCapturingClient(NotFoundClient):
+    def __init__(self):
+        super().__init__()
+        self.load_schemas: list[list[tuple[str, str]]] = []
+
+    def load_table_from_file(self, fh, destination, job_config=None, location=None, **kw):
+        self.load_schemas.append([(f.name, f.field_type) for f in job_config.schema])
+        return super().load_table_from_file(fh, destination, job_config=job_config,
+                                            location=location, **kw)
+
+
+def make_view_sqlite():
+    conn = make_sqlite()
+    conn.execute("CREATE VIEW daily_totals AS SELECT order_id AS ref,"
+                 " substr(order_date, 1, 10) AS day, SUM(total) AS revenue, SUM(qty) AS units"
+                 " FROM orders GROUP BY 1, 2")
+    conn.execute("INSERT INTO orders (order_id, order_date, total, qty, platform_discount)"
+                 " VALUES ('ORD-1001', '2026-10-05', 12.5, 3, 0)")
+    return conn
+
+
+VIEW_TYPES = (("day", "STRING"), ("revenue", "FLOAT"), ("units", "INTEGER"))
+VIEW_REF = f"{PROJECT}.{DATASET}.daily_totals"
+
+
+def test_untyped_view_columns_are_what_the_mirror_would_guess():
+    conn = make_view_sqlite()
+    cols = ms.sqlite_columns(conn, "daily_totals")
+    names = [n for n, _ in cols]
+    assert ms.untyped_guesses(cols, names, {}) == ["day", "revenue", "units"]
+    assert ms.untyped_guesses(cols, names, dict(VIEW_TYPES)) == []
+
+
+def test_view_created_with_overrides_is_typed_and_ok():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    res = run_one(client, conn, reg.Mirror("daily_totals", create_if_missing=True,
+                                           types=VIEW_TYPES))
+    assert res.status == "ok", (res.message, res.notes)
+    assert [(f.name, f.field_type) for f in client.tables[VIEW_REF].schema] == [
+        ("ref", "STRING"), ("day", "STRING"), ("revenue", "FLOAT"), ("units", "INTEGER")]
+    row = client.rows_in(VIEW_REF)[0]
+    assert row["revenue"] == 12.5 and row["units"] == 3
+
+
+def test_view_created_without_overrides_is_degraded_not_ok():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    res = run_one(client, conn, reg.Mirror("daily_totals", create_if_missing=True))
+    assert res.status == "degraded"
+    assert any("UNTYPED" in n and "revenue" in n for n in res.notes)
+
+
+def test_a_typed_table_created_from_sqlite_is_not_flagged_as_guessed():
+    conn, client = make_sqlite(), NotFoundClient()
+    conn.execute("INSERT INTO orders (order_id, order_date, total, qty, platform_discount)"
+                 " VALUES ('ORD-1001', '2026-10-08', 1.5, 2, 0.25)")
+    res = run_one(client, conn, reg.Mirror("orders", create_if_missing=True))
+    assert res.status == "ok" and not any("UNTYPED" in n for n in res.notes)
+
+
+def test_existing_string_columns_are_retyped_by_the_truncate_load():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    client.seed_table(VIEW_REF, [SF("ref", "STRING"), SF("day", "STRING"),
+                                 SF("revenue", "STRING"), SF("units", "STRING")])
+    res = run_one(client, conn, reg.Mirror("daily_totals", types=VIEW_TYPES))
+    assert res.status == "ok", (res.message, res.notes)
+    assert client.load_schemas[-1] == [("ref", "STRING"), ("day", "STRING"),
+                                       ("revenue", "FLOAT"), ("units", "INTEGER")]
+    assert client.updated == []        # never update_table: BigQuery refuses a type change
+    assert any("revenue STRING->FLOAT" in n for n in res.notes)
+    row = client.rows_in(VIEW_REF)[0]
+    assert row["revenue"] == 12.5 and row["units"] == 3      # numbers, not "12.5"
+
+
+def test_already_typed_table_is_not_retyped():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    client.seed_table(VIEW_REF, [SF("ref", "STRING"), SF("day", "STRING"),
+                                 SF("revenue", "FLOAT64"), SF("units", "INT64")])
+    res = run_one(client, conn, reg.Mirror("daily_totals", types=VIEW_TYPES))
+    assert res.status == "ok" and not any("retyped" in n for n in res.notes)
+
+
+def test_retype_plus_new_column_goes_through_the_load_not_update_table():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    client.seed_table(VIEW_REF, [SF("ref", "STRING"), SF("day", "STRING"),
+                                 SF("revenue", "STRING")])          # units missing
+    res = run_one(client, conn, reg.Mirror("daily_totals", types=VIEW_TYPES))
+    assert res.status == "ok", (res.message, res.notes)
+    assert client.updated == []
+    assert client.load_schemas[-1][-2:] == [("revenue", "FLOAT"), ("units", "INTEGER")]
+
+
+def test_retype_dry_run_writes_nothing_and_reports_no_retype():
+    conn, client = make_view_sqlite(), SchemaCapturingClient()
+    client.seed_table(VIEW_REF, [SF("ref", "STRING"), SF("day", "STRING"),
+                                 SF("revenue", "STRING"), SF("units", "STRING")])
+    res = run_one(client, conn, reg.Mirror("daily_totals", types=VIEW_TYPES), dry_run=True)
+    assert not client.loads and not client.updated
+    assert not any("retyped" in n for n in res.notes)
+
+
+def test_type_overrides_need_full_mode_and_known_types():
+    with pytest.raises(ValueError, match="full mode"):
+        reg.Mirror("orders", "window", column="order_date", types=(("total", "FLOAT"),))
+    with pytest.raises(ValueError, match="unsupported"):
+        reg.Mirror("orders", types=(("total", "NUMBERISH"),))
+    assert reg.Mirror("orders", types=(("total", "FLOAT"),)).type_map == {"total": "FLOAT"}
 
 
 # ------------------------------------------------------------------- driver

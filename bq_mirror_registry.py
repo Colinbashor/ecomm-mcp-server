@@ -22,6 +22,9 @@ TWO MODES (see bq_mirror_sync.py for the mechanics)
           too big to resend nightly (an `orders` table with millions of lines).
           `column` is the date column; SQLite holds it as TEXT starting
           YYYY-MM-DD, so every comparison uses the first 10 characters.
+          Inside `reconcile_days` a day is also rewritten when its row count
+          agrees but its VALUES do not (a connector that re-pulls history can
+          restate every amount without adding or removing a row).
 
           Tip: set `reconcile_days` to span a table's whole history (e.g. 1200)
           when its connector re-pulls a long trailing window. The first load,
@@ -36,6 +39,9 @@ ONE WRITER PER TABLE
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+# The BigQuery types bq_mirror_sync.convert() knows how to produce (Mirror.types).
+OVERRIDE_TYPES = ("STRING", "INTEGER", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP")
 
 
 @dataclass(frozen=True)
@@ -60,12 +66,35 @@ class Mirror:
     #                " WHERE is_complete = 0)")
     # The predicate is trusted SQL from this file, never user input.
     where: str | None = None
+    # (column, BigQuery type) pairs that OVERRIDE the type inferred from the
+    # SQLite declaration. Needed when you mirror a SQLite VIEW: a view column
+    # computed by an expression (SUM(...), CASE ...) has NO declared type, so
+    # the inferred type is STRING and every metric lands in BigQuery as text --
+    # it still answers queries, it just cannot be summed. Declare EVERY untyped
+    # column, the STRING ones too: the mirror reports a column whose type it
+    # had to guess as `degraded`. Full mode only -- a column type can only
+    # change through the whole-table WRITE_TRUNCATE load, which replaces the
+    # BigQuery schema. Example:
+    #   Mirror("weekly_sales_summary", create_if_missing=True, types=(
+    #       ("week_start", "STRING"), ("units", "INTEGER"), ("net_sales", "FLOAT")))
+    types: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
         if self.mode not in ("full", "window"):
             raise ValueError(f"{self.table}: unknown mode {self.mode!r}")
         if self.mode == "window" and not self.column:
             raise ValueError(f"{self.table}: window mode needs a date column")
+        if self.types and self.mode != "full":
+            raise ValueError(f"{self.table}: type overrides need full mode "
+                             "(only a whole-table WRITE_TRUNCATE can change a column type)")
+        bad = [t for _, t in self.types if t not in OVERRIDE_TYPES]
+        if bad:
+            raise ValueError(f"{self.table}: unsupported override type(s) {bad}; "
+                             f"use one of {', '.join(OVERRIDE_TYPES)}")
+
+    @property
+    def type_map(self) -> dict[str, str]:
+        return dict(self.types)
 
 
 def _full(*names: str, empty_ok: tuple[str, ...] = (), create: bool = False) -> list[Mirror]:
