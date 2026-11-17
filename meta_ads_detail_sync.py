@@ -438,7 +438,8 @@ def run(start: str, end: str, only: str | None = None,
         # allows one writer and the nightly pipeline would starve behind it.
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO meta_ad_daily VALUES "
+                "INSERT OR REPLACE INTO meta_ad_daily "
+                "(account_id, date, ad_id, ad_name, adset_id, adset_name, campaign_id, campaign_name, impressions, clicks, link_clicks, spend, add_to_carts, checkouts, purchases, revenue, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [r + (stamp,) for r in rows])
         stats["insight_rows"] += len(rows)
@@ -470,7 +471,8 @@ def run(start: str, end: str, only: str | None = None,
         crows = fetch_creatives(targets)
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO meta_ad_creatives VALUES "
+                "INSERT OR REPLACE INTO meta_ad_creatives "
+                "(ad_id, ad_name, campaign_id, adset_id, status, creative_id, creative_name, video_id, story_video_id, video_id_any, instagram_media_id, thumbnail_url, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?)", crows)
         stats["creatives"] = len(crows)
 

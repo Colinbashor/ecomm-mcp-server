@@ -220,7 +220,7 @@ def _record_coverage(conn: sqlite3.Connection, week_start: str, asins: list[str]
                      status: str, stamp: str) -> None:
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_sqp_coverage VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO amazon_sqp_coverage (week_start, asin, status, attempted_at) VALUES (?,?,?,?)",
             [(week_start, a, status, stamp) for a in asins],
         )
 
@@ -231,7 +231,8 @@ def _store_batch(conn: sqlite3.Connection, week_start: str, batch: list[str],
     rows = _rows_from_report(records, week_start, stamp)
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_sqp VALUES "
+            "INSERT OR REPLACE INTO amazon_sqp "
+            "(week_start, asin, search_query, query_score, query_volume, impressions_total, impressions_asin, impression_share, clicks_total, clicks_asin, click_share, median_click_price_total, median_click_price_asin, cart_adds_total, cart_adds_asin, cart_add_share, purchases_total, purchases_asin, purchase_share, synced_at) VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     _record_coverage(conn, week_start, batch, "done", stamp)
     return len(rows)

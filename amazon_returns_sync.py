@@ -90,7 +90,7 @@ def parse_returns(conn: sqlite3.Connection, text: str, stamp: str) -> int:
             stamp,
         ))
     conn.executemany(
-        "INSERT OR REPLACE INTO amazon_returns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", out)
+        "INSERT OR REPLACE INTO amazon_returns (return_date, order_id, sku, asin, fnsku, product_name, quantity, fulfillment_center, disposition, reason, status, license_plate_number, customer_comments, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", out)
     return len(out)
 
 

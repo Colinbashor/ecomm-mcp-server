@@ -604,11 +604,13 @@ def _flush(conn: sqlite3.Connection, order_rows: list[tuple], pkg_rows: list[tup
     with conn:
         if order_rows:
             conn.executemany(
-                "INSERT OR REPLACE INTO flexport_order_costs VALUES "
+                "INSERT OR REPLACE INTO flexport_order_costs "
+                "(order_id, external_order_id, cost, currency, internal_status, fulfillment_status, created_at, shipped_at, delivered_at, units, n_shipments, n_packages, total_weight_oz, carriers, shipping_methods, is_international, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", order_rows)
         if pkg_rows:
             conn.executemany(
-                "INSERT OR REPLACE INTO flexport_order_packages VALUES "
+                "INSERT OR REPLACE INTO flexport_order_packages "
+                "(order_id, shipment_id, package_id, warehouse_id, carrier, shipping_method, tracking_code, weight_oz, length_in, width_in, height_in, logistics_skus, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?)", pkg_rows)
 
 

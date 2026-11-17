@@ -111,7 +111,7 @@ def main():
 
     print(f"Found {len(periods)} period folders to process")
 
-    conn = sqlite3.connect(fsi.DB_PATH)
+    conn = sqlite3.connect(fsi.DB_PATH, timeout=fsi.BUSY_TIMEOUT_SECONDS)
     conn.execute(fsi.DDL)
     conn.commit()
 

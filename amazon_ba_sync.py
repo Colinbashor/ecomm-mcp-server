@@ -304,7 +304,7 @@ def sync_search_catalog(conn, ba_sunday: date, stamp: str, our_asins: set[str]) 
         ))
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_ba_search_catalog VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", out)
+            "INSERT OR REPLACE INTO amazon_ba_search_catalog (week_start, asin, impressions, impression_median_price, clicks, click_rate_pct, click_median_price, cart_adds, purchases, search_sales, conversion_rate_pct, purchase_median_price, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", out)
     print(f"    ba_search_catalog {week}: {len(out)} ASIN rows", flush=True)
     return len(out)
 
@@ -390,7 +390,7 @@ def sync_search_terms(conn, ba_sunday: date, stamp: str, our_asins: set[str]) ->
     with conn:
         conn.execute("DELETE FROM amazon_ba_search_terms WHERE week_start=?", (week,))
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_ba_search_terms VALUES (?,?,?,?,?,?,?,?,?,?,?)", out)
+            "INSERT OR REPLACE INTO amazon_ba_search_terms (week_start, department, search_term, search_frequency_rank, clicked_asin, clicked_item_name, click_share_rank, click_share_pct, conversion_share_pct, match_reason, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", out)
     kept_terms = len({(o[1], o[2]) for o in out})
     print(f"    ba_search_terms {week}: kept {len(out)} rows ({kept_terms} terms)", flush=True)
     if topic_kept:
@@ -423,7 +423,7 @@ def sync_market_basket(conn, ba_sunday: date, stamp: str, our_asins: set[str]) -
         ))
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_ba_market_basket VALUES (?,?,?,?,?,?,?)", out)
+            "INSERT OR REPLACE INTO amazon_ba_market_basket (week_start, asin, purchased_with_asin, purchased_with_rank, combination_pct, is_ours, synced_at) VALUES (?,?,?,?,?,?,?)", out)
     print(f"    ba_market_basket {week}: {len(out)} pairs", flush=True)
     return len(out)
 
@@ -450,7 +450,7 @@ def sync_repeat_purchase(conn, month_start: date, month_end: date, stamp: str) -
         ))
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO amazon_ba_repeat_purchase VALUES (?,?,?,?,?,?,?,?,?,?)", out)
+            "INSERT OR REPLACE INTO amazon_ba_repeat_purchase (period_start, period_end, period_type, asin, orders, unique_customers, repeat_customers_pct, repeat_revenue, repeat_revenue_pct, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?)", out)
     print(f"    ba_repeat {month_start}..{month_end}: {len(out)} ASIN rows", flush=True)
     return len(out)
 

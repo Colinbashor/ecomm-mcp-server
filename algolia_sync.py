@@ -533,7 +533,7 @@ def store_placement(conn: sqlite3.Connection, handles: list[str], stamp: str) ->
                 (snapshot_date, handle),
             )
             conn.executemany(
-                "INSERT INTO collection_placement VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO collection_placement (snapshot_date, collection, position, object_id, product_id, sku, handle, title, vendor, price, compare_at_price, inventory_available, published_at, collection_size, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
         total += len(rows)
@@ -645,7 +645,7 @@ def store_positions(conn: sqlite3.Connection, days: list[dt.date], stamp: str) -
             rows.append((day.isoformat(), lo, hi, entry.get("clickCount"), stamp))
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO algolia_click_positions VALUES (?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO algolia_click_positions (date, position_from, position_to, click_count, synced_at) VALUES (?,?,?,?,?)", rows)
         total += len(rows)
     print(f"    click positions: {total} buckets over {len(days)} day(s)", flush=True)
     return total
@@ -700,7 +700,7 @@ def store_searches(conn: sqlite3.Connection, days: list[dt.date], stamp: str) ->
         ]
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO algolia_searches VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO algolia_searches (date, query, search_count, nb_hits, click_through_rate, average_click_position, conversion_rate, click_count, conversion_count, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
         total += len(rows)
         note = f" (CAPPED at {SEARCH_QUERY_CAP})" if len(collected) >= SEARCH_QUERY_CAP else ""
         print(f"    {day}: {len(rows)} distinct queries{note}", flush=True)
@@ -752,7 +752,7 @@ def store_daily(conn: sqlite3.Connection, start: dt.date, end: dt.date, stamp: s
         ))
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO algolia_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "INSERT OR REPLACE INTO algolia_daily (date, search_count, user_count, tracked_search_count, click_count, click_through_rate, average_click_position, add_to_cart_count, add_to_cart_rate, purchase_count, purchase_rate, no_result_count, no_result_rate, no_click_count, no_click_rate, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     print(f"    daily series: {len(rows)} day(s)", flush=True)
     return len(rows)
 

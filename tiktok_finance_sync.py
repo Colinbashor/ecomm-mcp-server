@@ -409,7 +409,7 @@ def sync(days: int, *, with_components: bool = True, with_orders: bool = True) -
     with conn:
         for s in statements:
             conn.execute(
-                "INSERT OR REPLACE INTO tiktok_settlements VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO tiktok_settlements (id, statement_time, payment_time, payment_status, currency, revenue_amount, net_sales_amount, fee_amount, shipping_cost_amount, adjustment_amount, settlement_amount, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(s.get("id")), _ts(s.get("statement_time")), _ts(s.get("payment_time")),
                  s.get("payment_status"), s.get("currency"),
                  float(s.get("revenue_amount") or 0), float(s.get("net_sales_amount") or 0),
@@ -431,7 +431,8 @@ def sync(days: int, *, with_components: bool = True, with_orders: bool = True) -
             if order_rows and with_orders:
                 with conn:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO tiktok_settlement_orders VALUES ("
+                        "INSERT OR REPLACE INTO tiktok_settlement_orders "
+                        "(statement_id, order_id, order_create_time, currency, revenue_amount, net_sales_amount, gross_sales_amount, customer_refund_amount, fee_amount, referral_fee_amount, affiliate_commission_amount, affiliate_ads_commission_amount, affiliate_partner_commission_amount, actual_return_shipping_fee_amount, refund_administration_fee_amount, shipping_fee_amount, retail_delivery_fee_amount, fbm_shipping_cost_amount, fbt_fulfillment_fee_amount, sales_tax_amount, seller_discount_amount, platform_discount_amount, synced_at) VALUES ("
                         + ",".join("?" * (4 + len(ORDER_FIELDS) + 1)) + ")",
                         [(*r, stamp) for r in order_rows])
                 n_orders += len(order_rows)
@@ -442,7 +443,7 @@ def sync(days: int, *, with_components: bool = True, with_orders: bool = True) -
                     is_fee = 1 if field in FEE_FIELDS else 0
                     label = FEE_FIELDS.get(field) or CONTEXT_FIELDS.get(field) or field
                     conn.execute(
-                        "INSERT OR REPLACE INTO tiktok_settlement_components VALUES (?,?,?,?,?,?)",
+                        "INSERT OR REPLACE INTO tiktok_settlement_components (statement_id, field, label, is_fee, amount, synced_at) VALUES (?,?,?,?,?,?)",
                         (sid, field, label, is_fee, amount, stamp))
                     n_components += 1
 

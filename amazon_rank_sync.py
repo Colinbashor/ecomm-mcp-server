@@ -179,7 +179,7 @@ def write_rows(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     if not rows:
         return 0
     with conn:
-        conn.executemany("INSERT OR REPLACE INTO amazon_sales_rank VALUES (?,?,?,?,?,?,?)", rows)
+        conn.executemany("INSERT OR REPLACE INTO amazon_sales_rank (snapshot_date, asin, display_rank, display_title, category_rank, category_title, synced_at) VALUES (?,?,?,?,?,?,?)", rows)
     return len(rows)
 
 

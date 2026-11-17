@@ -56,6 +56,8 @@ from datetime import datetime, date
 
 import openpyxl
 
+from warehouse.db import BUSY_TIMEOUT_SECONDS
+
 try:
     import xlrd
 except ImportError:
@@ -584,7 +586,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     stats = process_folder(args.folder, conn, snapshot_date=args.snapshot_date, dry_run=args.dry_run)
     print(f"\nTotal rows parsed: {stats['n_rows']}")
     print(f"Distinct style_no: {stats['n_distinct_styles']}")

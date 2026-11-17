@@ -497,11 +497,11 @@ def _waitlist_rows(w: dict, snapshot: str, stamp: str) -> tuple[tuple, list[tupl
     return wl_row, inv_rows
 
 
-_PREORDER_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorders VALUES ({','.join('?' * 26)})"""
-_LINE_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorder_lines VALUES ({','.join('?' * 21)})"""
-_EXPORT_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorder_exports VALUES ({','.join('?' * 8)})"""
-_WAITLIST_SQL = f"""INSERT OR REPLACE INTO purple_dot_waitlists VALUES ({','.join('?' * 15)})"""
-_WLINV_SQL = f"""INSERT OR REPLACE INTO purple_dot_waitlist_inventory VALUES ({','.join('?' * 9)})"""
+_PREORDER_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorders (id, order_number, reference, created_at, placed_at, cancelled_at, cancel_reason, currency, customer_external_id, subtotal_price, total_discounts, total_tax, total_price, total_refunded, tax_included, discount_codes, ship_city, ship_province, ship_country, n_lines, n_units, shopify_order_id, shopify_order_number, exported_at, n_exported, synced_at) VALUES ({','.join('?' * 26)})"""
+_LINE_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorder_lines (preorder_id, line_id, line_no, sku, product_id, variant_id, name, quantity, unit_price, unit_total, price, total_discount, total, taxable, earliest_ship_date, latest_ship_date, waitlist_id, cancelled, cancelled_at, shopify_line_item_id, synced_at) VALUES ({','.join('?' * 21)})"""
+_EXPORT_SQL = f"""INSERT OR REPLACE INTO purple_dot_preorder_exports (preorder_id, shopify_order_id, export_no, shopify_order_number, export_type, exported_at, n_lines, synced_at) VALUES ({','.join('?' * 8)})"""
+_WAITLIST_SQL = f"""INSERT OR REPLACE INTO purple_dot_waitlists (id, created_at, updated_at, state, earliest_ship_date, latest_ship_date, launch_date, scheduled_pause_date, labels, product_id, buy_size, committed, available, n_variants, synced_at) VALUES ({','.join('?' * 15)})"""
+_WLINV_SQL = f"""INSERT OR REPLACE INTO purple_dot_waitlist_inventory (snapshot_date, waitlist_id, variant_id, sku, state, buy_size, committed, available, synced_at) VALUES ({','.join('?' * 9)})"""
 
 
 # ---- paging ---------------------------------------------------------------

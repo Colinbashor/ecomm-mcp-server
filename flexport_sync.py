@@ -196,7 +196,7 @@ def _commit_page(conn: sqlite3.Connection, rows: list[tuple], offset: int) -> No
             with conn:
                 conn.executemany(_PRODUCT_INSERT, rows)
                 conn.execute(
-                    "INSERT OR REPLACE INTO flexport_catalog_sync_state VALUES (?, ?)",
+                    "INSERT OR REPLACE INTO flexport_catalog_sync_state (key, value) VALUES (?, ?)",
                     (CATALOG_OFFSET_KEY, str(offset)))
             return
         except sqlite3.OperationalError as e:
@@ -265,7 +265,7 @@ def sync_inventory(conn: sqlite3.Connection, stamp: str, today: str) -> tuple[in
     ) for i in inventory]
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO flexport_inventory VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO flexport_inventory (snapshot_date, logistics_sku, merchant_sku, available, on_hand, unavailable, units_per_pack, synced_at) VALUES (?,?,?,?,?,?,?,?)",
             inv_rows)
     return len(inv_rows), len(gap_rows)
 

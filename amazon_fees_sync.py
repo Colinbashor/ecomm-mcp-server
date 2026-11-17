@@ -325,7 +325,7 @@ def parse_fee_preview(conn, text, stamp, snapshot_date, **_):
             _num(_pick(d, "expected-fulfillment-fee-per-unit")),
             _pick(d, "currency") or "USD", stamp,
         ))
-    conn.executemany("INSERT OR REPLACE INTO amazon_fee_preview VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", out)
+    conn.executemany("INSERT OR REPLACE INTO amazon_fee_preview (snapshot_date, sku, fnsku, asin, product_name, your_price, sales_price, estimated_fee_total, estimated_referral_fee_per_unit, expected_fulfillment_fee_per_unit, currency, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", out)
     return len(out)
 
 
@@ -343,7 +343,7 @@ def parse_storage(conn, text, stamp, **_):
             _num(_pick(d, "estimated_monthly_storage_fee", "estimated-monthly-storage-fee")),
             _pick(d, "currency") or "USD", stamp,
         ))
-    conn.executemany("INSERT OR REPLACE INTO amazon_fba_storage_fees VALUES (?,?,?,?,?,?,?,?,?)", out)
+    conn.executemany("INSERT OR REPLACE INTO amazon_fba_storage_fees (month_of_charge, fnsku, fulfillment_center, asin, product_name, avg_qty_on_hand, estimated_monthly_storage_fee, currency, synced_at) VALUES (?,?,?,?,?,?,?,?,?)", out)
     return len(out)
 
 
@@ -361,7 +361,7 @@ def parse_reimbursements(conn, text, stamp, **_):
             _int(_pick(d, "quantity-reimbursed-total")),
             _pick(d, "currency-unit", "currency") or "USD", stamp,
         ))
-    conn.executemany("INSERT OR REPLACE INTO amazon_fba_reimbursements VALUES (?,?,?,?,?,?,?,?,?,?,?)", out)
+    conn.executemany("INSERT OR REPLACE INTO amazon_fba_reimbursements (reimbursement_id, sku, amazon_order_id, approval_date, reason, fnsku, asin, amount_total, quantity_total, currency, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", out)
     return len(out)
 
 
@@ -378,7 +378,7 @@ def parse_promotions(conn, text, stamp, **_):
             _num(_pick(d, "item-promotion-discount")),
             _pick(d, "currency") or "USD", stamp,
         ))
-    conn.executemany("INSERT OR REPLACE INTO amazon_fba_promotions VALUES (?,?,?,?,?,?,?,?,?)", out)
+    conn.executemany("INSERT OR REPLACE INTO amazon_fba_promotions (shipment_item_id, item_promotion_id, shipment_date, amazon_order_id, shipment_id, description, item_promotion_discount, currency, synced_at) VALUES (?,?,?,?,?,?,?,?,?)", out)
     return len(out)
 
 

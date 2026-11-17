@@ -190,7 +190,7 @@ def main() -> None:
             continue
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO amazon_voc VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO amazon_voc (snapshot_date, sku, asin, product_name, cx_health, ncx_rate, ncx_orders, total_orders, top_ncx_reason, synced_at) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
         grand += len(rows)
 
     conn.close()

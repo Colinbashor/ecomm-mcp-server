@@ -274,10 +274,12 @@ def upsert_page(conn: sqlite3.Connection, recs: list[dict], stamp: str) -> tuple
             srow, lrows = rows_for_shipment(rec, stamp)
             conn.execute("DELETE FROM flexport_inbound_lines WHERE inbound_id = ?", (rec.get("id"),))
             conn.execute(
-                "INSERT OR REPLACE INTO flexport_inbounds VALUES "
+                "INSERT OR REPLACE INTO flexport_inbounds "
+                "(id, receiving_id, status, shipping_plan_id, shipping_plan_external_id, shipping_plan_name, shipping_option, shipment_destination, booking_id, ship_from_name, ship_from_country, ship_to_name, arrived_at, completed_at, n_lines, n_packages, expected_units, sellable_units, damaged_units, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", srow)
             conn.executemany(
-                "INSERT OR REPLACE INTO flexport_inbound_lines VALUES "
+                "INSERT OR REPLACE INTO flexport_inbound_lines "
+                "(inbound_id, shipment_item_id, merchant_sku, logistics_sku, pack_of_dsku, line_item_id, expected, sellable, damaged, synced_at) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?)", lrows)
             n_ships += 1
             n_lines += len(lrows)
