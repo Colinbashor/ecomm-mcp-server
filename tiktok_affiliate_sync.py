@@ -352,6 +352,16 @@ class ApiError(RuntimeError):
         self.code = code
 
 
+# Upstream faults the affiliate order search reports as ordinary API errors. They
+# clear on a retry, but raised immediately they fail the whole run, and a long
+# multi-window pull is the most exposed to them.
+#   2000011008  "Internal Error ... Please retry"
+#   1000010232  RPCError ... RPC_FAILED (the platform's own downstream call)
+#   2000010233  "main order not found" (the order service lagging the search
+#               index; a persistent case still fails once the retries run out)
+TRANSIENT_CODES = tts.TRANSIENT_CODES | {2000011008, 1000010232, 2000010233}
+
+
 class RateLimited(RuntimeError):
     """36009037 persisted through every backoff: pause the run (exit 75), do not fail it."""
 
@@ -392,7 +402,7 @@ def _call(path: str, query: dict, body: dict, pace: float = 0.0) -> dict:
             tts._refresh_access_token()
             refreshed = True
             continue
-        if code in tts.TRANSIENT_CODES and transient < tts.MAX_TRANSIENT_RETRIES:
+        if code in TRANSIENT_CODES and transient < tts.MAX_TRANSIENT_RETRIES:
             transient += 1
             time.sleep(min(15 * transient, 60))
             continue

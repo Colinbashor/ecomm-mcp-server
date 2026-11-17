@@ -536,6 +536,20 @@ class CallTests(unittest.TestCase):
                 tas._call(tas.ORDERS_PATH, {}, {})
         self.assertEqual(p.call_count, 1)
 
+    def test_upstream_internal_errors_are_retried_not_fatal(self):
+        for code in (2000011008, 1000010232, 2000010233):
+            flaky = _Resp({"code": code, "message": "Internal Error. Please retry."})
+            with self.subTest(code=code),                     mock.patch.object(tas.requests, "post", side_effect=[flaky, flaky, self.OK]) as p:
+                self.assertEqual(tas._call(tas.ORDERS_PATH, {}, {}), {"orders": []})
+                self.assertEqual(p.call_count, 3)
+
+    def test_a_persistent_upstream_error_still_fails(self):
+        flaky = _Resp({"code": 2000011008, "message": "Internal Error"})
+        with mock.patch.object(tas.requests, "post", side_effect=[flaky] * 20) as p:
+            with self.assertRaises(tas.ApiError):
+                tas._call(tas.ORDERS_PATH, {}, {})
+        self.assertEqual(p.call_count, tas.tts.MAX_TRANSIENT_RETRIES + 1)
+
     def test_token_refreshed_once_then_resigned(self):
         expired = _Resp({"code": next(iter(tas.tts.TOKEN_EXPIRED_CODES))})
         with mock.patch.object(tas.tts, "_refresh_access_token") as refresh, \
