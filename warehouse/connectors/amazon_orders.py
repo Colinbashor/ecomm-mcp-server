@@ -124,27 +124,85 @@ def sync(start_date: str, end_date: str) -> list[dict]:
             params = dict(base_params)
 
         payload = _get(host, path, params).get("payload", {})
-        for o in payload.get("Orders", []):
-            total = o.get("OrderTotal") or {}
-            shipped = int(o.get("NumberOfItemsShipped", 0) or 0)
-            unshipped = int(o.get("NumberOfItemsUnshipped", 0) or 0)
-            rows.append(
-                {
-                    "platform": PLATFORM,
-                    "order_id": o.get("AmazonOrderId"),
-                    "order_date": (o.get("PurchaseDate") or "")[:10],
-                    "status": o.get("OrderStatus"),
-                    "sku": "",  # order-level row; see module docstring
-                    "product_name": None,
-                    "quantity": shipped + unshipped,
-                    "total": float(total.get("Amount", 0) or 0),
-                    "currency": total.get("CurrencyCode"),
-                }
-            )
+        rows.extend(_row(o) for o in payload.get("Orders", []))
         next_token = payload.get("NextToken") or ""
         if not next_token:
             break
         # getOrders next-page rate limit is ~1 req/sec; pace ourselves.
         time.sleep(1)
 
-    return rows
+    fresh = refresh_open_orders(host, marketplace_id, start_date,
+                                skip={r["order_id"] for r in rows})
+    if fresh:
+        print(f"    amazon_orders: re-read {len(fresh)} older open order(s)", flush=True)
+    return rows + fresh
+
+
+def _row(o: dict) -> dict:
+    total = o.get("OrderTotal") or {}
+    shipped = int(o.get("NumberOfItemsShipped", 0) or 0)
+    unshipped = int(o.get("NumberOfItemsUnshipped", 0) or 0)
+    return {
+        "platform": PLATFORM,
+        "order_id": o.get("AmazonOrderId"),
+        "order_date": (o.get("PurchaseDate") or "")[:10],
+        "status": o.get("OrderStatus"),
+        "sku": "",  # order-level row; see module docstring
+        "product_name": None,
+        "quantity": shipped + unshipped,
+        "total": float(total.get("Amount", 0) or 0),
+        "currency": total.get("CurrencyCode"),
+    }
+
+
+# ORDERS CHANGE AFTER THEY ARE CREATED. A Pending order has no OrderTotal yet
+# (stored as 0) and becomes Shipped or Canceled later; a pull keyed on creation
+# date never looks again, so its revenue stays at $0 in the warehouse for good.
+# So every sync re-reads stored OPEN orders by id (getOrders takes up to 50
+# AmazonOrderIds per call), newest first, capped so it fits inside getOrders'
+# ~20-request burst; a backlog drains over successive runs.
+OPEN_STATUSES = ("Pending", "Unshipped", "PartiallyShipped", "PendingAvailability")
+OPEN_LOOKBACK_DAYS = 120
+REFRESH_OPEN_LIMIT = 600
+IDS_PER_CALL = 50
+
+
+def open_order_ids(conn, start_date: str, limit: int = REFRESH_OPEN_LIMIT,
+                   today=None) -> list[str]:
+    """Stored orders still open, created before the window, newest first."""
+    today = today or datetime.now(timezone.utc).date()
+    floor = (today - timedelta(days=OPEN_LOOKBACK_DAYS)).isoformat()
+    marks = ",".join("?" * len(OPEN_STATUSES))
+    return [r[0] for r in conn.execute(
+        f"SELECT order_id FROM orders WHERE platform=? AND status IN ({marks}) "
+        f"AND order_date >= ? AND order_date < ? ORDER BY order_date DESC LIMIT ?",
+        (PLATFORM, *OPEN_STATUSES, floor, start_date, limit))]
+
+
+def refresh_open_orders(host: str, marketplace_id: str, start_date: str,
+                        skip: set[str] = frozenset(), conn=None) -> list[dict]:
+    """Current rows for stored open orders. Best-effort: a failure here is
+    printed and returns what was gathered, never failing the main pull."""
+    own = conn is None
+    if own:
+        from warehouse import db
+        conn = db.connect_readonly()
+    try:
+        ids = [i for i in open_order_ids(conn, start_date) if i not in skip]
+    finally:
+        if own:
+            conn.close()
+    out: list[dict] = []
+    for i in range(0, len(ids), IDS_PER_CALL):
+        chunk = ids[i:i + IDS_PER_CALL]
+        try:
+            payload = _get(host, "/orders/v0/orders", {
+                "MarketplaceIds": marketplace_id,
+                "AmazonOrderIds": ",".join(chunk)}).get("payload", {})
+        except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+            print(f"    amazon_orders: open-order refresh stopped after {len(out)} "
+                  f"rows: {str(exc)[:150]}", flush=True)
+            break
+        out.extend(_row(o) for o in payload.get("Orders", []))
+        time.sleep(1)
+    return out

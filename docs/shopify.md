@@ -100,6 +100,12 @@ the same filter as a rolling window, and is ignored when `--since` is given.
   financial status lands (paid, pending, refunded, voided, and so on),
   including cancelled orders. `status` holds `displayFinancialStatus`.
   Refunds are **not** netted out of `total`, so filter on `status` yourself.
+- **Statuses stay current.** A refund or cancellation usually lands days after
+  the order, outside the created-date window, so every sync also re-reads
+  orders *updated* since the window start (at most 7 days back) that were
+  created before it. To repair older history once, run a longer window, e.g.
+  `run_sync.py --only shopify --days 90`: that re-reads every order created in
+  those 90 days with its current status.
 - **Dates are UTC.** The window is `T00:00:00Z`–`T23:59:59Z`, and
   `order_date` is the first 10 characters of `createdAt`. That is the UTC
   calendar date, not the store's local date, so orders near midnight can land

@@ -290,7 +290,6 @@ def sync(start_date: str, end_date: str) -> list[dict]:
     shopify_order_tags, and shopify_order_tag_coverage records that it was read.
     `tags` needs only read_orders, which this sync can't run without, so it is
     requested unconditionally."""
-    q = f"created_at:>='{start_date}T00:00:00Z' AND created_at:<='{end_date}T23:59:59Z'"
     want_customer = customer_capture_enabled()
     doc = _build_query(want_customer)
 
@@ -298,24 +297,33 @@ def sync(start_date: str, end_date: str) -> list[dict]:
     disc: list[dict] = []
     cust: list[dict] = []
     tags: list[dict] = []
-    cursor = None
-    while True:
-        data = _post({"n": PAGE_SIZE, "cursor": cursor, "q": q}, doc)
-        block = data["orders"]
-        for o in block["nodes"]:
-            name = o.get("name")
-            day = (o.get("createdAt") or "")[:10]
-            items = (o.get("lineItems") or {}).get("nodes") or []
-            rows.extend(_order_rows(
-                name, day, o.get("displayFinancialStatus"), items, o.get("sourceName")))
-            disc.extend(_discount_rows(name, day, items))
-            if want_customer:
-                cust.append(_customer_row(name, day, o.get("customer")))
-            if "tags" in o:  # absent = not read, so record nothing (not "untagged")
-                tags.append(_tag_row(name, day, o["tags"]))
-        if not block["pageInfo"]["hasNextPage"]:
-            break
-        cursor = block["pageInfo"]["endCursor"]
+
+    def pull(q: str) -> int:
+        n_orders, cursor = 0, None
+        while True:
+            data = _post({"n": PAGE_SIZE, "cursor": cursor, "q": q}, doc)
+            block = data["orders"]
+            for o in block["nodes"]:
+                n_orders += 1
+                name = o.get("name")
+                day = (o.get("createdAt") or "")[:10]
+                items = (o.get("lineItems") or {}).get("nodes") or []
+                rows.extend(_order_rows(
+                    name, day, o.get("displayFinancialStatus"), items, o.get("sourceName")))
+                disc.extend(_discount_rows(name, day, items))
+                if want_customer:
+                    cust.append(_customer_row(name, day, o.get("customer")))
+                if "tags" in o:  # absent = not read, so record nothing (not "untagged")
+                    tags.append(_tag_row(name, day, o["tags"]))
+            if not block["pageInfo"]["hasNextPage"]:
+                return n_orders
+            cursor = block["pageInfo"]["endCursor"]
+
+    pull(f"created_at:>='{start_date}T00:00:00Z' AND created_at:<='{end_date}T23:59:59Z'")
+    since = updated_since(start_date)
+    n = pull(updated_query(since, start_date))
+    print(f"    shopify: re-read {n} older order(s) updated since {since} "
+          f"(refunds, cancellations)", flush=True)
 
     from warehouse import db  # local import: avoids a circular import at module load
     if disc:
@@ -325,6 +333,31 @@ def sync(start_date: str, end_date: str) -> list[dict]:
     if tags:
         db.replace_shopify_order_tags(tags)
     return rows
+
+
+# ORDERS CHANGE AFTER THEY ARE CREATED. A refund, a cancellation or a void
+# changes displayFinancialStatus days or weeks later, and a pull keyed only on
+# created_at never sees it: a store with a normal refund rate ends up with a
+# large share of refunded orders still stored PAID. So every sync also re-reads
+# orders UPDATED since its window start but created before it. Capped, so a
+# manual `--days 90` does not also re-read 90 days of every fulfilment update.
+UPDATED_LOOKBACK_MAX_DAYS = 7
+
+
+def updated_since(start_date: str, today=None) -> str:
+    """Start of the updated-orders pass: the window start, but never more than
+    UPDATED_LOOKBACK_MAX_DAYS back."""
+    from datetime import date, timedelta
+    today = today or date.today()
+    floor = (today - timedelta(days=UPDATED_LOOKBACK_MAX_DAYS)).isoformat()
+    return max(start_date, floor)
+
+
+def updated_query(since: str, start_date: str) -> str:
+    """Orders updated on/after `since` that were CREATED before the window, so
+    nothing the created pass already read is fetched twice."""
+    return (f"updated_at:>='{since}T00:00:00Z' AND "
+            f"created_at:<'{start_date}T00:00:00Z'")
 
 
 def _customer_row(order_id: str, order_date: str, customer: dict | None) -> dict:

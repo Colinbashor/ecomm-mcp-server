@@ -231,8 +231,11 @@ class IncrementalSyncTests(_TempDbCase):
     def _sync(self, nodes: list[dict]) -> list[dict]:
         def fake_post(variables, query=None):
             self.docs.append(query)
+            # The updated-orders pass asks for orders created BEFORE the
+            # window; these fixtures are all inside it.
+            hit = nodes if not variables["q"].startswith("updated_at") else []
             return {"orders": {"pageInfo": {"hasNextPage": False, "endCursor": None},
-                               "nodes": nodes}}
+                               "nodes": hit}}
         with patch.object(shopify, "_post", fake_post):
             return shopify.sync("2026-10-13", "2026-10-13")
 

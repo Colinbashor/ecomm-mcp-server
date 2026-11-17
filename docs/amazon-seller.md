@@ -118,6 +118,14 @@ python voc_import.py --date 2025-07-20 imports/voc/export.csv   # force snapshot
 
 ## Notes
 
+- **Open orders are re-read until they settle.** A `Pending` order has no total
+  yet (stored as 0) and later becomes `Shipped` or `Canceled`, long after the
+  created-date window has moved on. Every `amazon_orders` sync re-reads stored
+  orders still `Pending`, `Unshipped`, `PartiallyShipped` or
+  `PendingAvailability` from the last 120 days, by order id (50 per call),
+  newest first, up to 600 per run so it fits inside getOrders' burst. A larger
+  backlog drains over successive runs.
+
 `voc_import.py` uses header-driven column matching (spellings drift between
 Seller Central export versions) — a useful template if you need to import
 any other Seller-Central-only report that has no API.
