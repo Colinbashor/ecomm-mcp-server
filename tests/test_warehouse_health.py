@@ -302,6 +302,45 @@ class StatusEscalationTests(_Conn):
         self.assertEqual(issues, [])
 
 
+class AutoVolumeTests(_Conn):
+    """A platform that normally writes rows and has stopped, whatever it logged."""
+
+    TODAY = date(2026, 9, 20)
+
+    def _days(self, platform, pattern, status="ok"):
+        """pattern[0] is the newest run; one run per day back from TODAY."""
+        from datetime import timedelta
+        return [_run(platform, (self.TODAY - timedelta(days=i)).isoformat(),
+                     status=status, rows=rows) for i, rows in enumerate(pattern)]
+
+    def test_a_tolerated_degraded_no_op_streak_is_caught(self) -> None:
+        """A scheduled job skipping itself: `degraded`, 0 rows, every night."""
+        _log(self.conn, self._days("nightly_copy", [0, 0, 0], "degraded")[:3]
+             + self._days("nightly_copy", [0, 0, 0] + [500] * 10)[3:])
+        issues = wh.check_auto_volume(self.conn, self.TODAY)
+        self.assertEqual([i.check for i in issues], ["auto_volume:nightly_copy"])
+        self.assertEqual(issues[0].severity, wh.DEGRADED)
+
+    def test_it_escalates_once_the_streak_has_stood_the_clock(self) -> None:
+        _log(self.conn, self._days("feed", [0] * 9 + [40] * 10))
+        self.assertEqual(
+            wh.check_auto_volume(self.conn, self.TODAY)[0].severity, wh.ERROR)
+
+    def test_a_platform_that_never_writes_rows_has_no_baseline(self) -> None:
+        _log(self.conn, self._days("probe", [0] * 20))
+        self.assertEqual(wh.check_auto_volume(self.conn, self.TODAY), [])
+
+    def test_an_occasional_empty_day_is_not_a_streak(self) -> None:
+        _log(self.conn, self._days("feed", [0, 0, 12, 0, 9, 14, 11, 8, 10, 13]))
+        self.assertEqual(wh.check_auto_volume(self.conn, self.TODAY), [])
+
+    def test_too_little_history_is_no_opinion_and_skip_is_honoured(self) -> None:
+        _log(self.conn, self._days("new_feed", [0, 0, 0, 5, 5]))
+        _log(self.conn, self._days("listed", [0] * 4 + [3] * 10))
+        self.assertEqual(
+            wh.check_auto_volume(self.conn, self.TODAY, skip=["listed"]), [])
+
+
 class VolumeTests(_Conn):
     """rows_written is recorded on every run; reading it is what catches a
     sync that logs `ok` on an empty pull forever."""

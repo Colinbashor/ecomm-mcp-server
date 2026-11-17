@@ -80,6 +80,7 @@ table soft forever.
 | `sync_status:<job>` (scheduled jobs) | a declared non-daily job never ran; its latest run is older than its own `max_age_days`; or its latest status is outside `expected_statuses`. With `blocked_prefix`: its latest run is tagged as blocked (DEGRADED, then ERROR past `blocked_escalate_days`) | ERROR / DEGRADED (blocked) |
 | `freshness:<name>` | the newest date in a table is older than `max_age_days` (or its newest timestamp older than `max_age_hours`); or the table has never produced anything | ERROR / DEGRADED (owned) |
 | `volume:<platform>` | the last *N*+1 **successful** runs (inside 14 days) all wrote 0 rows — a sync answering "did the request succeed?" instead of "did any data arrive?" | ERROR |
+| `auto_volume:<platform>` | **any** platform, listed or not, whose last 3 runs wrote 0 rows — `ok` *or* `degraded` — when at least half of its earlier runs (60 days, 5+ runs) wrote rows. Catches a job that keeps skipping itself behind a tolerated status. Needs no config; drop one with `disable` if its rows legitimately stop for a season | DEGRADED, then ERROR past the clock |
 | `snapshot_gaps:<name>` | missing days in a current-state snapshot table over the last 21 days (days before the table's first snapshot don't count) | WARN |
 | `historical_gaps:<name>` | missing days inside a daily series, minus `verified_empty_dates` | WARN |
 
@@ -208,10 +209,14 @@ outage.
   the ERRORs an error would be announced exactly once: miss that message and
   it never comes up again while it stays broken. The digest goes out once on
   its day however often the script runs, and skips anything already pushed
-  that day.
+  that day;
+- **every day, each ERROR that is still standing**, once per day until it
+  clears (`--error-repeat-days N`; `0` leaves standing ERRORs to the weekly
+  digest). An unfixed ERROR is waiting on a person, and a weekly reminder lets
+  an outage run a week between mentions.
 
-Silence is the normal output, both on a healthy day and on a day when the same
-known problems are still true. Identity is the check id and change is the
+Silence is the normal output on a healthy day, and on a day when the only
+standing conditions are tolerated DEGRADED ones. Identity is the check id and change is the
 severity, so a message whose text ticks from "8 days old" to "9 days old" does
 not re-announce. A brand-new WARN is recorded but never pushed.
 

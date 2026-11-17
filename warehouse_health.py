@@ -1053,6 +1053,78 @@ def check_scheduled_jobs(
     return issues
 
 
+# --- automatic zero-row streaks -------------------------------------------
+# check_volume only watches the platforms listed under "volume", and only `ok`
+# runs. So a feed nobody listed is never checked, and a run that logs a
+# tolerated `degraded` with 0 rows -- a scheduled job skipping itself night
+# after night, say -- is invisible. This check needs no list: each platform's
+# OWN history is the baseline.
+AUTO_VOLUME_STREAK = 3          # consecutive most-recent runs that wrote nothing
+AUTO_VOLUME_BASELINE_DAYS = 60  # history that decides "this platform writes rows"
+AUTO_VOLUME_MIN_BASELINE = 5    # too little history = no opinion
+AUTO_VOLUME_MIN_SHARE = 0.5     # share of baseline runs that wrote rows
+
+
+def check_auto_volume(
+    conn: sqlite3.Connection,
+    today: date,
+    escalate_after_days: int = ESCALATE_AFTER_DAYS,
+    skip: Sequence[str] = (),
+) -> list[Issue]:
+    """A platform that normally writes rows and has now written none, N runs
+    running, whatever status it logged.
+
+    DEGRADED at first (it may be a quiet upstream), ERROR once the streak has
+    stood `escalate_after_days`. A platform that legitimately logs 0 (a probe,
+    a pipeline row, "nothing to alert") never trips it: with no history of
+    writing rows there is no baseline. For one whose rows legitimately stop
+    for a season, add `auto_volume:<platform>` to "disable".
+    """
+    since = (today - timedelta(days=AUTO_VOLUME_BASELINE_DAYS)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT platform, started_at, rows_written FROM sync_log
+        WHERE lower(status) IN ('ok','success','degraded')
+          AND substr(started_at,1,10) >= ?
+        ORDER BY platform, started_at DESC, id DESC
+        """,
+        (since,),
+    ).fetchall()
+    by_platform: dict[str, list[tuple]] = {}
+    for platform, started, written in rows:
+        by_platform.setdefault(platform, []).append((started, written or 0))
+
+    skipped = set(skip)
+    issues: list[Issue] = []
+    for platform, runs in sorted(by_platform.items()):
+        if platform in skipped:
+            continue
+        streak = 0
+        for _, written in runs:
+            if written > 0:
+                break
+            streak += 1
+        if streak < AUTO_VOLUME_STREAK:
+            continue
+        baseline = runs[streak:]
+        if len(baseline) < AUTO_VOLUME_MIN_BASELINE:
+            continue
+        wrote = sum(1 for _, written in baseline if written > 0)
+        if wrote / len(baseline) < AUTO_VOLUME_MIN_SHARE:
+            continue
+        began = _date_value(runs[streak - 1][0])
+        age = (today - began).days if began else 0
+        severity = ERROR if age >= escalate_after_days else DEGRADED
+        issues.append(Issue(
+            severity,
+            f"auto_volume:{platform}",
+            f"last {streak} runs wrote 0 rows"
+            + (f" since {began.isoformat()}" if began else "")
+            + f"; {wrote} of the {len(baseline)} runs before that wrote rows",
+        ))
+    return issues
+
+
 def collect_issues(
     conn: sqlite3.Connection,
     now: datetime | None = None,
@@ -1073,6 +1145,9 @@ def collect_issues(
         now=now))
     issues.extend(check_volume(conn, today, config.volume,
                                config.volume_window_days))
+    issues.extend(check_auto_volume(
+        conn, today, config.escalate_after_days,
+        skip=[spec.platform for spec in config.volume]))
     issues.extend(check_snapshot_gaps(conn, today, config.snapshot_tables,
                                       config.snapshot_lookback_days, seen))
     issues.extend(check_historical_date_gaps(

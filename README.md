@@ -173,7 +173,7 @@ scripts, none needing credentials of their own:
 |---|---|
 | `pipeline_runner.py` | Runs your steps (from `pipeline.json`, or the checked-in `pipeline.example.json`) as child processes in ordered waves, one pipeline at a time. Per-step timeouts kill the step's whole process tree; exit 75 from a step marked `tolerate_pause` is a tolerated pause. Writes a `sync_log` row per step and per run: `ok`, `degraded` (only tolerated pauses, exit 0) or `error` (exit 1) |
 | `warehouse_health.py` | Read-only checks over `sync_log` and the tables, at three severities: **ERROR** (ours, exit 1), **DEGRADED** (a known upstream pause, exit 0), **WARN** (historical gaps, exit 0). A platform that stays `degraded` past 7 days without a successful run escalates to ERROR. Also catches stale tables, feeds that stopped running, and runs logged `ok` that wrote 0 rows. Defaults cover every public connector, skip ones you never ran, and are overridable in `health.json` |
-| `health_alerts.py` | Pushes to Slack / Google Chat / email via `warehouse/notify.py` **only when health changes** — a new problem, an escalation, a recovery — plus a weekly digest of standing ERROR and DEGRADED conditions. Recipients come from `WAREHOUSE_HEALTH_*` env vars |
+| `health_alerts.py` | Pushes to Slack / Google Chat / email via `warehouse/notify.py` **only when health changes** — a new problem, an escalation, a recovery — plus a daily repeat of any unfixed ERROR and a weekly digest of standing DEGRADED conditions. Recipients come from `WAREHOUSE_HEALTH_*` env vars |
 
 ```bash
 python pipeline_runner.py daily --dry-run   # print the plan
