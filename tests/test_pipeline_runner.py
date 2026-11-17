@@ -404,7 +404,8 @@ class RealProcessTests(unittest.TestCase):
     def _config(self, steps) -> Path:
         path = self.folder / "pipeline.json"
         path.write_text(json.dumps({"pipelines": {"nightly": {
-            "launch_stagger_seconds": 0, "waves": steps}}}), encoding="utf-8")
+            "launch_stagger_seconds": 0, "retry_delay_seconds": 0,
+            "waves": steps}}}), encoding="utf-8")
         return path
 
     def test_step_and_run_rows_are_written(self) -> None:
