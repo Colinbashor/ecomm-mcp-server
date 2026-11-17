@@ -73,7 +73,7 @@ class RequestRetryTests(unittest.TestCase):
     def test_expired_token_triggers_one_refresh_and_retry(self) -> None:
         expired = _resp(code=next(iter(tf.TOKEN_EXPIRED_CODES)), message="token expired")
         ok = _resp(code=0, data={"statements": []})
-        with patch.object(tf.requests, "get", side_effect=[expired, ok]) as get, \
+        with patch.object(tf.net.requests, "request", side_effect=[expired, ok]) as get, \
              patch.object(tf, "_refresh_access_token") as refresh:
             data = tf._get(tf.STATEMENTS_PATH, {}, None)
         self.assertEqual(get.call_count, 2)
@@ -82,7 +82,7 @@ class RequestRetryTests(unittest.TestCase):
 
     def test_non_zero_code_raises_with_code_attached(self) -> None:
         bad = _resp(code=12345, message="SortField is a required field")
-        with patch.object(tf.requests, "get", return_value=bad):
+        with patch.object(tf.net.requests, "request", return_value=bad):
             with self.assertRaises(RuntimeError) as cm:
                 tf._get(tf.STATEMENTS_PATH, {}, None)
         self.assertEqual(cm.exception.args[1], 12345)
@@ -100,13 +100,13 @@ class FetchStatementsTests(unittest.TestCase):
     def test_follows_next_page_token_and_stops_at_end(self) -> None:
         page1 = _resp(data={"statements": [{"id": 1}], "next_page_token": "P2"})
         page2 = _resp(data={"statements": [{"id": 2}], "next_page_token": None})
-        with patch.object(tf.requests, "get", side_effect=[page1, page2]):
+        with patch.object(tf.net.requests, "request", side_effect=[page1, page2]):
             rows = tf.fetch_statements(30)
         self.assertEqual([r["id"] for r in rows], [1, 2])
 
     def test_stops_on_empty_batch_even_with_a_token(self) -> None:
         empty = _resp(data={"statements": [], "next_page_token": "SOMETHING"})
-        with patch.object(tf.requests, "get", return_value=empty):
+        with patch.object(tf.net.requests, "request", return_value=empty):
             rows = tf.fetch_statements(30)
         self.assertEqual(rows, [])
 
@@ -128,7 +128,7 @@ class FetchStatementTransactionsTests(unittest.TestCase):
             "sales_tax_amount": "-4.00", "seller_discount_amount": "-1.00",
         }
         payload = _resp(data={"statement_transactions": [tx], "next_page_token": None})
-        with patch.object(tf.requests, "get", return_value=payload):
+        with patch.object(tf.net.requests, "request", return_value=payload):
             agg, order_rows = tf.fetch_statement_transactions("STMT-1")
 
         self.assertEqual(agg["referral_fee_amount"], -3.00)
@@ -147,7 +147,7 @@ class FetchStatementTransactionsTests(unittest.TestCase):
     def test_missing_order_id_is_skipped_from_order_rows_but_still_aggregated(self) -> None:
         tx = {"referral_fee_amount": "-1.50"}
         payload = _resp(data={"statement_transactions": [tx], "next_page_token": None})
-        with patch.object(tf.requests, "get", return_value=payload):
+        with patch.object(tf.net.requests, "request", return_value=payload):
             agg, order_rows = tf.fetch_statement_transactions("STMT-1")
         self.assertEqual(agg["referral_fee_amount"], -1.50)
         self.assertEqual(order_rows, [])
@@ -189,7 +189,7 @@ class SyncWritePolicyTests(unittest.TestCase):
         })
 
     def test_sync_writes_statement_and_is_idempotent(self) -> None:
-        with patch.object(tf.requests, "get", return_value=self._statement_page(fee_amount="0")):
+        with patch.object(tf.net.requests, "request", return_value=self._statement_page(fee_amount="0")):
             summary1 = tf.sync(30, with_components=False)
             summary2 = tf.sync(30, with_components=False)
         self.assertEqual(summary1["statements"], 1)
@@ -201,7 +201,7 @@ class SyncWritePolicyTests(unittest.TestCase):
 
     def test_sync_with_components_tags_is_fee_correctly(self) -> None:
         responses = [self._statement_page(), self._transactions_page()]
-        with patch.object(tf.requests, "get", side_effect=responses):
+        with patch.object(tf.net.requests, "request", side_effect=responses):
             summary = tf.sync(30, with_components=True, with_orders=True)
 
         self.assertEqual(summary["components"], 2)  # referral fee + sales tax
@@ -213,14 +213,14 @@ class SyncWritePolicyTests(unittest.TestCase):
         self.assertEqual(rows["sales_tax_amount"], 0)  # pass-through, never a fee
 
     def test_no_components_flag_skips_the_breakdown_call(self) -> None:
-        with patch.object(tf.requests, "get", return_value=self._statement_page()) as get:
+        with patch.object(tf.net.requests, "request", return_value=self._statement_page()) as get:
             summary = tf.sync(30, with_components=False)
         self.assertEqual(get.call_count, 1)  # only the statements list, no transactions call
         self.assertEqual(summary["components"], 0)
 
     def test_no_orders_flag_skips_order_table_but_keeps_components(self) -> None:
         responses = [self._statement_page(), self._transactions_page()]
-        with patch.object(tf.requests, "get", side_effect=responses):
+        with patch.object(tf.net.requests, "request", side_effect=responses):
             summary = tf.sync(30, with_components=True, with_orders=False)
         self.assertGreater(summary["components"], 0)
         self.assertEqual(summary["order_rows"], 0)
@@ -230,7 +230,7 @@ class SyncWritePolicyTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_fee_rate_computed_from_revenue_and_fees(self) -> None:
-        with patch.object(tf.requests, "get", return_value=self._statement_page(fee_amount="-20.00")):
+        with patch.object(tf.net.requests, "request", return_value=self._statement_page(fee_amount="-20.00")):
             summary = tf.sync(30, with_components=False)
         self.assertAlmostEqual(summary["rate"], 20.00 / 100.00)
 

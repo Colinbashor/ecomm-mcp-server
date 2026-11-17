@@ -33,6 +33,7 @@ warehouse/
   product_keys.py      sku_key / match_key normalization (catalog_sync.py + product_lookup)
   notify.py            optional Slack / Google Chat / email notifications
   drive.py             in-place Google Sheet/Drive file replace with bounded retry
+  net.py               shared retry: net.request() for requests calls, net.retry_call() for client libraries
 server.py              MCP server (7 read-only tools + opt-in Sheets write set; stdio, or --http)
 *_mutate.py            WRITE-capable ad-account scripts (google, meta, amazon); dry-run unless --execute
 tiktok_promotions.py   WRITE-capable TikTok Shop fixed-price promotions; dry-run unless --apply
@@ -298,6 +299,10 @@ Follow an existing standalone sync; they share a shape.
    keys its checks on it, and add the new platform (and its tables) to its
    defaults — see [Statuses, exit codes and health](#statuses-exit-codes-and-health).
 5. Support `--dry-run` (or `--probe`), a date window, and resume.
+   Make outbound calls through `warehouse/net.py`: `net.request()` instead of
+   a bare `requests.get/post`, or `net.retry_call()` around a client-library
+   call that is safe to repeat. A connection reset or a brief 5xx is the
+   commonest real failure, and one more attempt nearly always gets through.
 6. Write `docs/<platform>.md`: auth steps, retention floor, pagination style,
    rate limits, and every trap you hit. **This is a deliverable, not an
    afterthought** — the next agent has none of your context.

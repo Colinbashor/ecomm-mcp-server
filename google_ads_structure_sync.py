@@ -86,7 +86,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timezone
 
-from warehouse import db
+from warehouse import db, net
 from warehouse.connectors import google_ads
 
 GRAINS = ("campaigns", "asset_groups", "assets", "listing_filters", "conversion_actions")
@@ -234,7 +234,9 @@ def run(snapshot: str, only: list[str] | None = None) -> tuple[int, list[str]]:
             if only and grain not in only:
                 continue
             try:
-                rows = FETCH[grain]()
+                # Re-fetch the whole grain on a transient fault; a reset often
+                # lands inside the client library's own token refresh.
+                rows = net.retry_call(FETCH[grain], label=grain)
             except Exception as e:  # noqa: BLE001 — one grain must not kill the rest
                 failures.append(f"{grain}: {str(e)[:150]}")
                 print(f"    {grain} FAILED: {str(e)[:150]}")

@@ -109,7 +109,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 
-from warehouse import db
+from warehouse import db, net
 from warehouse.connectors import google_ads
 
 DDL = """
@@ -399,7 +399,9 @@ def run(start: str, end: str, only: list[str] | None = None) -> tuple[int, list[
         for lo, hi, table in sorted(work):
             cfg = REPORTS[table]
             try:
-                rows = cfg["fetch"](lo, hi)
+                # Re-fetch the window on a transient fault: each fetch returns
+                # a complete list, so a repeat is safe.
+                rows = net.retry_call(cfg["fetch"], lo, hi, label=f"{table} {lo}..{hi}")
             except Exception as e:  # noqa: BLE001 — one grain must not kill the rest
                 failures.append(f"{table} {lo}..{hi}: {str(e)[:120]}")
                 print(f"    {table} {lo}..{hi} FAILED: {str(e)[:120]}")

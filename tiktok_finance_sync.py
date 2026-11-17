@@ -97,10 +97,9 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import requests
 from dotenv import load_dotenv
 
-from warehouse import db
+from warehouse import db, net
 from warehouse.connectors.tiktok_shop import TOKEN_EXPIRED_CODES, _refresh_access_token
 
 load_dotenv()
@@ -320,9 +319,11 @@ def _get(path: str, extra: dict, page_token: str | None) -> dict:
         if page_token:
             params["page_token"] = page_token
         params["sign"] = _sign(path, params, secret)
-        r = requests.get(BASE + path, params=params,
-                         headers={"x-tts-access-token": os.environ["TIKTOK_ACCESS_TOKEN"],
-                                  "Content-Type": "application/json"}, timeout=90)
+        # net.request retries a dropped connection, a timeout or a 5xx; the
+        # signed timestamp stays inside the API's signature window across them.
+        r = net.request("GET", BASE + path, params=params,
+                        headers={"x-tts-access-token": os.environ["TIKTOK_ACCESS_TOKEN"],
+                                 "Content-Type": "application/json"}, timeout=90)
         data = r.json()
         code = data.get("code")
         if code in TOKEN_EXPIRED_CODES and attempt == 1:

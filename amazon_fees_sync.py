@@ -89,10 +89,10 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 from warehouse import db as warehouse_db
+from warehouse import net
 from warehouse.connectors.amazon_orders import HOSTS, _access_token
 
 load_dotenv()
@@ -235,7 +235,11 @@ def _create_and_download(host: str, report_type: str, start: str | None,
         body["dataStartTime"] = f"{start}T00:00:00Z"
         body["dataEndTime"] = f"{end}T23:59:59Z"
 
-    r = requests.post(f"{host}/reports/2021-06-30/reports", headers=headers, json=body, timeout=60)
+    # net.request retries transport errors and 5xx on every call here. A
+    # retried createReport that had in fact landed only queues a duplicate
+    # report, which is harmless. 429 keeps its own handling just below.
+    r = net.request("POST", f"{host}/reports/2021-06-30/reports", headers=headers,
+                    json=body, timeout=60, retry_status=net.TRANSIENT_STATUS - {429})
     if r.status_code == 429:
         time.sleep(60)
         return _create_and_download(host, report_type, start, end)
@@ -247,8 +251,8 @@ def _create_and_download(host: str, report_type: str, start: str | None,
     for _ in range(max(1, int(REPORT_TIMEOUT_MIN * 60 / POLL_SECONDS))):
         time.sleep(POLL_SECONDS)
         headers["x-amz-access-token"] = _access_token()
-        st = requests.get(f"{host}/reports/2021-06-30/reports/{report_id}",
-                          headers=headers, timeout=60).json()
+        st = net.request("GET", f"{host}/reports/2021-06-30/reports/{report_id}",
+                         headers=headers, timeout=60).json()
         status = st.get("processingStatus")
         if status == "DONE":
             doc_id = st["reportDocumentId"]
@@ -260,9 +264,9 @@ def _create_and_download(host: str, report_type: str, start: str | None,
     if not doc_id:
         raise TimeoutError(f"{report_type} did not finish in {REPORT_TIMEOUT_MIN:g} min")
 
-    doc = requests.get(f"{host}/reports/2021-06-30/documents/{doc_id}",
-                       headers=headers, timeout=60).json()
-    raw = requests.get(doc["url"], timeout=180).content
+    doc = net.request("GET", f"{host}/reports/2021-06-30/documents/{doc_id}",
+                      headers=headers, timeout=60).json()
+    raw = net.request("GET", doc["url"], timeout=180).content
     if doc.get("compressionAlgorithm") == "GZIP":
         raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
     # Amazon flat files are usually cp1252/latin-1 with a UTF-8 BOM on some.
