@@ -89,6 +89,36 @@ class ChangeDetectionTests(unittest.TestCase):
         self.assertEqual(buckets["new"], [])
         self.assertIsNone(build_message(buckets, TUESDAY, False))
 
+    def test_a_standing_error_is_in_the_digest_and_listed_first(self) -> None:
+        """An ERROR used to be announced once and never again: the digest
+        listed standing DEGRADED only, so a missed message stayed missed."""
+        previous = {"sync_status:a_paused": _prev(wh.DEGRADED),
+                    "sync_status:z_broken": _prev(wh.ERROR,
+                                                  first_seen="2026-09-02"),
+                    "historical_gaps:x": _prev(wh.WARN, notified_on=None)}
+        issues = [_issue(wh.DEGRADED, "sync_status:a_paused", "rate limited"),
+                  _issue(wh.ERROR, "sync_status:z_broken", "token expired"),
+                  _issue(wh.WARN, "historical_gaps:x", "2 missing days")]
+        buckets = classify(issues, previous)
+        self.assertIsNone(build_message(buckets, TUESDAY, False, previous))
+        message = build_message(buckets, MONDAY, True, previous)
+        self.assertIn("- sync_status:z_broken: token expired (standing 12d)",
+                      message)
+        self.assertLess(message.index("Still failing"),
+                        message.index("Still degraded"))
+        self.assertNotIn("historical_gaps", message)   # a WARN is never pushed
+
+    def test_a_standing_error_alone_is_enough_for_a_digest(self) -> None:
+        check = "volume:gmc_visibility"
+        buckets = classify([_issue()], {check: _prev(wh.ERROR)})
+        self.assertIn("Still failing", build_message(buckets, MONDAY, True))
+
+    def test_the_digest_skips_what_was_already_pushed_today(self) -> None:
+        check = "volume:gmc_visibility"
+        previous = {check: _prev(wh.ERROR, notified_on=MONDAY.isoformat())}
+        buckets = classify([_issue()], previous)
+        self.assertIsNone(build_message(buckets, MONDAY, True, previous))
+
 
 class ChangeOnlyDeliveryTests(unittest.TestCase):
     """End to end over a persisted state table: send exactly when it changed."""
@@ -158,8 +188,46 @@ class ChangeOnlyDeliveryTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 2)
         self.assertIn("Still degraded", self.send.call_args.args[0])
 
+    def test_standing_error_is_repeated_on_the_digest_day_only(self) -> None:
+        broken = [_issue(message="0 rows for 3 runs")]
+        self._run(broken, MONDAY - timedelta(days=5))    # new -> send
+        for back in (4, 3, 2, 1):
+            self._run(broken, MONDAY - timedelta(days=back))   # silent
+        self.assertEqual(self.send.call_count, 1)
+        self._run(broken, MONDAY)                        # digest -> send
+        self.assertEqual(self.send.call_count, 2)
+        text = self.send.call_args.args[0]
+        self.assertIn("Still failing", text)
+        self.assertIn("volume:gmc_visibility: 0 rows for 3 runs (standing 5d)",
+                      text)
+        self.assertNotIn("*NEW*", text)
+        self._run(broken, MONDAY + timedelta(days=1))    # silent again
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_the_digest_goes_out_once_on_its_day_however_often_this_runs(self) -> None:
+        broken = [_issue(), _issue(wh.DEGRADED, "sync_status:x")]
+        self._run(broken, MONDAY - timedelta(days=2))    # new -> send
+        self._run(broken, MONDAY)                        # digest -> send
+        self._run(broken, MONDAY)                        # same day -> silent
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_an_error_new_on_the_digest_day_is_not_repeated_that_day(self) -> None:
+        self._run([_issue()], MONDAY)                    # new -> send
+        self._run([_issue()], MONDAY)                    # same day -> silent
+        self.assertEqual(self.send.call_count, 1)
+        self._run([_issue()], MONDAY + timedelta(days=7))   # next digest -> send
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_force_lists_each_check_once(self) -> None:
+        held = [_issue(), _issue(wh.DEGRADED, "sync_status:x")]
+        self._run(held, MONDAY - timedelta(days=2))
+        self._run(held, MONDAY, force=True)
+        text = self.send.call_args.args[0]
+        self.assertEqual(text.count("volume:gmc_visibility"), 1)
+        self.assertEqual(text.count("sync_status:x"), 1)
+
     def test_digest_can_be_disabled(self) -> None:
-        held = [_issue(wh.DEGRADED, "sync_status:x")]
+        held = [_issue(wh.DEGRADED, "sync_status:x"), _issue()]
         self._run(held, MONDAY - timedelta(days=1), digest_weekday=-1)
         self._run(held, MONDAY, digest_weekday=-1)
         self.assertEqual(self.send.call_count, 1)

@@ -15,8 +15,11 @@ So this pushes ONLY:
   * an escalation -- a check whose severity went UP (the aging DEGRADED
     condition that has now become an ERROR is the case that matters)
   * a recovery, which is what keeps the channel worth reading
-  * a weekly digest of standing DEGRADED conditions, so a long pause stays
-    visible without being mentioned every morning
+  * a weekly digest of what is STILL wrong -- standing ERRORs first, then
+    standing DEGRADED conditions -- so neither fades out of view without
+    being mentioned every morning. Without the ERRORs in it, an error was
+    announced exactly once: miss that one message and it never came up again
+    for as long as it stayed broken.
 
 Silence is the expected output on a healthy day, and equally on a day when the
 same known conditions are still true. That silence is the signal.
@@ -59,9 +62,10 @@ from warehouse import db, notify
 SYNC_PLATFORM = "health_alerts"
 DEFAULT_DEST = "warehouse_health"
 
-# Standing DEGRADED conditions are re-announced on this weekday (0=Monday) so
-# a long upstream pause cannot fade out of view entirely. On any other day
-# they are recorded silently. -1 disables the digest.
+# Standing ERROR and DEGRADED conditions are re-announced on this weekday
+# (0=Monday) so an unfixed failure or a long upstream pause cannot fade out of
+# view entirely. On any other day they are recorded silently. -1 disables the
+# digest.
 DIGEST_WEEKDAY = 0
 
 DDL = """
@@ -130,9 +134,15 @@ def _age(first_seen: str, today: date) -> str:
     return " (first seen today)" if days <= 0 else f" (standing {days}d)"
 
 
-def build_message(buckets: dict[str, list], today: date,
-                  digest: bool) -> str | None:
-    """Render only what changed. Returns None when there is nothing to say."""
+def build_message(buckets: dict[str, list], today: date, digest: bool,
+                  previous: dict[str, dict] | None = None) -> str | None:
+    """Render only what changed -- plus, when `digest` is set, what is still
+    standing. Returns None when there is nothing to say.
+
+    `previous` (the stored state) is read only by the digest: first_seen says
+    how long a check has stood, notified_on whether it was already pushed today.
+    """
+    previous = previous or {}
     lines: list[str] = []
     if buckets["new"]:
         lines.append("*NEW*")
@@ -148,7 +158,28 @@ def build_message(buckets: dict[str, list], today: date,
         for check, before in buckets["resolved"]:
             lines.append(f"- {check} (was {before['severity']})")
     if digest:
-        held = [i for i in buckets["standing"] if i.severity == wh.DEGRADED]
+        # Nothing twice in one message (--force puts everything under NEW),
+        # and nothing twice in one day: a check already pushed today -- as
+        # NEW this morning, or in an earlier digest -- is not standing news
+        # yet, so a job that runs several times on the digest day sends the
+        # digest once.
+        said = {i.check for i in buckets["new"]}
+        stamp = today.isoformat()
+        standing = [
+            i for i in buckets["standing"] if i.check not in said
+            and (previous.get(i.check) or {}).get("notified_on") != stamp]
+
+        def since(issue) -> str:
+            before = previous.get(issue.check)
+            return _age(before["first_seen"], today) if before else ""
+
+        # Errors first: they are the ones waiting on a person.
+        failing = [i for i in standing if i.severity == wh.ERROR]
+        if failing:
+            lines.append("*Still failing - not fixed yet*")
+            for issue in failing:
+                lines.append(f"- {issue.check}: {issue.message}{since(issue)}")
+        held = [i for i in standing if i.severity == wh.DEGRADED]
         if held:
             lines.append("*Still degraded, tolerated for now*")
             for issue in held:
@@ -236,7 +267,7 @@ def run(issues: Sequence[wh.Issue], conn: sqlite3.Connection, today: date,
     if force:
         buckets["new"] = [i for i in issues if i.severity != wh.WARN]
         digest = True
-    message = build_message(buckets, today, digest)
+    message = build_message(buckets, today, digest, previous)
 
     if message is None:
         print("Nothing new - staying silent (the normal outcome).")
@@ -279,8 +310,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path,
                         help="health config JSON (same as warehouse_health.py)")
     parser.add_argument("--digest-weekday", type=int, default=DIGEST_WEEKDAY,
-                        help="weekday for the standing-DEGRADED digest, "
-                             "0=Monday; -1 disables (default 0)")
+                        help="weekday for the digest of standing ERROR and "
+                             "DEGRADED checks, 0=Monday; -1 disables "
+                             "(default 0)")
     args = parser.parse_args(argv)
 
     started = db.now()

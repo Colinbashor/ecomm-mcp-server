@@ -217,7 +217,7 @@ real outage behind it.
   `ok`, never as a consecutive-failure count, which an intermittent feed resets
   on every lucky run.
 - **`health_alerts.py` notifies on change only** (new, escalated, recovered,
-  plus a weekly digest of standing DEGRADED). Don't add a code path that
+  plus a weekly digest of standing ERROR and DEGRADED). Don't add a code path that
   notifies on standing state.
 - **Never alarm on `rows_written` with a floor.** The volume check looks for a
   streak of successful runs that all wrote 0 rows; a fixed minimum both
