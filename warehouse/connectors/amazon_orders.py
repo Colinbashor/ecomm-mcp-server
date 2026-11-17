@@ -180,15 +180,19 @@ def open_order_ids(conn, start_date: str, limit: int = REFRESH_OPEN_LIMIT,
 
 
 def refresh_open_orders(host: str, marketplace_id: str, start_date: str,
-                        skip: set[str] = frozenset(), conn=None) -> list[dict]:
+                        skip: set[str] = frozenset(), conn=None,
+                        limit: int = REFRESH_OPEN_LIMIT) -> list[dict]:
     """Current rows for stored open orders. Best-effort: a failure here is
-    printed and returns what was gathered, never failing the main pull."""
+    printed and returns what was gathered, never failing the main pull.
+
+    `limit` above the default is for a one-off backlog repair: past getOrders'
+    ~20-request burst each call waits about a minute, so 10,000 ids take ~3h."""
     own = conn is None
     if own:
         from warehouse import db
         conn = db.connect_readonly()
     try:
-        ids = [i for i in open_order_ids(conn, start_date) if i not in skip]
+        ids = [i for i in open_order_ids(conn, start_date, limit=limit) if i not in skip]
     finally:
         if own:
             conn.close()
