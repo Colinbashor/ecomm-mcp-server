@@ -8,6 +8,11 @@ from the Merchant API v1 (`merchantapi.googleapis.com`, `reports:search`).
 **Script:** `merchant_center_sync.py` (standalone — not wired into `run_sync.py`;
 creates its own tables via `ensure_schema()` on every run)
 
+Two write-capable companions publish Google Sheets that Merchant Center
+fetches: `merchant_center_labels_export.py` (custom labels as a supplemental
+feed) and `gmc_promotions_sync.py` (Shopify codes as promotions). See
+[Write-capable: custom labels and promotions](#write-capable-custom-labels-and-promotions).
+
 ## Setup
 
 1. Use the same kind of service-account credential as [GA4](ga4.md) — you can
@@ -232,7 +237,155 @@ empty pull isn't a resumable pause; it's a downstream health check's job to
 decide when a streak of empty pulls is an error. Exit codes: `1` if any
 family raised (takes precedence), `75` if a backfill paused, otherwise `0`.
 
+## Write-capable: custom labels and promotions
+
+Two more scripts **write** to Merchant Center, indirectly: each replaces the
+whole content of a Google Sheet that Merchant Center fetches on its own
+schedule. Both are dry runs unless given `--execute`, both upload through
+`warehouse/drive.py` (bounded retry on transient Drive faults; a permanent 4xx
+fails at once), and both authenticate with `GMC_CREDENTIALS_FILE`.
+
+**One-time Google setup for both:**
+
+1. In the Cloud project of the `GMC_CREDENTIALS_FILE` key, enable the
+   **Google Drive API**.
+2. Create each Google Sheet, share it with the service account's email
+   (`name@project.iam.gserviceaccount.com`) as an **Editor**, and copy its
+   file id from the URL (`docs.google.com/spreadsheets/d/<file id>/edit`).
+   Drive answers 404, not 403, for a file the account cannot see.
+3. Set `GMC_FEED_ID_FORMAT` to match your **primary feed's** item ids. Open a
+   product in Merchant Center (Products → All products) and read its id:
+
+   | Primary feed id looks like | `GMC_FEED_ID_FORMAT` |
+   |---|---|
+   | `shopify_US_1000000000001_1000000000101` (Shopify's Google & YouTube channel) | `shopify` (set `GMC_TARGET_COUNTRY` to the country in the id) |
+   | `1000000000101` (the Shopify variant id) | `variant_id` |
+   | `SKU-1001` | `sku` |
+
+   There is no default. A supplemental row whose id is not in the primary feed
+   is ignored without an error, so a wrong format produces a feed that looks
+   fine and does nothing. After the first push, check that the labels appear
+   on a few products before relying on them.
+
+### `merchant_center_labels_export.py` — custom labels supplemental feed
+
+Writes `id, custom_label_0 … custom_label_4` for every ACTIVE Shopify variant
+to the Sheet `GMC_LABELS_SHEET_ID`. Labels come from `feed_labels.py` (shared
+with [Meta](meta-ads.md#write-capable-meta_catalog_labels_syncpy--custom-labels-on-a-catalog)):
+
+| Label | Meaning | Values |
+|---|---|---|
+| `custom_label_0` | net margin: `(price − unit_cost − FEED_LABEL_SHIP_COST) / price − FEED_LABEL_DEDUCTION_RATE` | `Margin 50%+`, `Margin 40-50%`, `Margin 30-40%`, `Margin 20-30%`, `Margin 10-20%`, `Margin 0-10%`, `Negative margin`, `Unknown margin` (cost missing, or above 2× price, which is treated as a broken cost record) |
+| `custom_label_1` | markdown: price vs `compare_at_price` | `Full price`, `Light markdown (<25% off)`, `Deep markdown (25%+ off)` |
+| `custom_label_2` | launched within `FEED_LABEL_NEW_ARRIVAL_DAYS` (default 30), from `launch_date_epoch` | `New arrival`, `Established`, blank when the launch date is unknown |
+| `custom_label_3` | units over the last `FEED_LABEL_VELOCITY_DAYS` (default 30) of `orders` for `FEED_LABEL_ORDER_PLATFORMS` (default `shopify`), ranked among SKUs that sold | `Top seller` (top 10% of selling SKUs), `Steady seller` (to the top 50%), `Slow seller`, `No recent sales`; blank for every product when the window has no orders at all (the order feed is not syncing, which is not the same as nothing selling) |
+| `custom_label_4` | reserved, always blank | |
+
+Velocity is ranked rather than cut at fixed unit counts so the bands mean the
+same thing at any store size; SKUs tied on units always share a band. Orders
+are matched to the catalog on SKU (trimmed, case-insensitive) with no status
+filter. `launch_date_epoch` is filled only if you map it with
+`SHOPIFY_CATALOG_METAFIELDS` (see [catalog.md](catalog.md)). Band cut points
+are constants at the top of `feed_labels.py`; Google Ads listing groups match
+the label **text**, so renaming a band breaks any filter that uses it.
+
+**Merchant Center step (once):** Products → Feeds (or Settings → Data
+sources) → *Add supplemental source* → Google Sheets → choose "existing
+sheet" and pick this Sheet → attach it to your existing primary feed → set a
+daily fetch time after your scheduled run. Do **not** add it as a primary
+source.
+
+```bash
+python merchant_center_labels_export.py                 # dry run: label counts + samples
+python merchant_center_labels_export.py --csv out.csv   # dry run, also write the rows
+python merchant_center_labels_export.py --execute       # push the sheet
+```
+
+**Guards.** Only ACTIVE products are labelled (an archived duplicate shares
+its live product's SKU). With `GMC_FEED_ID_FORMAT=sku`, a SKU held by more
+than one ACTIVE variant is dropped rather than guessed, and the dry run
+reports how many rows were dropped. A build with fewer than
+`GMC_LABELS_MIN_ROWS` (default 100) rows is refused and the Sheet left as it
+was: an empty catalog table or a mistyped setting produces a tiny build, and
+pushing it would replace every good label with nothing. Set the floor to a
+comfortable fraction of your normal row count.
+
+**`sync_log`** (platform `gmc_labels_export`, `--execute` only): `ok` with the
+rows pushed, or `error` (refused, build failed, push failed) with exit 1.
+
+**Blank cells.** `custom_label_4` and unknown labels go out as empty cells.
+How Merchant Center treats an empty supplemental value (ignore vs. clear) is
+not verified here; if your primary feed already sets a custom label, check a
+product after the first push.
+
+### `gmc_promotions_sync.py` — Shopify codes as Merchant Center promotions
+
+Reads live and scheduled Shopify code discounts and publishes the ones Google
+accepts as promotions, so codes appear on Shopping ads and free listings
+without being re-typed into Merchant Center.
+
+- **Which codes:** one shared code, for all customers, no usage limit, not
+  once-per-customer, ending in the future. Single-use, generated and
+  segment-only codes are skipped and the dry run prints why per reason. Buy X
+  get Y codes and codes scoped to specific products are skipped (not mapped).
+  `--min-hours` (default 0) skips short windows; `--lookahead-days` (default 14)
+  includes scheduled codes starting soon.
+- **Which products:** every promotion is `specific_products`. Products are
+  tied to it through a `promotion_id` column on a second, **supplemental**
+  Sheet (`id, promotion_id`), so a bad push can never delist a product.
+  Eligible = every ACTIVE product, or only those tagged
+  `GMC_PROMO_ELIGIBLE_TAG` when set. Set the tag when checkout excludes some
+  products from codes: Google disapproves a promotion whose code fails on a
+  product it is shown with. A collection-scoped code is accepted only if its
+  collection is exactly `GMC_PROMO_COLLECTION_HANDLE`, which must hold the same
+  products as the tag (for example a smart collection on that tag). Google
+  allows at most 10 `promotion_id` values per product; the newest codes win.
+- **Order and clearing:** inclusions are pushed before promotions. With no
+  live codes, both Sheets are pushed header-only; replacing the whole Sheet is
+  how an expired promotion leaves Merchant Center.
+- **Guard:** a live code with an empty eligible set is refused (`error`,
+  nothing pushed).
+
+**Shopify scopes:** `read_discounts` (older apps: `read_price_rules`) and
+`read_products`, added to the app the [Shopify connector](shopify.md) uses;
+release a new app version and reinstall after adding scopes.
+
+**Merchant Center steps (once):**
+
+1. Marketing → Promotions must be enabled for the account (Google may require
+   accepting the promotions program terms).
+2. Promotions → *Add promotions data source* → Google Sheets → this script's
+   `GMC_PROMO_SHEET_ID` Sheet, daily fetch.
+3. Add `GMC_PROMO_INCLUSIONS_SHEET_ID` as a **supplemental** product source on
+   the primary feed, as for the labels Sheet above.
+4. Schedule this script shortly before both fetch times.
+
+```bash
+python gmc_promotions_sync.py                                  # dry run (default)
+python gmc_promotions_sync.py --out-dir reports/promotions     # dry run + both CSVs
+python gmc_promotions_sync.py --execute                        # push both sheets
+python gmc_promotions_sync.py --min-hours 6 --lookahead-days 7
+```
+
+Settings: `GMC_TARGET_COUNTRY` (default `US`), `GMC_PROMO_CURRENCY` (`USD`),
+`GMC_PROMO_CONTENT_LANGUAGE` (`en`), `GMC_PROMO_DESTINATIONS`
+(`Shopping_ads,Free_listings`), `GMC_PROMO_SKIP_TITLE_PREFIXES` (a search
+pre-filter for generated code families; the rules above still apply). The
+promotion id is `SHOP_<CODE>_<start date>`, so a re-run updates the same
+promotion and a code reused later gets a new one.
+
+**`sync_log`** (platform `gmc_promotions_sync`, `--execute` only): `ok` with
+the promotion count (zero live codes is a measured result, still `ok`), or
+`error` on a Shopify, build or push failure, with exit 1.
+
 ## Tests
+
+`tests/test_merchant_center_labels_export.py`, `tests/test_gmc_promotions_sync.py`,
+`tests/test_feed_labels.py` and `tests/test_drive.py` — label bands, rank-based
+velocity, blank-vs-zero handling, SKU ambiguity and each feed-id format; the
+row floor, dry-run default and `sync_log` status of the export; code
+classification, promotion rows, the eligible set and push order of the
+promotions sync; Drive retry and whole-sheet replacement.
 
 `tests/test_merchant_center_sync.py` — field coercion (`as_int`, `as_float`,
 `as_date`, `as_money`, `parse_offer_id`), transport retry/throttle/401

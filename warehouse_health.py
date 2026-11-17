@@ -247,6 +247,12 @@ DEFAULT_STATUS_PLATFORMS: dict[str, int] = {
     "gmc_pricing": STALE_RUN_DAYS,
     "gmc_bestsellers": STALE_RUN_DAYS,
     "gmc_visibility": STALE_RUN_DAYS,
+    # Write-capable feed publishers: a stale run means stale labels or
+    # expired promotions still showing. Cadence only, never the volume check:
+    # zero live codes or zero label changes is a legitimate `ok`.
+    "gmc_labels_export": STALE_RUN_DAYS,
+    "gmc_promotions_sync": STALE_RUN_DAYS,
+    "meta_catalog_labels": STALE_RUN_DAYS,
     # Search Console retention is a ROLLING ~16 months: a stall nobody
     # notices silently loses the OLD end of the history for good.
     "search_console": STALE_RUN_DAYS,

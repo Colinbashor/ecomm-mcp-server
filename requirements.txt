@@ -18,8 +18,10 @@ cryptography
 # Only needed for ga4_sync.py (Google Analytics 4).
 google-analytics-data
 
-# Only needed for ga4_sync.py and merchant_center_sync.py — both use a Google
-# service-account credential (server-to-server auth, no browser consent step).
+# Only needed for ga4_sync.py, merchant_center_sync.py and the Google Sheet
+# publishers (warehouse/drive.py: merchant_center_labels_export.py,
+# gmc_promotions_sync.py) — all use a Google service-account credential
+# (server-to-server auth, no browser consent step).
 google-auth
 
 # Only needed for the browser-consent OAuth helpers google_auth.py and
@@ -32,8 +34,8 @@ google-auth-oauthlib
 xlrd
 
 # Only needed for tiktok_creators_sync.py's `import` subcommand (loading a
-# manually-exported .xlsx creator roster). The `api` subcommand and every
-# other script here work without it.
+# manually-exported .xlsx creator roster) and for the Google Sheet publishers
+# above, which upload an .xlsx. Everything else here works without it.
 openpyxl
 
 # Required by algolia_sync.py and amazon_search_terms_monthly.py (YAML

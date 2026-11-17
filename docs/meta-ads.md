@@ -3,7 +3,8 @@
 Campaign-level spend/clicks/conversions from the core connector, plus an
 optional standalone script for ad/adset/creative/video-level detail, and a
 write-capable `meta_ads_mutate.py` for pausing/resuming, budgets and ad-set
-copies (see the last section).
+copies, and a write-capable `meta_catalog_labels_sync.py` that sets custom
+labels on a product catalog (see the last two sections).
 
 **Script:** `warehouse/connectors/meta_ads.py`, via `run_sync.py --only meta`
 (plain HTTPS against the Graph/Marketing API `v23.0`, no Meta SDK)
@@ -552,3 +553,88 @@ every other targeting key, the `individual_setting` fix, the overlap
 refusal and the no-change short-circuit. `VideoViewersAudienceTests`
 cover the dry run, de-duplicated rule entries with the page context,
 the duplicate-name check, non-numeric ids and a missing `META_PAGE_ID`.
+
+## Write-capable: `meta_catalog_labels_sync.py` — custom labels on a catalog
+
+Writes the five custom labels from `feed_labels.py` (the same labels
+`merchant_center_labels_export.py` sends to Google; definitions in
+[merchant-center.md](merchant-center.md#merchant_center_labels_exportpy--custom-labels-supplemental-feed))
+onto a Meta product catalog through the Catalog Batch API
+(`POST /{catalog_id}/items_batch`), so product sets and Advantage+ catalog ads
+can filter on margin, markdown, newness and velocity.
+
+Why the API rather than a supplementary feed: a catalog filled by Shopify's
+Facebook & Instagram channel usually has no feed to attach a supplement to.
+The API needs no Commerce Manager setup and reports errors per item.
+
+### Setup
+
+| Variable | Notes |
+|---|---|
+| `META_CATALOG_ID` | required. Commerce Manager → your catalog → Settings. |
+| `META_CATALOG_ACCESS_TOKEN` | optional; a token with `catalog_management` on that catalog. Empty = use `META_ACCESS_TOKEN` (the system user then needs the catalog assigned in Business Settings). |
+| `META_CATALOG_RETAILER_ID_FORMAT` | `variant_id` (default; what the Shopify channel uses), `sku`, or `shopify`. Open one item in Commerce Manager and compare its content id before the first run. |
+| `META_LABELS_MIN_ROWS` | default `100`; see Guards. |
+| `META_LABELS_MAX_CLEAR_SHARE` | default `0.30`; see Guards. |
+
+The `FEED_LABEL_*` variables in `.env.example` set the label math.
+
+### How a run works
+
+1. Build the desired labels for every ACTIVE Shopify variant, keyed on
+   retailer_id.
+2. Read every catalog item's current labels, following `paging.next` until
+   there is none. A short page never ends the read.
+3. Diff. Only items whose labels differ are sent; catalog items absent from
+   the build (archived, drafts, another source's items) are **cleared** to
+   blank so they cannot keep a stale label. Build rows not in the catalog are
+   counted and skipped: `allow_upsert=false`, so the script can never create a
+   product.
+4. Send `UPDATE` requests in batches of up to 3,000 (Meta's cap is 5,000) and
+   poll `check_batch_request_status` until each finishes (~15 minutes max).
+   `UPDATE` is a partial update: price, stock, images and everything else the
+   catalog's own source maintains are untouched.
+
+Every Graph call, GET and POST, retries network errors and Graph codes 1, 2,
+4, 17, 32 and 613 up to 4 times with a growing pause; any other Graph error
+(bad token, missing permission) fails at once. Re-sending a label `UPDATE`
+that already landed is harmless.
+
+### Guards
+
+The run is refused (`error`, exit 1, catalog untouched) when the build has
+fewer than `META_LABELS_MIN_ROWS` rows, or when it would clear labels on more
+than `META_LABELS_MAX_CLEAR_SHARE` of the catalog. Both are what a broken
+upstream build looks like (an empty `catalog_shopify`, the wrong retailer-id
+format), and pushing it would wipe labels that live product sets filter on.
+
+### Usage
+
+```bash
+python meta_catalog_labels_sync.py                       # dry run: counts + 5 sample changes
+python meta_catalog_labels_sync.py --limit 20 --execute  # small live test
+python meta_catalog_labels_sync.py --execute             # full run
+```
+
+### `sync_log` and exit code
+
+Platform `meta_catalog_labels`, `--execute` runs only. `ok` (including "0
+changes needed", which is a full read and compare, not an empty pull);
+`degraded` (exit 0) when some items errored or a batch had not finished when
+polling stopped, since the next run's diff re-sends whatever did not land;
+`error` (exit 1) when refused, when the build or catalog read failed, or when
+every item sent errored.
+
+If the catalog's own source resets these fields, the nightly diff re-sends
+them; a large, steady update count every night in `sync_log` is the sign.
+Product-set filters are not touched: point your sets at the label text
+yourself (e.g. `custom_label_0` is `Margin 50%+`), and keep in mind that
+renaming a band in `feed_labels.py` breaks any set that matches its old text.
+
+### Tests
+
+`tests/test_meta_catalog_labels_sync.py` — retry on transient Graph codes and
+transport errors for both GET and POST, immediate failure on a permanent
+error, paging past a short page, the diff (only changes, strays cleared, no
+creates), both guards, batch size, `allow_upsert=false` and status polling,
+dry-run default, `--limit`, and the `ok` / `degraded` / `error` outcomes.

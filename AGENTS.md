@@ -32,9 +32,13 @@ warehouse/
   brand_analytics.py   shared Amazon report runner
   product_keys.py      sku_key / match_key normalization (catalog_sync.py + product_lookup)
   notify.py            optional Slack / Google Chat / email notifications
+  drive.py             in-place Google Sheet/Drive file replace with bounded retry
 server.py              MCP server (7 read-only tools + opt-in Sheets write set; stdio, or --http)
 *_mutate.py            WRITE-capable ad-account scripts (google, meta, amazon); dry-run unless --execute
 tiktok_promotions.py   WRITE-capable TikTok Shop fixed-price promotions; dry-run unless --apply
+feed_labels.py         custom-label logic shared by the next two (no I/O beyond SQLite)
+merchant_center_labels_export.py, gmc_promotions_sync.py, meta_catalog_labels_sync.py
+                       WRITE-capable feed sheets / catalog labels; dry-run unless --execute
 google_sheets_script.py  Sheets/Apps Script writes behind the opt-in MCP tools
 backup_db.py           rotating, verified local backups of warehouse.db
 pipeline_runner.py     runs the scheduled steps from pipeline.json (template:
