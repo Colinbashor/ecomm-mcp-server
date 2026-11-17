@@ -45,8 +45,8 @@
         {
           "description": "Strictly last: both read everything. --report-only keeps a found ERROR from marking the whole run failed; health_alerts is what reaches a person.",
           "steps": [
-            {"script": "warehouse_health.py", "args": ["--report-only"], "timeout_minutes": 15},
-            {"script": "health_alerts.py", "timeout_minutes": 15}
+            {"script": "warehouse_health.py", "args": ["--report-only"], "timeout_minutes": 15, "retry": false},
+            {"script": "health_alerts.py", "timeout_minutes": 15, "retry": false}
           ]
         }
       ]

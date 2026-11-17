@@ -298,9 +298,11 @@ but a standalone script without credentials fails.
 | `timeout_minutes` | `180` | per-step budget; on expiry the step's whole process tree is killed |
 | `tolerate_pause` | `false` | exit 75 from this step counts as `degraded`, not `error`. Only for scripts that checkpoint and resume |
 | `name` | script + args | label in logs and in the step's `sync_log` platform |
+| `retry` | `true` | a failed step is re-run **once**, after the rest of its wave and `retry_delay_seconds`, before the next wave starts. Never for a timeout or a tolerated pause. Set `false` for a step that sends something (alerts, digests, email), so a retry cannot deliver it twice. A step that succeeds on its retry does not fail the run; the run's `sync_log` message lists it as "recovered on retry" |
 | `lock_wait_minutes` | `0` | how long to wait for another running pipeline before giving up |
 | `max_concurrent` | `4` | cap on simultaneous steps in a wave |
 | `launch_stagger_seconds` | `5` | gap between launches within a wave |
+| `retry_delay_seconds` | `120` | pause before a wave's failed steps are retried |
 
 The config is validated before anything runs; unknown keys, `args` given as a
 string, duplicate steps and missing scripts are errors (exit 2).

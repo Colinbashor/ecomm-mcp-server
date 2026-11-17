@@ -66,7 +66,7 @@ import threading
 import time
 from concurrent import futures
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -91,6 +91,14 @@ DEFAULT_MAX_CONCURRENT = 4
 # Several API clients launching at the same instant can trip a platform's
 # connection shedding; a few seconds apart is negligible against a long wave.
 DEFAULT_LAUNCH_STAGGER_SECONDS = 5
+# A failed step is re-run once, after the rest of its wave has finished and
+# this pause, before the next wave starts (so a later wave still reads its
+# output). Most step failures are one-off upstream faults -- a dropped
+# connection, a 5xx -- that the very next attempt gets through. NOT retried: a
+# timeout (a hang re-run is another full budget holding the lock), a declared
+# pause (exit 75 resumes on the next run by design), and any step configured
+# "retry": false (one that sends a message, so it cannot send twice).
+DEFAULT_RETRY_DELAY_SECONDS = 120
 DEFAULT_LOCK_WAIT_MINUTES = 0
 # POSIX only: how long a timed-out step gets after SIGTERM before SIGKILL.
 KILL_GRACE_SECONDS = 10
@@ -115,6 +123,9 @@ class Step:
     # pause, and load_config refuses it.
     tolerated_exits: tuple[int, ...] = ()
     name: str | None = None
+    # False for a step that SENDS something (an alert, a digest, an email): a
+    # retry after a failure part-way through could deliver it twice.
+    retry: bool = True
 
     @property
     def label(self) -> str:
@@ -140,10 +151,15 @@ class Step:
 
 @dataclass(frozen=True)
 class StepOutcome:
-    """A step that did not exit 0. `tolerated` splits degraded from failed."""
+    """A step that did not exit 0. `tolerated` splits degraded from failed.
+
+    `recovered`: it failed, then succeeded on its retry. The data landed, so it
+    does not fail the run, but it is still reported so a flaky feed is visible.
+    """
     label: str
     exit_code: int
     tolerated: bool
+    recovered: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,6 +169,7 @@ class Pipeline:
     lock_wait_seconds: float = DEFAULT_LOCK_WAIT_MINUTES * 60
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     launch_stagger_seconds: float = DEFAULT_LAUNCH_STAGGER_SECONDS
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS
     description: str = ""
 
     @property
@@ -167,10 +184,10 @@ class Pipeline:
 _COMMENT_KEYS = {"description", "_comment"}
 _TOP_KEYS = {"pipelines"} | _COMMENT_KEYS
 _PIPELINE_KEYS = {"waves", "lock_wait_minutes", "max_concurrent",
-                  "launch_stagger_seconds"} | _COMMENT_KEYS
+                  "launch_stagger_seconds", "retry_delay_seconds"} | _COMMENT_KEYS
 _WAVE_KEYS = {"steps"} | _COMMENT_KEYS
 _STEP_KEYS = {"script", "args", "timeout_minutes", "tolerate_pause",
-              "name"} | _COMMENT_KEYS
+              "name", "retry"} | _COMMENT_KEYS
 
 
 def _reject_unknown(obj: dict, allowed: set[str], where: str) -> None:
@@ -217,12 +234,16 @@ def _parse_step(raw: Any, where: str, check_scripts: bool) -> Step:
     name = raw.get("name")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise ConfigError(f"{where}: 'name' must be a non-empty string")
+    retry = raw.get("retry", True)
+    if not isinstance(retry, bool):
+        raise ConfigError(f"{where}: 'retry' must be true or false")
     step = Step(
         script=script,
         args=tuple(args),
         timeout_seconds=timeout,
         tolerated_exits=(GRACEFUL_PAUSE_EXIT,) if tolerate else (),
         name=name,
+        retry=retry,
     )
     if check_scripts and not step.path.is_file():
         raise ConfigError(f"{where}: script not found: {step.path}")
@@ -265,6 +286,9 @@ def _parse_pipeline(name: str, raw: Any, check_scripts: bool) -> Pipeline:
         launch_stagger_seconds=_positive_number(
             raw.get("launch_stagger_seconds", DEFAULT_LAUNCH_STAGGER_SECONDS),
             f"{where}.launch_stagger_seconds", allow_zero=True),
+        retry_delay_seconds=_positive_number(
+            raw.get("retry_delay_seconds", DEFAULT_RETRY_DELAY_SECONDS),
+            f"{where}.retry_delay_seconds", allow_zero=True),
         description=str(raw.get("description", "")),
     )
     # The same invocation twice is always a mistake, and a duplicate NAME would
@@ -504,6 +528,7 @@ def run_steps(waves: Sequence[Sequence[Step]],
               pipeline_name: str | None = None,
               max_concurrent: int = DEFAULT_MAX_CONCURRENT,
               launch_stagger_seconds: float = DEFAULT_LAUNCH_STAGGER_SECONDS,
+              retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
               ) -> list[StepOutcome]:
     """Run each wave's steps CONCURRENTLY, waves in order.
 
@@ -518,31 +543,58 @@ def run_steps(waves: Sequence[Sequence[Step]],
     for n, wave in enumerate(waves, 1):
         if len(waves) > 1:
             print(f"=== wave {n}/{len(waves)}: {len(wave)} step(s)", flush=True)
-        if len(wave) == 1:
-            outcome = run_step(wave[0], pipeline_name)
-            if outcome:
-                outcomes.append(outcome)
-            continue
-        workers = max(1, min(max_concurrent, len(wave)))
-        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            pending = []
-            try:
-                for i, step in enumerate(wave):
-                    if i and launch_stagger_seconds:
-                        time.sleep(launch_stagger_seconds)
-                    pending.append(pool.submit(run_step, step, pipeline_name))
-                for future in pending:
-                    outcome = future.result()
-                    if outcome:
-                        outcomes.append(outcome)
-            except KeyboardInterrupt:
-                # The pool's exit waits for its threads, and each thread waits
-                # for its child -- so the children must die first or ^C hangs.
-                for future in pending:
-                    future.cancel()
-                _kill_live_children()
-                raise
+        results = _run_wave(wave, pipeline_name, max_concurrent,
+                            launch_stagger_seconds)
+        again = [step for step, out in results if out and _retryable(step, out)]
+        second: dict[str, StepOutcome | None] = {}
+        if again:
+            print(f"=== retrying {len(again)} failed step(s) in "
+                  f"{retry_delay_seconds:.0f}s: "
+                  + ", ".join(s.display_name for s in again), flush=True)
+            if retry_delay_seconds:
+                time.sleep(retry_delay_seconds)
+            second = {step.label: out for step, out in _run_wave(
+                tuple(again), pipeline_name, max_concurrent, launch_stagger_seconds)}
+        for step, out in results:
+            if out is None:
+                continue
+            if step.label not in second:
+                outcomes.append(out)
+            elif second[step.label] is None:
+                print(f"<<< {step.display_name} recovered on retry", flush=True)
+                outcomes.append(replace(out, recovered=True))
+            else:
+                outcomes.append(second[step.label])
     return outcomes
+
+
+def _retryable(step: Step, outcome: StepOutcome) -> bool:
+    return (step.retry and not outcome.tolerated
+            and outcome.exit_code != TIMEOUT_EXIT)
+
+
+def _run_wave(wave: Sequence[Step], pipeline_name: str | None,
+              max_concurrent: int, launch_stagger_seconds: float,
+              ) -> list[tuple[Step, StepOutcome | None]]:
+    """Run one wave's steps concurrently; (step, outcome) in wave order."""
+    if len(wave) == 1:
+        return [(wave[0], run_step(wave[0], pipeline_name))]
+    workers = max(1, min(max_concurrent, len(wave)))
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = []
+        try:
+            for i, step in enumerate(wave):
+                if i and launch_stagger_seconds:
+                    time.sleep(launch_stagger_seconds)
+                pending.append((step, pool.submit(run_step, step, pipeline_name)))
+            return [(step, future.result()) for step, future in pending]
+        except KeyboardInterrupt:
+            # The pool's exit waits for its threads, and each thread waits
+            # for its child -- so the children must die first or ^C hangs.
+            for _, future in pending:
+                future.cancel()
+            _kill_live_children()
+            raise
 
 
 def _kill_live_children() -> None:
@@ -554,11 +606,12 @@ def _kill_live_children() -> None:
 
 def summarize(outcomes: Sequence[StepOutcome]) -> tuple[str, str]:
     """(status, message) for the run-level sync_log row."""
-    failures = [o for o in outcomes if not o.tolerated]
+    failures = [o for o in outcomes if not o.tolerated and not o.recovered]
     paused = [o for o in outcomes if o.tolerated]
     message = "; ".join(
         f"{o.label} exit {o.exit_code}"
         + (" (tolerated pause)" if o.tolerated else "")
+        + (" (recovered on retry)" if o.recovered else "")
         for o in outcomes
     )
     status = "error" if failures else ("degraded" if paused else "ok")
@@ -576,10 +629,12 @@ def run_pipeline(pipeline: Pipeline) -> int:
                 pipeline_name=pipeline.name,
                 max_concurrent=pipeline.max_concurrent,
                 launch_stagger_seconds=pipeline.launch_stagger_seconds,
+                retry_delay_seconds=pipeline.retry_delay_seconds,
             )
             status, message = summarize(outcomes)
             if status == "ok":
-                message = f"{len(pipeline.steps)} step(s) ok"
+                message = f"{len(pipeline.steps)} step(s) ok" + (
+                    f"; {message}" if message else "")
             db.log_sync(platform, started, 0, status, message)
     except PipelineBusy:
         # A run that could not make progress must say so, not vanish: a

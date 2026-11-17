@@ -31,9 +31,77 @@ def _proc(pid: int = 1, wait_result: int | Exception = 0) -> Mock:
     return process
 
 
+class RetryTests(unittest.TestCase):
+    """A failed step is re-run once at the end of its wave."""
+
+    def _run(self, waves, results):
+        with patch.object(pipeline_runner.subprocess, "Popen",
+                          side_effect=results) as popen, \
+                patch.object(pipeline_runner, "kill_tree"):
+            outcomes = pipeline_runner.run_steps(
+                waves, retry_delay_seconds=0, launch_stagger_seconds=0)
+        return outcomes, [Path(c.args[0][1]).name for c in popen.call_args_list]
+
+    def test_a_step_that_fails_once_recovers_and_does_not_fail_the_run(self) -> None:
+        waves = ((pipeline_runner.Step("flaky.py"),),
+                 (pipeline_runner.Step("after.py"),))
+        outcomes, ran = self._run(waves, [_proc(wait_result=1), _proc(wait_result=0),
+                                          _proc(wait_result=0)])
+        self.assertEqual(ran, ["flaky.py", "flaky.py", "after.py"])  # before the next wave
+        self.assertEqual(outcomes, [pipeline_runner.StepOutcome(
+            "flaky.py", 1, tolerated=False, recovered=True)])
+        self.assertEqual(pipeline_runner.summarize(outcomes)[0], "ok")
+        self.assertIn("recovered on retry", pipeline_runner.summarize(outcomes)[1])
+
+    def test_only_the_failed_steps_of_a_wave_are_retried(self) -> None:
+        wave = (pipeline_runner.Step("a.py"), pipeline_runner.Step("b.py"))
+        outcomes, ran = self._run((wave,), [_proc(wait_result=0), _proc(wait_result=3),
+                                            _proc(wait_result=0)])
+        self.assertEqual(sorted(ran), ["a.py", "b.py", "b.py"])
+        self.assertTrue(outcomes[0].recovered)
+
+    def test_a_timeout_is_never_retried(self) -> None:
+        hung = _proc(pid=7, wait_result=subprocess.TimeoutExpired(cmd=["h"], timeout=1))
+        outcomes, ran = self._run(((pipeline_runner.Step("hung.py"),),), [hung])
+        self.assertEqual(ran, ["hung.py"])
+        self.assertEqual(outcomes[0].exit_code, pipeline_runner.TIMEOUT_EXIT)
+
+    def test_a_declared_pause_is_never_retried(self) -> None:
+        step = pipeline_runner.Step("resumable.py",
+                                    tolerated_exits=(pipeline_runner.GRACEFUL_PAUSE_EXIT,))
+        outcomes, ran = self._run(((step,),), [_proc(wait_result=75)])
+        self.assertEqual(ran, ["resumable.py"])
+        self.assertTrue(outcomes[0].tolerated)
+
+    def test_retry_false_is_never_retried(self) -> None:
+        step = pipeline_runner.Step("sends_digest.py", retry=False)
+        outcomes, ran = self._run(((step,),), [_proc(wait_result=1)])
+        self.assertEqual(ran, ["sends_digest.py"])
+        self.assertFalse(outcomes[0].recovered)
+        self.assertEqual(pipeline_runner.summarize(outcomes)[0], "error")
+
+    def test_config_reads_retry_and_retry_delay(self) -> None:
+        raw = {"pipelines": {"p": {"retry_delay_seconds": 30, "waves": [
+            {"steps": [{"script": "a.py"}, {"script": "b.py", "retry": False}]}]}}}
+        pipe = pipeline_runner.parse_config(raw, check_scripts=False)["p"]
+        self.assertEqual(pipe.retry_delay_seconds, 30)
+        self.assertEqual([s.retry for s in pipe.steps], [True, False])
+        with self.assertRaises(pipeline_runner.ConfigError):
+            pipeline_runner.parse_config(
+                {"pipelines": {"p": {"waves": [{"steps": [
+                    {"script": "a.py", "retry": "no"}]}]}}}, check_scripts=False)
+
+    def test_example_config_never_retries_the_health_and_alert_steps(self) -> None:
+        daily = pipeline_runner.load_config(pipeline_runner.EXAMPLE_CONFIG)["daily"]
+        for step in daily.steps:
+            if step.script in {"warehouse_health.py", "health_alerts.py"}:
+                self.assertFalse(step.retry, step.label)
+
+
 class RunStepsTests(unittest.TestCase):
     def test_run_steps_continues_and_collects_failures(self) -> None:
         results = [_proc(wait_result=0), _proc(wait_result=7),
+                   _proc(wait_result=7),      # its retry fails too
                    _proc(wait_result=0)]
         waves = (
             (pipeline_runner.Step("one.py"),),
@@ -42,13 +110,13 @@ class RunStepsTests(unittest.TestCase):
         )
         with patch.object(pipeline_runner.subprocess, "Popen",
                           side_effect=results) as popen:
-            failures = pipeline_runner.run_steps(waves)
+            failures = pipeline_runner.run_steps(waves, retry_delay_seconds=0)
 
         self.assertEqual(
             failures,
             [pipeline_runner.StepOutcome("two.py --flag", 7, tolerated=False)],
         )
-        self.assertEqual(popen.call_count, 3)
+        self.assertEqual(popen.call_count, 4)
 
     def test_command_uses_this_interpreter_and_no_shell(self) -> None:
         step = pipeline_runner.Step("run_sync.py", ("--days", "3"))
