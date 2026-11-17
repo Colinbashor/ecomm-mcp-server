@@ -547,6 +547,11 @@ def main() -> int:
                    help="exit 0 even if a period comes back short. Use for an early pass run "
                         "soon after a period ends, where a short pull is expected; a later "
                         "--repair pass is the one that should fail loudly.")
+    p.add_argument("--log-as", default=PLATFORM, metavar="PLATFORM",
+                   help="sync_log platform for the weekly branch. Give a scheduled DAILY "
+                        "--repair pass its own name (e.g. amazon_traffic_repair): a health "
+                        "check that reads the default platform as 'the weekly pull ran' would "
+                        "otherwise stay green on the daily no-op through a missed weekly pull.")
     args = p.parse_args()
 
     require_env()
@@ -604,7 +609,7 @@ def main() -> int:
         conn.close()
 
     status, message = run_status(total, partial, failed, args.repair)
-    warehouse_db.log_sync(PLATFORM, started, total, status, message)
+    warehouse_db.log_sync(args.log_as, started, total, status, message)
     print(f"Amazon traffic: wrote {total} rows [{status}]" + (f" — {message}" if message else ""))
     code = exit_code(status, args.repair, args.allow_partial)
     if code == 0 and status == "degraded":

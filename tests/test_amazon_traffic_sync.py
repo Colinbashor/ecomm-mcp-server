@@ -404,5 +404,38 @@ class MainMonthFailureTests(unittest.TestCase):
                     os.environ[k] = v
 
 
+class LogAsTests(unittest.TestCase):
+    """A daily --repair pass must be loggable apart from the weekly pull."""
+
+    def _run(self, argv):
+        saved = {k: os.environ.get(k) for k in traffic.REQUIRED_ENV}
+        try:
+            for k in traffic.REQUIRED_ENV:
+                os.environ[k] = "x"
+            logged = {}
+
+            def fake_log_sync(platform, started, rows, status, message=""):
+                logged.update(platform=platform, status=status)
+
+            with patch("sys.argv", ["amazon_traffic_sync.py", *argv]),                  patch.object(traffic.warehouse_db, "init_db"),                  patch.object(traffic.warehouse_db, "now", return_value="stamp"),                  patch.object(traffic.warehouse_db, "log_sync", side_effect=fake_log_sync),                  patch("sqlite3.connect", return_value=sqlite3.connect(":memory:")),                  patch.object(traffic, "weeks_needing_repair", return_value=[]):
+                rc = traffic.main()
+            return rc, logged
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_repair_logs_under_the_given_platform(self) -> None:
+        rc, logged = self._run(["--repair", "--weeks", "4", "--log-as", "amazon_traffic_repair"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(logged, {"platform": "amazon_traffic_repair", "status": "ok"})
+
+    def test_default_platform_is_unchanged(self) -> None:
+        _, logged = self._run(["--repair", "--weeks", "4"])
+        self.assertEqual(logged["platform"], traffic.PLATFORM)
+
+
 if __name__ == "__main__":
     unittest.main()

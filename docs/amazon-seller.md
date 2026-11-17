@@ -77,6 +77,7 @@ python amazon_economics_sync.py                     # or --week YYYY-MM-DD / --w
 python amazon_traffic_sync.py                       # or --week / --weeks N / --month YYYY-MM
 python amazon_traffic_sync.py --repair               # re-pull only weeks recorded incomplete
 python amazon_traffic_sync.py --allow-partial        # exit 0 on a short pull (early-pass schedule)
+python amazon_traffic_sync.py --repair --log-as amazon_traffic_repair   # a DAILY repair pass, logged apart from the weekly pull
 python amazon_event_pull.py --event-id spring_sale --name "Spring Sale" --start 2026-03-10 --end 2026-03-11
 python amazon_listing_quality_sync.py --skus SKU1,SKU2
 python amazon_listing_quality_sync.py --skus-file skus.txt
@@ -186,6 +187,11 @@ re-pull only the recorded-incomplete periods, bounded to 6 attempts per
 period so a day Amazon will never actually finish publishing doesn't get
 re-requested forever. `--allow-partial` is for the opposite case — an early
 pass expected to be short — and exits 0 instead of failing the run.
+
+If you schedule `--repair` DAILY (so a short weekly pull heals before the next
+weekly run), pass `--log-as amazon_traffic_repair`. A daily no-op logged under
+the default platform would satisfy any health check that reads "the weekly
+pull ran recently", hiding a weekly pull that never happened.
 
 The exit code is decided by a small pure function, `exit_code(status, repair,
 allow_partial)`: `degraded` (a short pull) exits `0` when either `--repair` or
