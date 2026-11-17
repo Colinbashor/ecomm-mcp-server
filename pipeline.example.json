@@ -43,9 +43,9 @@
           ]
         },
         {
-          "description": "Strictly last: both read everything. warehouse_health exits 1 on any ERROR; health_alerts is what reaches a person, and only when something changed.",
+          "description": "Strictly last: both read everything. --report-only keeps a found ERROR from marking the whole run failed; health_alerts is what reaches a person.",
           "steps": [
-            {"script": "warehouse_health.py", "timeout_minutes": 15},
+            {"script": "warehouse_health.py", "args": ["--report-only"], "timeout_minutes": 15},
             {"script": "health_alerts.py", "timeout_minutes": 15}
           ]
         }

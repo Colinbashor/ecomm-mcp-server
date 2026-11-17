@@ -133,6 +133,7 @@ ERROR from day one (renamed, dropped from the schedule, or never set up).
 
 ```bash
 python warehouse_health.py                  # report; exit 1 if any ERROR
+python warehouse_health.py --report-only    # as a pipeline step: exit 0 even on ERROR
 python warehouse_health.py --json           # issues as JSON
 python warehouse_health.py --warnings-as-errors
 python warehouse_health.py --print-config > health.json   # start a config

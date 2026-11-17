@@ -667,6 +667,7 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(wh.exit_code([wh.Issue(wh.DEGRADED, "x", "")]), 0)
         self.assertEqual(wh.exit_code([wh.Issue(wh.WARN, "x", "")]), 0)
         self.assertEqual(wh.exit_code([wh.Issue(wh.ERROR, "x", "")]), 1)
+        self.assertEqual(wh.exit_code([wh.Issue(wh.ERROR, "x", "")], report_only=True), 0)
         self.assertEqual(wh.exit_code([wh.Issue(wh.WARN, "x", "")],
                                       warnings_as_errors=True), 1)
         self.assertGreater(wh.SEVERITY_RANK[wh.ERROR],

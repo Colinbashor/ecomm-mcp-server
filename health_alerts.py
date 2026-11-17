@@ -68,6 +68,11 @@ DEFAULT_DEST = "warehouse_health"
 # digest.
 DIGEST_WEEKDAY = 0
 
+# An unfixed ERROR is repeated every this-many days until it clears. It is
+# waiting on a person, and a weekly reminder lets an outage run a week between
+# mentions. 0 restores the older behaviour: standing ERRORs only in the digest.
+ERROR_REPEAT_DAYS = 1
+
 DDL = """
 CREATE TABLE IF NOT EXISTS health_state (
     check_name  TEXT NOT NULL PRIMARY KEY,
@@ -135,7 +140,8 @@ def _age(first_seen: str, today: date) -> str:
 
 
 def build_message(buckets: dict[str, list], today: date, digest: bool,
-                  previous: dict[str, dict] | None = None) -> str | None:
+                  previous: dict[str, dict] | None = None,
+                  error_repeat_days: int = ERROR_REPEAT_DAYS) -> str | None:
     """Render only what changed -- plus, when `digest` is set, what is still
     standing. Returns None when there is nothing to say.
 
@@ -157,28 +163,36 @@ def build_message(buckets: dict[str, list], today: date, digest: bool,
         lines.append("*RECOVERED*")
         for check, before in buckets["resolved"]:
             lines.append(f"- {check} (was {before['severity']})")
+    # Nothing twice in one message (--force puts everything under NEW), and
+    # nothing twice in one day: a check already pushed today is not standing
+    # news yet, so a job that runs several times a day repeats nothing.
+    said = {i.check for i in buckets["new"]}
+    stamp = today.isoformat()
+    standing = [
+        i for i in buckets["standing"] if i.check not in said
+        and (previous.get(i.check) or {}).get("notified_on") != stamp]
+
+    def since(issue) -> str:
+        before = previous.get(issue.check)
+        return _age(before["first_seen"], today) if before else ""
+
+    def due(issue) -> bool:
+        if digest:
+            return True
+        if error_repeat_days <= 0:
+            return False
+        last = wh._date_value((previous.get(issue.check) or {}).get("notified_on"))
+        return last is None or (today - last).days >= error_repeat_days
+
+    # An unfixed ERROR is repeated every `error_repeat_days`, not only on the
+    # digest day. DEGRADED is tolerated by definition and has its own
+    # escalation clock, so it keeps the weekly digest.
+    failing = [i for i in standing if i.severity == wh.ERROR and due(i)]
+    if failing:
+        lines.append("*Still failing - not fixed yet*")
+        for issue in failing:
+            lines.append(f"- {issue.check}: {issue.message}{since(issue)}")
     if digest:
-        # Nothing twice in one message (--force puts everything under NEW),
-        # and nothing twice in one day: a check already pushed today -- as
-        # NEW this morning, or in an earlier digest -- is not standing news
-        # yet, so a job that runs several times on the digest day sends the
-        # digest once.
-        said = {i.check for i in buckets["new"]}
-        stamp = today.isoformat()
-        standing = [
-            i for i in buckets["standing"] if i.check not in said
-            and (previous.get(i.check) or {}).get("notified_on") != stamp]
-
-        def since(issue) -> str:
-            before = previous.get(issue.check)
-            return _age(before["first_seen"], today) if before else ""
-
-        # Errors first: they are the ones waiting on a person.
-        failing = [i for i in standing if i.severity == wh.ERROR]
-        if failing:
-            lines.append("*Still failing - not fixed yet*")
-            for issue in failing:
-                lines.append(f"- {issue.check}: {issue.message}{since(issue)}")
         held = [i for i in standing if i.severity == wh.DEGRADED]
         if held:
             lines.append("*Still degraded, tolerated for now*")
@@ -251,7 +265,8 @@ class RunResult(NamedTuple):
 
 def run(issues: Sequence[wh.Issue], conn: sqlite3.Connection, today: date,
         dest: str = DEFAULT_DEST, dry_run: bool = False, force: bool = False,
-        digest_weekday: int = DIGEST_WEEKDAY) -> RunResult:
+        digest_weekday: int = DIGEST_WEEKDAY,
+        error_repeat_days: int = ERROR_REPEAT_DAYS) -> RunResult:
     """Diff `issues` against the stored state, record, and push if changed."""
     conn.executescript(DDL)
     previous = load_state(conn)
@@ -267,7 +282,7 @@ def run(issues: Sequence[wh.Issue], conn: sqlite3.Connection, today: date,
     if force:
         buckets["new"] = [i for i in issues if i.severity != wh.WARN]
         digest = True
-    message = build_message(buckets, today, digest, previous)
+    message = build_message(buckets, today, digest, previous, error_repeat_days)
 
     if message is None:
         print("Nothing new - staying silent (the normal outcome).")
@@ -313,6 +328,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="weekday for the digest of standing ERROR and "
                              "DEGRADED checks, 0=Monday; -1 disables "
                              "(default 0)")
+    parser.add_argument("--error-repeat-days", type=int, default=ERROR_REPEAT_DAYS,
+                        help="repeat an unfixed ERROR every N days until it "
+                             "clears; 0 = only in the weekly digest (default 1)")
     args = parser.parse_args(argv)
 
     started = db.now()
@@ -336,7 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = run(issues, conn, today, dest=args.dest,
                      dry_run=args.dry_run, force=args.force,
-                     digest_weekday=args.digest_weekday)
+                     digest_weekday=args.digest_weekday,
+                     error_repeat_days=args.error_repeat_days)
     finally:
         conn.close()
     if not args.dry_run:

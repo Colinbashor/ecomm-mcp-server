@@ -1093,7 +1093,13 @@ def open_readonly() -> sqlite3.Connection:
     return db.connect_readonly()
 
 
-def exit_code(issues: Sequence[Issue], warnings_as_errors: bool = False) -> int:
+def exit_code(issues: Sequence[Issue], warnings_as_errors: bool = False,
+              report_only: bool = False) -> int:
+    # --report-only is for the pipeline step: finding problems is the check
+    # doing its job, and a nonzero exit there marks every pipeline run failed
+    # for as long as any ERROR stands, whatever the steps themselves did.
+    if report_only:
+        return 0
     # ERROR ALONE decides the exit code. DEGRADED is a known upstream
     # condition with a clock on it; returning nonzero for one is what turns a
     # health signal into permanent noise.
@@ -1116,6 +1122,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "point for health.json) and exit")
     parser.add_argument("--warnings-as-errors", action="store_true",
                         help="exit 1 on any issue, not just ERROR")
+    parser.add_argument("--report-only", action="store_true",
+                        help="exit 0 even when ERRORs are found (use as a pipeline "
+                             "step; a config error or crash still exits nonzero)")
     args = parser.parse_args(argv)
 
     if args.print_config:
@@ -1147,7 +1156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Warehouse health: {counts[ERROR]} error(s), "
               f"{counts[DEGRADED]} degraded, {counts[WARN]} warning(s)",
               flush=True)
-    return exit_code(issues, args.warnings_as_errors)
+    return exit_code(issues, args.warnings_as_errors, args.report_only)
 
 
 if __name__ == "__main__":

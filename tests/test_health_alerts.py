@@ -48,7 +48,8 @@ class ChangeDetectionTests(unittest.TestCase):
         buckets = classify([_issue()],
                            {"volume:gmc_visibility": _prev(wh.ERROR)})
         self.assertEqual(buckets["new"], [])
-        self.assertIsNone(build_message(buckets, TUESDAY, digest=False))
+        self.assertIsNone(build_message(buckets, TUESDAY, digest=False,
+                                        error_repeat_days=0))
 
     def test_degraded_ageing_into_error_is_announced(self) -> None:
         check = "sync_status:flexport_inbounds"
@@ -100,7 +101,8 @@ class ChangeDetectionTests(unittest.TestCase):
                   _issue(wh.ERROR, "sync_status:z_broken", "token expired"),
                   _issue(wh.WARN, "historical_gaps:x", "2 missing days")]
         buckets = classify(issues, previous)
-        self.assertIsNone(build_message(buckets, TUESDAY, False, previous))
+        self.assertIsNone(build_message(buckets, TUESDAY, False, previous,
+                                        error_repeat_days=0))
         message = build_message(buckets, MONDAY, True, previous)
         self.assertIn("- sync_status:z_broken: token expired (standing 12d)",
                       message)
@@ -118,6 +120,54 @@ class ChangeDetectionTests(unittest.TestCase):
         previous = {check: _prev(wh.ERROR, notified_on=MONDAY.isoformat())}
         buckets = classify([_issue()], previous)
         self.assertIsNone(build_message(buckets, MONDAY, True, previous))
+
+
+class ErrorRepeatTests(unittest.TestCase):
+    """An unfixed ERROR is repeated on a clock, not announced once and dropped."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.conn = sqlite3.connect(Path(self._tmp.name) / "w.db")
+        self._send = patch.object(health_alerts.notify, "send", return_value=[])
+        self.send = self._send.start()
+        self._env = patch.dict(os.environ, REACHABLE)
+        self._env.start()
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._send.stop()
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def _run(self, issues, today, **kw):
+        return health_alerts.run(issues, self.conn, today, digest_weekday=-1, **kw)
+
+    def test_by_default_a_standing_error_is_sent_again_every_day(self) -> None:
+        broken = [_issue(message="0 rows for 3 runs")]
+        for day in range(4):
+            self._run(broken, TUESDAY + timedelta(days=day))
+        self.assertEqual(self.send.call_count, 4)
+        self.assertIn("Still failing", self.send.call_args.args[0])
+        self.assertIn("standing 3d", self.send.call_args.args[0])
+
+    def test_but_only_once_per_day(self) -> None:
+        broken = [_issue()]
+        self._run(broken, TUESDAY)
+        self._run(broken, TUESDAY + timedelta(days=1))
+        self._run(broken, TUESDAY + timedelta(days=1))
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_the_interval_is_configurable(self) -> None:
+        broken = [_issue()]
+        for day in range(7):
+            self._run(broken, TUESDAY + timedelta(days=day), error_repeat_days=3)
+        self.assertEqual(self.send.call_count, 3)          # days 0, 3, 6
+
+    def test_standing_degraded_is_never_repeated_daily(self) -> None:
+        held = [_issue(wh.DEGRADED, "sync_status:x", "rate limited")]
+        for day in range(4):
+            self._run(held, TUESDAY + timedelta(days=day))
+        self.assertEqual(self.send.call_count, 1)
 
 
 class ChangeOnlyDeliveryTests(unittest.TestCase):
@@ -138,6 +188,10 @@ class ChangeOnlyDeliveryTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, issues, today=TUESDAY, **kw):
+        # These tests pin CHANGE detection and the weekly digest, so the daily
+        # repeat of standing ERRORs is switched off here and tested on its own
+        # in ErrorRepeatTests.
+        kw.setdefault("error_repeat_days", 0)
         return health_alerts.run(issues, self.conn, today, **kw)
 
     def test_same_state_twice_sends_once(self) -> None:
