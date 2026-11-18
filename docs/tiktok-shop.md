@@ -1,8 +1,8 @@
 # TikTok Shop
 
-Order ground truth (core), plus seven standalone scripts (and a one-off video-products backfill) for video
+Order ground truth (core), plus eight standalone scripts (and a one-off video-products backfill) for video
 performance, LIVE-shopping, creator identity and Marketplace profiles, sales-source attribution,
-settlement/fee data, and listing-quality diagnostics.
+settlement/fee data, listing-quality diagnostics, and Fulfilled by TikTok (FBT) inventory.
 
 ## Scripts
 
@@ -18,6 +18,7 @@ settlement/fee data, and listing-quality diagnostics.
 | `tiktok_analytics_sync.py` | standalone | true mutually-exclusive LIVE/VIDEO/PRODUCT_CARD sales-source split |
 | `tiktok_finance_sync.py` | standalone | settlement statements + per-order fee decomposition |
 | `tiktok_listing_quality_sync.py` | standalone | per-product content-quality tier + issues (Listings Diagnosis API) |
+| `tiktok_fbt_sync.py` | standalone | Fulfilled by TikTok stock: daily per-warehouse levels, the goods census, and on-hand movement history — see [FBT inventory](#fbt-inventory-tiktok_fbt_syncpy) |
 | `tiktok_promotions.py` | **WRITE-capable**, dry run unless `--apply` | fixed-price promotion activities: list/show/export, create, set product prices — see [Promotions](#promotions-tiktok_promotionspy) |
 
 ## Setup
@@ -45,7 +46,9 @@ All the extras reuse the core `TIKTOK_*` credentials — nothing new to
 configure, except `tiktok_listing_quality_sync.py`, which additionally needs
 the `seller.product.optimize` scope granted on your Partner Center app
 (separate from the product-read scopes the other scripts use — check
-Partner Center > your app > Scopes before a first run).
+Partner Center > your app > Scopes before a first run), and
+`tiktok_fbt_sync.py`, which needs the FBT scope. Add a scope by
+re-authorising with **all** scopes; a partial re-auth drops the others.
 
 ## Usage
 
@@ -98,6 +101,10 @@ python tiktok_finance_sync.py --no-orders     # skip retaining per-order fee row
 python tiktok_listing_quality_sync.py --product-ids 1234567890,2345678901
 python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt
 python tiktok_listing_quality_sync.py --product-ids-file product_ids.txt --limit 400   # smoke test: first 400 ids
+
+python tiktok_fbt_sync.py                              # today's FBT snapshot + 7 days of movements
+python tiktok_fbt_sync.py --records-since 2026-01-01   # deeper movement pull
+python tiktok_fbt_sync.py --probe                      # reachability + a sample, writes nothing
 ```
 
 `tiktok_videos_sync.py` makes up to 6 attempts per page. One of them may be
@@ -182,6 +189,43 @@ body is retried only if that body carries one of the transient codes above.
   **reaches if you fix this issue**, not its current tier), and
   `suggestion_json` (TikTok's raw `suggestion` object for that field, if it
   sent one)
+- `tiktok_fbt_snapshot_log`, `tiktok_fbt_inventory`, `tiktok_fbt_goods`,
+  `tiktok_fbt_inventory_records` — see [FBT inventory](#fbt-inventory-tiktok_fbt_syncpy)
+
+## FBT inventory (`tiktok_fbt_sync.py`)
+
+Stock you have sent into TikTok's own fulfillment network. It has left your
+3PL and appears in no other inventory feed, so this is a separate stock pool.
+
+- **`tiktok_fbt_snapshot_log`** (PK `snapshot_date`) is the "we looked"
+  marker: warehouses listed, goods registered, inventory rows returned and the
+  bucket totals. A sold-through pool writes no inventory rows, so health
+  checks (freshness, snapshot gaps) read this table, never the inventory one.
+- **`tiktok_fbt_inventory`** (PK `snapshot_date`, `fbt_warehouse_id`,
+  `goods_id`): `available`, `reserved`, `total_onhand`, `unfulfillable`,
+  `in_transit`. **Only `available` is sellable stock.** Reserved units are
+  already allocated, unfulfillable ones cannot be sold, and in-transit ones
+  are still on their way in; never add them to `available`. Current state
+  only: a missed day is lost for good. A same-day re-run replaces the day.
+- **`tiktok_fbt_goods`** (PK `goods_id`): the census, one goods per
+  size-level SKU, with your `reference_code`, TikTok product and SKU ids and
+  barcodes.
+- **`tiktok_fbt_inventory_records`**: every on-hand change with before/after
+  quantities and the order behind it. Unlike the level, this has history:
+  each run re-pulls the trailing 7 days (idempotent on a composite key, as the
+  API gives no record id).
+- `sku_key` is the `reference_code`, or NULL when `TIKTOK_FBT_SKU_PATTERN` is
+  set and the code does not fully match it.
+- Inventory and records are queried by goods id in chunks of 100 (the filter
+  maximum). The records search has answered "access denied" with no goods
+  filter while the filtered call succeeded.
+- Error 105005 is retried 4 times, 15s apart, before it is raised: after a
+  re-authorisation the FBT endpoints have answered it intermittently for some
+  minutes. Expired-token and transient codes follow the orders connector.
+- Status (platform `tiktok_fbt`): `ok` when the goods census answered,
+  `degraded` when it came back empty (an empty census cannot tell "nothing in
+  FBT" from "the API returned nothing"); an empty inventory with a non-empty
+  census is a measured zero and `ok`.
 
 ## Promotions (`tiktok_promotions.py`)
 
@@ -531,6 +575,10 @@ window being final, resuming from coverage not tag rows, the poison guard,
 `tests/test_tiktok_live_sync.py`,
 `tests/test_tiktok_creators_sync.py`, `tests/test_tiktok_analytics_sync.py`,
 `tests/test_tiktok_finance_sync.py`, `tests/test_tiktok_listing_quality_sync.py`,
+`tests/test_tiktok_fbt_sync.py` (the SKU-key pattern, buckets kept apart, a
+same-day re-run replacing the day, idempotent movement records, an empty
+inventory logged as a measured zero, id chunking, paging to an empty token,
+the 105005 retry, one token refresh),
 `tests/test_tiktok_promotions.py` (a dry run never writes, the add body shapes,
 20-product batches, rate-limit backoff, one token refresh, verify-after-write),
 `tests/test_tiktok_affiliate_sync.py` (paging past a short page and stopping

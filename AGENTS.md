@@ -87,7 +87,8 @@ of this writing `--dry-run`/`--probe` exist on `algolia_sync.py`,
 `amazon_awd_sync.py`, `amazon_search_terms_monthly.py`, `bq_mirror_sync.py`,
 `factory_status_backfill.py`, `factory_status_import.py`, `reacher_sync.py`,
 `search_console_sync.py`, `shopify_customers_sync.py`,
-`tiktok_analytics_sync.py`, `tiktok_creators_sync.py` and `voc_import.py`;
+`tiktok_analytics_sync.py`, `tiktok_creators_sync.py`, `tiktok_fbt_sync.py` and
+`voc_import.py`;
 check the script's argparse (or its `docs/<platform>.md` Usage section) for
 the rest. `run_sync.py` has neither — use `--sample` to exercise the pipeline
 without credentials, or `--only <one>` with a short window.

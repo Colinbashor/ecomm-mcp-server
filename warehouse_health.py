@@ -235,6 +235,7 @@ DEFAULT_STATUS_PLATFORMS: dict[str, int] = {
     "amazon_ads_detail": STALE_RUN_DAYS,
     "amazon_inventory": STALE_RUN_DAYS,
     "amazon_awd": STALE_RUN_DAYS,
+    "tiktok_fbt": STALE_RUN_DAYS,
     "amazon_returns": STALE_RUN_DAYS,
     "flexport": STALE_RUN_DAYS,
     "flexport_orders": STALE_RUN_DAYS,
@@ -305,6 +306,10 @@ _FRESHNESS_DEFAULTS: list[dict[str, Any]] = [
      "sql": "SELECT MAX(snapshot_date) FROM amazon_inventory"},
     {"name": "amazon_awd", "platform": "amazon_awd", "max_age_days": 2,
      "sql": "SELECT MAX(snapshot_date) FROM amazon_awd_inventory"},
+    # The snapshot LOG, not tiktok_fbt_inventory: a sold-through FBT pool
+    # writes no inventory rows, and that is a measured zero, not staleness.
+    {"name": "tiktok_fbt", "platform": "tiktok_fbt", "max_age_days": 2,
+     "sql": "SELECT MAX(snapshot_date) FROM tiktok_fbt_snapshot_log"},
     {"name": "flexport_inventory", "platform": "flexport", "max_age_days": 2,
      "sql": "SELECT MAX(snapshot_date) FROM flexport_inventory"},
     {"name": "purple_dot_waitlists", "platform": "purple_dot_waitlists",
@@ -360,7 +365,7 @@ _FRESHNESS_DEFAULTS: list[dict[str, Any]] = [
 # Pipeline platforms (`*_pipeline`) log 0 rows by construction: never list them.
 DEFAULT_VOLUME_PLATFORMS = (
     "google", "meta", "amazon", "amazon_orders", "shopify", "tiktok",
-    "ga4", "amazon_inventory", "amazon_awd", "flexport",
+    "ga4", "amazon_inventory", "amazon_awd", "tiktok_fbt", "flexport",
     "purple_dot_waitlists", "gmc_performance", "gmc_status", "gmc_pricing",
     "gmc_bestsellers", "gmc_visibility",
 )
@@ -370,6 +375,9 @@ _SNAPSHOT_DEFAULTS: list[dict[str, Any]] = [
      "platform": "amazon_inventory"},
     {"name": "amazon_awd", "table": "amazon_awd_inventory",
      "platform": "amazon_awd"},
+    # the log again: an FBT day can legitimately hold zero inventory rows
+    {"name": "tiktok_fbt", "table": "tiktok_fbt_snapshot_log",
+     "platform": "tiktok_fbt"},
     {"name": "flexport_inventory", "table": "flexport_inventory",
      "platform": "flexport"},
     {"name": "purple_dot_waitlists", "table": "purple_dot_waitlist_inventory",

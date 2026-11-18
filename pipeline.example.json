@@ -16,6 +16,8 @@
             {"script": "search_console_sync.py", "args": ["--days", "5"], "timeout_minutes": 90},
             {"script": "amazon_inventory_sync.py",
              "description": "Current-state snapshot with no backfill: a missed day is lost for good."},
+            {"script": "tiktok_fbt_sync.py",
+             "description": "Fulfilled by TikTok stock levels: snapshot-only like amazon_inventory; the movement records re-pull a trailing week."},
             {"script": "flexport_sync.py"},
             {"script": "flexport_orders_sync.py", "tolerate_pause": true, "timeout_minutes": 240},
             {"script": "flexport_returns_sync.py", "tolerate_pause": true},
