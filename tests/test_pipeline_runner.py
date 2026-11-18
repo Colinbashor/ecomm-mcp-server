@@ -54,9 +54,15 @@ class RetryTests(unittest.TestCase):
         self.assertIn("recovered on retry", pipeline_runner.summarize(outcomes)[1])
 
     def test_only_the_failed_steps_of_a_wave_are_retried(self) -> None:
+        # A wave's steps launch concurrently, so hand out exit codes by
+        # script name, not by launch order (which varies by thread timing).
+        exits = {"a.py": [0], "b.py": [3, 0]}
+
+        def by_name(cmd, *args, **kwargs):
+            return _proc(wait_result=exits[Path(cmd[1]).name].pop(0))
+
         wave = (pipeline_runner.Step("a.py"), pipeline_runner.Step("b.py"))
-        outcomes, ran = self._run((wave,), [_proc(wait_result=0), _proc(wait_result=3),
-                                            _proc(wait_result=0)])
+        outcomes, ran = self._run((wave,), by_name)
         self.assertEqual(sorted(ran), ["a.py", "b.py", "b.py"])
         self.assertTrue(outcomes[0].recovered)
 
