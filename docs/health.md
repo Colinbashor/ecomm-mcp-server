@@ -358,6 +358,10 @@ $repo = "C:\path\to\ecomm-mcp-server"
 $action = New-ScheduledTaskAction -Execute "$repo\.venv\Scripts\python.exe" `
     -Argument "pipeline_runner.py daily" -WorkingDirectory $repo
 $trigger = New-ScheduledTaskTrigger -Daily -At 4:30am
+# New-ScheduledTaskTrigger stores the start time in UTC, which Task Scheduler
+# fires at a fixed UTC instant: the task moves an hour whenever DST starts or
+# ends. Strip the offset so it stays at 04:30 local time all year.
+$trigger.StartBoundary = ([datetime]$trigger.StartBoundary).ToString('s')
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
     -ExecutionTimeLimit (New-TimeSpan -Hours 12)
 Register-ScheduledTask -TaskName "warehouse daily pipeline" `
