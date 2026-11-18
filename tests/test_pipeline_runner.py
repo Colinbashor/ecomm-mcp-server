@@ -247,6 +247,29 @@ class ConfigTests(unittest.TestCase):
                     self.assertTrue(step.path.is_file())
                     self.assertFalse(Path(step.script).is_absolute())
 
+    def test_example_run_sync_orders_do_not_wait_behind_amazon_ads(self) -> None:
+        """run_sync runs its connectors serially, so an order connector that
+        shares a step with `amazon` (Ads) waits for Amazon's report queue. And
+        because the steps pass --only, a connector added to run_sync.CONNECTORS
+        later would never run unless the --only lists together cover it."""
+        import run_sync
+
+        orders = {"amazon_orders", "shopify", "tiktok"}
+        daily = pipeline_runner.load_config(pipeline_runner.EXAMPLE_CONFIG)["daily"]
+        covered: set[str] = set()
+        for step in daily.steps:
+            if step.script != "run_sync.py":
+                continue
+            if "--only" not in step.args:
+                covered |= set(run_sync.CONNECTORS)
+                continue
+            platforms = set(step.args[step.args.index("--only") + 1].split(","))
+            covered |= platforms
+            if "amazon" in platforms:
+                with self.subTest(step=step.label):
+                    self.assertFalse(platforms & orders)
+        self.assertEqual(covered, set(run_sync.CONNECTORS))
+
     def test_example_daily_ends_with_health_then_alerts(self) -> None:
         daily = pipeline_runner.load_config(
             pipeline_runner.EXAMPLE_CONFIG)["daily"]

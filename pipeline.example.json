@@ -9,8 +9,11 @@
         {
           "description": "Independent pulls. None reads another's output, so they overlap; SQLite still serialises their writes behind db.BUSY_TIMEOUT_SECONDS.",
           "steps": [
-            {"script": "run_sync.py", "args": ["--days", "3"], "timeout_minutes": 240,
-             "description": "The six shared-table connectors; skips any without credentials."},
+            {"script": "run_sync.py", "args": ["--only", "google,meta,amazon", "--days", "3"],
+             "timeout_minutes": 240,
+             "description": "The ad-platform connectors; skips any without credentials. Amazon Ads can sit in its report queue for hours, hence the budget."},
+            {"script": "run_sync.py", "args": ["--only", "amazon_orders,shopify,tiktok", "--days", "3"],
+             "description": "The order connectors, in their own step: run_sync.py runs its connectors one after another, so sharing a step with Amazon Ads would hold the orders back until its reports finish."},
             {"script": "ga4_sync.py", "args": ["--days", "3"]},
             {"script": "merchant_center_sync.py", "args": ["--days", "3"], "tolerate_pause": true},
             {"script": "search_console_sync.py", "args": ["--days", "5"], "timeout_minutes": 90},

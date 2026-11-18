@@ -270,6 +270,13 @@ checked-in `pipeline.example.json`. Copy the example and delete the steps for
 platforms you don't use: `run_sync.py` skips connectors without credentials,
 but a standalone script without credentials fails.
 
+The example runs `run_sync.py` as two steps, ads (`--only google,meta,amazon`)
+and orders (`--only amazon_orders,shopify,tiktok`). `run_sync.py` runs its
+connectors one after another, so orders sharing a step with Amazon Ads land
+only after its report queue clears, which can take hours. If you add a
+connector to `run_sync.CONNECTORS`, add it to one of the `--only` lists too:
+a test pins that the two lists together cover every connector.
+
 ```json
 {
   "pipelines": {
