@@ -3,9 +3,8 @@ Meta AD-LEVEL and CREATIVE-LEVEL detail -> warehouse.
 
 WHY THIS EXISTS
 `ad_metrics` (platform='meta', from warehouse/connectors/meta_ads.py) is
-CAMPAIGN grain, and if you also run meta_products_sync.py that's CATALOG-
-PRODUCT grain. Neither carries an ad_id, an adset_id, or a creative id, so
-neither can answer anything about a specific AD or the CREATIVE inside it.
+CAMPAIGN grain. It carries no ad_id, adset_id or creative id, so it cannot
+answer anything about a specific AD or the CREATIVE inside it.
 That becomes a blocker the moment you want to know "did this specific video
 work as a Meta ad" — e.g. when a business starts running videos originally
 made for TikTok creator/affiliate marketing (via a tool like Reacher — see

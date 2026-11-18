@@ -11,9 +11,8 @@ KEYWORD-BASED header matching rather than hardcoded per-file column indices,
 because header wording drifts week to week (line breaks, trailing translated
 text, minor rewording) even from the same vendor.
 
-This is a MANUAL-DROP importer, the same shape as `voc_import.py`/
-`pacvue_import.py` elsewhere in this repo: someone downloads/receives the
-files and drops them into a folder; you run this script by hand (or on your
+This is a MANUAL-DROP importer, the same shape as `voc_import.py`: someone
+downloads/receives the files and drops them into a folder; you run this script by hand (or on your
 own schedule) to load them. There's no API here — production-tracking sheets
 essentially never have one.
 
