@@ -112,7 +112,7 @@ Keep the answers; you'll need them in the hand-off summary.
    activate it, run `pip install -r requirements.txt`, and copy `.env.example`
    to `.env`. The commands are in `docs/setup-manual.md` §3.
 3. **Check:** `pip install -r requirements-dev.txt` then `pytest -q`. Expect
-   all tests to pass, with at most a skip or two, in about 20 seconds. A
+   all tests to pass, with at most a skip or two, in under a minute. A
    failure here is an install problem; fix it before going on.
 
 ## Phase 2: Sample data and the MCP client

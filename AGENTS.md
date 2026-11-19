@@ -82,16 +82,12 @@ python server.py              # stdio MCP server
 
 Where a script offers `--dry-run` or `--probe`, **use it first.** A probe costs
 one request and usually tells you a scope is missing, which is the real problem
-far more often than the error message suggests. Not every script has one — as
-of this writing `--dry-run`/`--probe` exist on `algolia_sync.py`,
-`amazon_awd_sync.py`, `amazon_search_terms_monthly.py`, `bq_mirror_sync.py`,
-`factory_status_backfill.py`, `factory_status_import.py`, `reacher_sync.py`,
-`search_console_sync.py`, `shopify_customers_sync.py`,
-`tiktok_analytics_sync.py`, `tiktok_creators_sync.py`, `tiktok_fbt_sync.py` and
-`voc_import.py`;
-check the script's argparse (or its `docs/<platform>.md` Usage section) for
-the rest. `run_sync.py` has neither — use `--sample` to exercise the pipeline
-without credentials, or `--only <one>` with a short window.
+far more often than the error message suggests. Not every script has one,
+and the scripts that write to a platform (`*_mutate.py`, the label and
+promotion exports) are dry runs unless given `--execute`; check the script's
+`--help` or its `docs/<platform>.md` Usage section. `run_sync.py` has
+neither — use `--sample` to exercise the pipeline without credentials, or
+`--only <one>` with a short window.
 
 ---
 

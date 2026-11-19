@@ -61,9 +61,8 @@ snapshot-keyed; otherwise only its latest `snapshot_date` is used), `sku`,
 process environment, else `warehouse.db` next to `factory_status_import.py`.
 Neither script calls `load_dotenv()`, so a `WAREHOUSE_DB` that exists only in
 `.env` is **not** picked up — export it in the shell if you need a
-non-default path. They connect with plain `sqlite3.connect()` (SQLite's
-default 5 s busy timeout, not the repo's long `db.BUSY_TIMEOUT_SECONDS`), so
-avoid running them while a long sync is writing.
+non-default path. Like the syncs, they wait up to `db.BUSY_TIMEOUT_SECONDS`
+for the write lock, so running them during a sync waits rather than fails.
 
 ## Usage
 

@@ -99,7 +99,7 @@ Optional, but a good check that the install worked:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                          # ~20 seconds, no network, no credentials
+pytest -q                          # under a minute, no network, no credentials
 ```
 
 ## 4. Try it with sample data
